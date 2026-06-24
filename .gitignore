@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+dist/
+build/work/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+Thumbs.db
+desktop.ini
