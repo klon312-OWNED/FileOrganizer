@@ -10,11 +10,10 @@ from .config import DB_PATH
 
 
 class FileIndex:
-    """Простой потокобезопасный индекс перемещённых файлов."""
+    """Потокобезопасный индекс перемещённых файлов и журнал истории."""
 
     def __init__(self, db_path: Path = DB_PATH) -> None:
         self._lock = threading.Lock()
-        # check_same_thread=False — обращаемся из GUI и из фонового потока
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
@@ -43,7 +42,6 @@ class FileIndex:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_date ON files(year, month)"
             )
-            # миграция: добавляем колонку kind ('file' | 'dir'), если её нет
             cols = {
                 row["name"]
                 for row in self._conn.execute("PRAGMA table_info(files)").fetchall()
@@ -52,7 +50,7 @@ class FileIndex:
                 self._conn.execute(
                     "ALTER TABLE files ADD COLUMN kind TEXT DEFAULT 'file'"
                 )
-            # журнал перемещений — нужен для отмены последней сортировки
+
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS moves (
@@ -67,6 +65,32 @@ class FileIndex:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_moves_batch ON moves(batch)"
+            )
+
+            move_cols = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(moves)").fetchall()
+            }
+            for col, default in (
+                ("category", "''"),
+                ("action", "'move'"),
+                ("name", "''"),
+            ):
+                if col not in move_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE moves ADD COLUMN {col} TEXT DEFAULT {default}"
+                    )
+
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS batches (
+                    batch TEXT PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    sort_mode TEXT,
+                    storage_mode TEXT,
+                    item_count INTEGER DEFAULT 0
+                )
+                """
             )
             self._conn.commit()
 
@@ -109,13 +133,53 @@ class FileIndex:
             )
             self._conn.commit()
 
-    # ---- журнал перемещений (для отмены) ----
+    # ---- журнал перемещений ----
 
-    def log_move(self, *, batch: str, src: str, dst: str, kind: str, ts: float) -> None:
+    def start_batch(
+        self, *, batch: str, sort_mode: str, storage_mode: str, ts: float,
+    ) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO moves (batch, src, dst, kind, ts) VALUES (?, ?, ?, ?, ?)",
-                (batch, src, dst, kind, ts),
+                """
+                INSERT INTO batches (batch, ts, sort_mode, storage_mode, item_count)
+                VALUES (?, ?, ?, ?, 0)
+                ON CONFLICT(batch) DO UPDATE SET
+                    ts=excluded.ts,
+                    sort_mode=excluded.sort_mode,
+                    storage_mode=excluded.storage_mode
+                """,
+                (batch, ts, sort_mode, storage_mode),
+            )
+            self._conn.commit()
+
+    def finish_batch(self, batch: str, item_count: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE batches SET item_count = ? WHERE batch = ?",
+                (item_count, batch),
+            )
+            self._conn.commit()
+
+    def log_move(
+        self,
+        *,
+        batch: str,
+        src: str,
+        dst: str,
+        kind: str,
+        ts: float,
+        category: str = "",
+        action: str = "move",
+        name: str = "",
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO moves
+                    (batch, src, dst, kind, ts, category, action, name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (batch, src, dst, kind, ts, category, action, name or Path(dst).name),
             )
             self._conn.commit()
 
@@ -135,7 +199,51 @@ class FileIndex:
     def delete_batch(self, batch: str) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM moves WHERE batch = ?", (batch,))
+            self._conn.execute("DELETE FROM batches WHERE batch = ?", (batch,))
             self._conn.commit()
+
+    def query_history(
+        self,
+        *,
+        batch: str | None = None,
+        search: str | None = None,
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        sql = """
+            SELECT m.*, b.sort_mode, b.storage_mode
+            FROM moves m
+            LEFT JOIN batches b ON b.batch = m.batch
+            WHERE 1=1
+        """
+        params: list = []
+        if batch and batch != "Все операции":
+            sql += " AND m.batch = ?"
+            params.append(batch)
+        if search:
+            sql += " AND (m.name LIKE ? OR m.src LIKE ? OR m.dst LIKE ?)"
+            like = f"%{search}%"
+            params.extend([like, like, like])
+        sql += " ORDER BY m.ts DESC, m.id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
+
+    def history_batches(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                """
+                SELECT b.*, COUNT(m.id) AS moves_count
+                FROM batches b
+                LEFT JOIN moves m ON m.batch = b.batch
+                GROUP BY b.batch
+                ORDER BY b.ts DESC
+                LIMIT 200
+                """
+            ).fetchall()
+
+    def history_count(self) -> int:
+        with self._lock:
+            return self._conn.execute("SELECT COUNT(*) AS c FROM moves").fetchone()["c"]
 
     def remove_by_path(self, path: str) -> None:
         with self._lock:
@@ -143,7 +251,6 @@ class FileIndex:
             self._conn.commit()
 
     def remove_missing(self) -> int:
-        """Удалить из индекса записи о файлах, которых уже нет на диске."""
         removed = 0
         with self._lock:
             rows = self._conn.execute("SELECT id, path FROM files").fetchall()

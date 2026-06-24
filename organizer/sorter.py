@@ -1,4 +1,4 @@
-"""Движок сортировки: перемещает файлы и папки в Категория/Год/Месяц и индексирует."""
+"""Движок сортировки: перемещает или копирует файлы по выбранной схеме."""
 
 from __future__ import annotations
 
@@ -9,36 +9,40 @@ from pathlib import Path
 
 from .config import APP_DIR, FOLDER_CATEGORY, SKIP_EXTENSIONS, Settings, app_install_root
 from .database import FileIndex
+from .layouts import dest_directory
 
-MONTHS_RU = {
-    1: "01-Январь", 2: "02-Февраль", 3: "03-Март", 4: "04-Апрель",
-    5: "05-Май", 6: "06-Июнь", 7: "07-Июль", 8: "08-Август",
-    9: "09-Сентябрь", 10: "10-Октябрь", 11: "11-Ноябрь", 12: "12-Декабрь",
-}
-
-# Папка самого приложения — её и всё внутри трогать нельзя.
 APP_ROOT = app_install_root()
 
 
 class Sorter:
-    """Сортирует файлы по типу и дате загрузки, а папки — целиком в 'Папки'."""
+    """Сортирует файлы и папки по настраиваемой схеме раскладки."""
 
     def __init__(self, settings: Settings, index: FileIndex) -> None:
         self.settings = settings
         self.index = index
-        # текущая "пачка" перемещений (для группировки при отмене)
         self.current_batch: str | None = None
+        self._batch_count = 0
 
-    def _record_move(self, src: str, dst: str, kind: str, ts: float) -> None:
+    def _record_move(
+        self, src: str, dst: str, kind: str, ts: float,
+        *, category: str, name: str,
+    ) -> None:
         batch = self.current_batch or f"single-{time.time():.6f}"
-        self.index.log_move(batch=batch, src=src, dst=dst, kind=kind, ts=time.time())
+        self.index.log_move(
+            batch=batch, src=src, dst=dst, kind=kind, ts=time.time(),
+            category=category,
+            action=self.settings.storage_mode,
+            name=name,
+        )
+        self._batch_count += 1
 
-    # ---- вспомогательные ----
-
-    @staticmethod
-    def _download_time(path: Path) -> float:
-        """Время появления файла/папки (приближение даты загрузки)."""
+    def _file_time(self, path: Path) -> float:
         st = path.stat()
+        src = self.settings.date_source
+        if src == "modified":
+            return st.st_mtime
+        if src == "created":
+            return st.st_ctime
         return min(st.st_ctime, st.st_mtime)
 
     @staticmethod
@@ -56,10 +60,8 @@ class Sorter:
         return total
 
     def _is_ready(self, path: Path) -> bool:
-        """Объект готов к перемещению (не качается/не изменяется прямо сейчас)?"""
         if path.is_file():
-            ext = path.suffix.lower()
-            if ext in SKIP_EXTENSIONS:
+            if path.suffix.lower() in SKIP_EXTENSIONS:
                 return False
         try:
             age = time.time() - path.stat().st_mtime
@@ -76,23 +78,18 @@ class Sorter:
             return False
 
     def _is_protected(self, path: Path) -> bool:
-        """Запрещённые для перемещения объекты: само приложение, его данные,
-        папка-архив и сами отслеживаемые папки."""
         try:
             rp = path.resolve()
         except OSError:
             return True
-        # папка приложения и всё внутри неё
         if rp == APP_ROOT or APP_ROOT in rp.parents:
             return True
-        # служебные данные приложения
         try:
             app_data = APP_DIR.resolve()
             if rp == app_data or app_data in rp.parents:
                 return True
         except OSError:
             pass
-        # сами отслеживаемые папки (их содержимое сортируем, а их — нет)
         for folder in self.settings.watched_folders:
             try:
                 if rp == Path(folder).resolve():
@@ -103,7 +100,6 @@ class Sorter:
 
     @staticmethod
     def _unique_target(target: Path) -> Path:
-        """Если объект с таким именем уже есть — добавить (1), (2)..."""
         if not target.exists():
             return target
         stem, suffix = target.stem, target.suffix
@@ -116,21 +112,32 @@ class Sorter:
                 return candidate
             i += 1
 
-    def _dest_dir(self, category: str, ts: float) -> tuple[Path, int, int]:
-        dt = datetime.fromtimestamp(ts)
-        dest_dir = (
-            Path(self.settings.destination)
-            / category
-            / str(dt.year)
-            / MONTHS_RU[dt.month]
+    def _dest_dir(
+        self, category: str, ts: float, extension: str = "", is_dir: bool = False,
+    ) -> tuple[Path, int, int]:
+        return dest_directory(
+            archive_root=Path(self.settings.destination),
+            sort_mode=self.settings.sort_mode,
+            category=category,
+            extension=extension,
+            ts=ts,
+            is_dir=is_dir,
         )
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        return dest_dir, dt.year, dt.month
 
-    # ---- сортировка отдельных объектов ----
+    def _transfer(self, src: Path, dst: Path) -> bool:
+        try:
+            if self.settings.storage_mode == "copy":
+                if src.is_dir():
+                    shutil.copytree(str(src), str(dst))
+                else:
+                    shutil.copy2(str(src), str(dst))
+            else:
+                shutil.move(str(src), str(dst))
+            return True
+        except (OSError, shutil.Error):
+            return False
 
     def sort_file(self, file_path: str | Path) -> Path | None:
-        """Отсортировать один файл. Возвращает новый путь или None."""
         path = Path(file_path)
         if not path.is_file():
             return None
@@ -141,25 +148,23 @@ class Sorter:
 
         ext = path.suffix.lower()
         category = self.settings.category_for_extension(ext)
-        ts = self._download_time(path)
-        dest_dir, year, month = self._dest_dir(category, ts)
+        ts = self._file_time(path)
+        dest_dir, year, month = self._dest_dir(category, ts, ext)
         target = self._unique_target(dest_dir / path.name)
 
-        try:
-            shutil.move(str(path), str(target))
-        except (OSError, shutil.Error):
+        if not self._transfer(path, target):
             return None
 
+        src_str = str(path)
         self.index.add_file(
-            name=target.name, path=str(target), source_path=str(path),
+            name=target.name, path=str(target), source_path=src_str,
             category=category, extension=ext, size=target.stat().st_size,
             added_ts=ts, year=year, month=month, kind="file",
         )
-        self._record_move(str(path), str(target), "file", ts)
+        self._record_move(src_str, str(target), "file", ts, category=category, name=target.name)
         return target
 
     def sort_directory(self, dir_path: str | Path) -> Path | None:
-        """Отсортировать одну папку (перенести целиком в категорию 'Папки')."""
         path = Path(dir_path)
         if not path.is_dir():
             return None
@@ -170,35 +175,33 @@ class Sorter:
         if self._is_inside_destination(path) or self._is_protected(path):
             return None
 
-        ts = self._download_time(path)
+        ts = self._file_time(path)
         size = self._folder_size(path)
-        dest_dir, year, month = self._dest_dir(FOLDER_CATEGORY, ts)
+        dest_dir, year, month = self._dest_dir(FOLDER_CATEGORY, ts, is_dir=True)
         target = self._unique_target(dest_dir / path.name)
 
-        try:
-            shutil.move(str(path), str(target))
-        except (OSError, shutil.Error):
+        if not self._transfer(path, target):
             return None
 
+        src_str = str(path)
         self.index.add_file(
-            name=target.name, path=str(target), source_path=str(path),
+            name=target.name, path=str(target), source_path=src_str,
             category=FOLDER_CATEGORY, extension="", size=size,
             added_ts=ts, year=year, month=month, kind="dir",
         )
-        self._record_move(str(path), str(target), "dir", ts)
+        self._record_move(
+            src_str, str(target), "dir", ts,
+            category=FOLDER_CATEGORY, name=target.name,
+        )
         return target
 
     def sort_entry(self, entry_path: str | Path) -> Path | None:
-        """Отсортировать файл или папку — автоматически определяет тип."""
         path = Path(entry_path)
         if path.is_dir():
             return self.sort_directory(path)
         return self.sort_file(path)
 
-    # ---- пакетная сортировка ----
-
     def sort_folder(self, folder: str | Path) -> int:
-        """Отсортировать все файлы и папки верхнего уровня внутри folder."""
         folder = Path(folder)
         if not folder.is_dir():
             return 0
@@ -209,7 +212,6 @@ class Sorter:
         except OSError:
             return 0
         for entry in entries:
-            # никогда не трогаем сам архив
             try:
                 if entry.resolve() == dest:
                     continue
@@ -220,10 +222,17 @@ class Sorter:
         return count
 
     def sort_all(self) -> int:
-        """Отсортировать все отслеживаемые папки. Возвращает общее количество."""
         total = 0
         dest = Path(self.settings.destination).resolve()
-        self.current_batch = f"sort-{datetime.now():%Y%m%d-%H%M%S}-{time.time():.0f}"
+        batch = f"sort-{datetime.now():%Y%m%d-%H%M%S}-{time.time():.0f}"
+        self.current_batch = batch
+        self._batch_count = 0
+        self.index.start_batch(
+            batch=batch,
+            sort_mode=self.settings.sort_mode,
+            storage_mode=self.settings.storage_mode,
+            ts=time.time(),
+        )
         try:
             for folder in self.settings.watched_folders:
                 fpath = Path(folder).resolve()
@@ -231,68 +240,98 @@ class Sorter:
                     continue
                 total += self.sort_folder(fpath)
         finally:
+            self.index.finish_batch(batch, total)
             self.current_batch = None
         return total
 
-    def undo_last(self) -> tuple[int, int]:
-        """Отменить последнюю сортировку: вернуть файлы/папки на прежние места.
-
-        Возвращает (успешно возвращено, не удалось).
-        """
-        batch = self.index.last_batch()
-        if not batch:
-            return (0, 0)
-        ok = 0
-        fail = 0
+    def undo_batch(self, batch: str) -> tuple[int, int]:
+        ok = fail = 0
         for mv in self.index.moves_in_batch(batch):
             dst = Path(mv["dst"])
             src = Path(mv["src"])
+            action = mv["action"] if "action" in mv.keys() else "move"
             if not dst.exists():
-                # уже нет на месте — просто чистим индекс
                 self.index.remove_by_path(str(dst))
                 continue
             try:
-                src.parent.mkdir(parents=True, exist_ok=True)
-                target = src
-                if target.exists():
-                    target = self._unique_target(src)
-                shutil.move(str(dst), str(target))
+                if action == "copy":
+                    if dst.is_dir():
+                        shutil.rmtree(dst)
+                    else:
+                        dst.unlink()
+                else:
+                    src.parent.mkdir(parents=True, exist_ok=True)
+                    target = src if not src.exists() else self._unique_target(src)
+                    shutil.move(str(dst), str(target))
                 self.index.remove_by_path(str(dst))
                 ok += 1
             except (OSError, shutil.Error):
                 fail += 1
         self.index.delete_batch(batch)
-        return (ok, fail)
+        return ok, fail
+
+    def undo_last(self) -> tuple[int, int]:
+        batch = self.index.last_batch()
+        if not batch:
+            return (0, 0)
+        return self.undo_batch(batch)
+
+    def _guess_category_from_path(self, entry: Path, archive: Path) -> str:
+        try:
+            rel = entry.relative_to(archive)
+            parts = rel.parts
+            if not parts:
+                return "Другое"
+            if parts[0] == "По расширению" and len(parts) > 1:
+                return f".{parts[1]}"
+            if parts[0].isdigit() and len(parts) >= 2:
+                return "По дате"
+            return parts[0]
+        except ValueError:
+            return "Другое"
 
     def reindex_destination(self) -> int:
-        """Перестроить индекс по содержимому архива (файлы и папки верхнего
-        уровня внутри Категория/Год/Месяц)."""
         dest = Path(self.settings.destination)
         if not dest.is_dir():
             return 0
         count = 0
-        for category_dir in dest.iterdir():
-            if not category_dir.is_dir():
+        file_paths: set[str] = set()
+
+        for entry in dest.rglob("*"):
+            if not entry.is_file():
                 continue
-            category = category_dir.name
-            for year_dir in category_dir.iterdir():
-                if not year_dir.is_dir():
-                    continue
-                for month_dir in year_dir.iterdir():
-                    if not month_dir.is_dir():
-                        continue
-                    for entry in month_dir.iterdir():
-                        ts = self._download_time(entry)
-                        dt = datetime.fromtimestamp(ts)
-                        is_dir = entry.is_dir()
-                        self.index.add_file(
-                            name=entry.name, path=str(entry), source_path="",
-                            category=category,
-                            extension="" if is_dir else entry.suffix.lower(),
-                            size=self._folder_size(entry) if is_dir
-                            else entry.stat().st_size,
-                            added_ts=ts, year=dt.year, month=dt.month,
-                            kind="dir" if is_dir else "file",
-                        )
-                        count += 1
+            rp = str(entry.resolve())
+            file_paths.add(rp)
+            ts = self._file_time(entry)
+            dt = datetime.fromtimestamp(ts)
+            category = self._guess_category_from_path(entry, dest)
+            self.index.add_file(
+                name=entry.name, path=rp, source_path="",
+                category=category, extension=entry.suffix.lower(),
+                size=entry.stat().st_size, added_ts=ts,
+                year=dt.year, month=dt.month, kind="file",
+            )
+            count += 1
+
+        for entry in dest.rglob("*"):
+            if not entry.is_dir() or entry == dest:
+                continue
+            try:
+                kids = list(entry.iterdir())
+            except OSError:
+                continue
+            if not kids or any(k.is_dir() for k in kids):
+                continue
+            if kids and all(k.is_file() and str(k.resolve()) in file_paths for k in kids):
+                continue
+            rp = str(entry.resolve())
+            ts = self._file_time(entry)
+            dt = datetime.fromtimestamp(ts)
+            category = self._guess_category_from_path(entry, dest)
+            self.index.add_file(
+                name=entry.name, path=rp, source_path="",
+                category=category, extension="", size=self._folder_size(entry),
+                added_ts=ts, year=dt.year, month=dt.month, kind="dir",
+            )
+            count += 1
         return count

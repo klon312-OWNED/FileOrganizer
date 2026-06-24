@@ -80,8 +80,13 @@ DEFAULT_SETTINGS: dict = {
     "archive_name": "Архив",
     # Сортировать ли папки (целиком переносить в категорию "Папки")
     "sort_folders": True,
+    # Режим раскладки: type_date | type_only | date_only | extension | flat
+    "sort_mode": "type_date",
+    # move — перемещать; copy — копировать, оригинал оставлять
+    "storage_mode": "move",
+    # Источник даты для папок назначения
+    "date_source": "download",
     # Сколько секунд файл должен быть "спокоен" перед перемещением
-    # (чтобы не перемещать файл во время скачивания)
     "min_age_seconds": 5,
     # Категории по типам
     "categories": DEFAULT_CATEGORIES,
@@ -140,6 +145,18 @@ class Settings:
     @property
     def categories(self) -> dict[str, list[str]]:
         return self.data.get("categories", DEFAULT_CATEGORIES)
+
+    @property
+    def sort_mode(self) -> str:
+        return self.data.get("sort_mode", "type_date")
+
+    @property
+    def storage_mode(self) -> str:
+        return self.data.get("storage_mode", "move")
+
+    @property
+    def date_source(self) -> str:
+        return self.data.get("date_source", "download")
 
     def category_for_extension(self, ext: str) -> str:
         """Определить категорию по расширению файла."""
