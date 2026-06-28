@@ -14,6 +14,7 @@ from pathlib import Path
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
+from .config import SKIP_EXTENSIONS
 from .sorter import Sorter
 
 
@@ -62,10 +63,13 @@ class FolderWatcher:
 
     def _queue(self, path: str) -> None:
         try:
-            rp = str(Path(path).resolve())
+            p = Path(path)
+            rp = str(p.resolve())
         except OSError:
             return
         if rp in self._protected:
+            return
+        if p.is_file() and p.suffix.lower() in SKIP_EXTENSIONS:
             return
         with self._pending_lock:
             self._pending[path] = time.time()
@@ -76,20 +80,43 @@ class FolderWatcher:
             time.sleep(2)
             with self._pending_lock:
                 items = list(self._pending.keys())
+
+            to_sort: list[str] = []
+            drop: list[str] = []
             for path in items:
-                if not Path(path).exists():
-                    with self._pending_lock:
-                        self._pending.pop(path, None)
+                p = Path(path)
+                if not p.exists():
+                    drop.append(path)
                     continue
-                result = self.sorter.sort_entry(path)
-                if result is not None:
-                    with self._pending_lock:
+                if p.is_dir() and not self.sorter.settings.sort_folders:
+                    drop.append(path)
+                    continue
+                if self.sorter._is_inside_destination(p) or self.sorter._is_protected(p):
+                    drop.append(path)
+                    continue
+                if not self.sorter._is_ready(p):
+                    continue
+                to_sort.append(path)
+
+            if drop:
+                with self._pending_lock:
+                    for path in drop:
                         self._pending.pop(path, None)
-                    if self.on_sorted:
-                        try:
-                            self.on_sorted(str(result))
-                        except Exception:
-                            pass
+
+            if not to_sort:
+                continue
+
+            with self.sorter.batch_context("watch"):
+                for path in to_sort:
+                    result = self.sorter.sort_entry(path)
+                    if result is not None:
+                        with self._pending_lock:
+                            self._pending.pop(path, None)
+                        if self.on_sorted:
+                            try:
+                                self.on_sorted(str(result))
+                            except Exception:
+                                pass
 
     def start(self) -> None:
         if self._observer is not None:

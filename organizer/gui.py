@@ -10,18 +10,18 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 from tkinter import (
-    BOTH, END, LEFT, RIGHT, X, Y, Frame, Label, StringVar, Tk, Toplevel,
-    Text, filedialog, messagebox,
+    BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, Frame, Label, StringVar, Tk, Toplevel,
+    Text, filedialog, messagebox, Canvas,
 )
 from tkinter import ttk
 
 from .classify import classify
 from .config import OTHER_CATEGORY, Settings
 from .database import FileIndex
-from .layouts import DATE_SOURCES, SORT_MODES, STORAGE_MODES, sort_mode_label, storage_mode_label
+from .layouts import DATE_SOURCES, MONTHS_RU, SORT_MODES, STORAGE_MODES, sort_mode_label, storage_mode_label
 from .preview import get_text_preview
 from .scanner import Scanner, fixed_drives
-from .sorter import MONTHS_RU, Sorter
+from .sorter import Sorter
 from . import theme
 from .thumbs import IMAGE_EXTS, VIDEO_EXTS, get_thumbnail
 from .watcher import FolderWatcher
@@ -140,13 +140,16 @@ class App(Tk):
         nb = ttk.Notebook(self)
         nb.pack(side="top", fill=BOTH, expand=True, padx=10, pady=(6, 10))
         tab_archive = Frame(nb, bg=theme.BG)
+        tab_desktop = Frame(nb, bg=theme.BG)
         tab_history = Frame(nb, bg=theme.BG)
         tab_pc = Frame(nb, bg=theme.BG)
         nb.add(tab_archive, text="  Архив  ")
+        nb.add(tab_desktop, text="  Рабочий стол  ")
         nb.add(tab_history, text="  История  ")
         nb.add(tab_pc, text="  Поиск по ПК  ")
 
         self._build_archive_tab(tab_archive)
+        self._build_desktop_tab(tab_desktop)
         self._build_history_tab(tab_history)
         self._build_pc_tab(tab_pc)
 
@@ -254,6 +257,262 @@ class App(Tk):
         self.ctx = Menu(self, tearoff=0)
         self.ctx.add_command(label="Открыть файл", command=self._open_selected)
         self.ctx.add_command(label="Показать в папке", command=self._reveal_selected)
+
+    # ---------- вкладка «рабочий стол» ----------
+
+    _DESKTOP_TILE_W = 132
+    _DESKTOP_TILE_H = 152
+    _DESKTOP_COL_PAD = 140
+
+    def _build_desktop_tab(self, root) -> None:
+        self._desktop_selected: set[str] = set()
+        self._desktop_photos: dict[str, object] = {}
+        self._desktop_tiles: dict[str, Frame] = {}
+        self._desktop_entries: list[dict] = []
+
+        toolbar = Frame(root, padx=4, pady=8, bg=theme.BG)
+        toolbar.pack(side="top", fill=X)
+
+        ttk.Button(toolbar, text="Выбрать всё", command=self._desktop_select_all).pack(side=LEFT)
+        ttk.Button(toolbar, text="Снять выбор", command=self._desktop_deselect_all).pack(
+            side=LEFT, padx=(8, 0),
+        )
+        ttk.Button(
+            toolbar, text="Сортировать выбранное", style="Accent.TButton",
+            command=self._desktop_sort_selected,
+        ).pack(side=LEFT, padx=(16, 0))
+        ttk.Button(toolbar, text="Сортировать всё", command=self._sort_now).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(toolbar, text="Обновить", command=self._desktop_refresh).pack(side=LEFT, padx=(8, 0))
+
+        self._desktop_count_var = StringVar(value="Выбрано: 0")
+        Label(
+            toolbar, textvariable=self._desktop_count_var, bg=theme.BG,
+            fg=theme.TEXT_MUTED, font=("Segoe UI", 10),
+        ).pack(side=RIGHT, padx=(8, 4))
+
+        body = Frame(root, bg=theme.BG)
+        body.pack(side="top", fill=BOTH, expand=True, padx=4, pady=(0, 4))
+
+        self._desktop_canvas = Canvas(body, bg=theme.BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(body, orient="vertical", command=self._desktop_canvas.yview)
+        self._desktop_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=RIGHT, fill=Y)
+        self._desktop_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+
+        self._desktop_inner = Frame(self._desktop_canvas, bg=theme.BG)
+        self._desktop_window = self._desktop_canvas.create_window(
+            (0, 0), window=self._desktop_inner, anchor="nw",
+        )
+
+        self._desktop_inner.bind("<Configure>", self._desktop_on_inner_configure)
+        self._desktop_canvas.bind("<Configure>", self._desktop_on_canvas_configure)
+        self._desktop_canvas.bind("<MouseWheel>", self._desktop_on_mousewheel)
+        root.bind("<Control-a>", self._desktop_select_all_shortcut)
+
+        self._desktop_refresh()
+
+    def _desktop_on_inner_configure(self, _event=None) -> None:
+        self._desktop_canvas.configure(scrollregion=self._desktop_canvas.bbox("all"))
+
+    def _desktop_on_canvas_configure(self, event) -> None:
+        self._desktop_canvas.itemconfigure(self._desktop_window, width=event.width)
+        self._desktop_reflow()
+
+    def _desktop_on_mousewheel(self, event) -> None:
+        if self._desktop_canvas.winfo_exists():
+            self._desktop_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def _desktop_refresh(self) -> None:
+        self._desktop_selected.clear()
+        self._desktop_photos.clear()
+        for widget in self._desktop_inner.winfo_children():
+            widget.destroy()
+        self._desktop_tiles.clear()
+        self._desktop_entries = self.sorter.list_watched_entries()
+        if not self._desktop_entries:
+            Label(
+                self._desktop_inner, text="Нет элементов в отслеживаемых папках.\n"
+                "Проверьте настройки или нажмите «Обновить».",
+                bg=theme.BG, fg=theme.TEXT_MUTED, font=("Segoe UI", 11), justify="center",
+            ).pack(pady=40)
+        else:
+            for entry in self._desktop_entries:
+                tile = self._desktop_make_tile(entry)
+                self._desktop_tiles[entry["path"]] = tile
+            self._desktop_reflow()
+        self._desktop_update_count()
+        self.status_var.set(f"Рабочий стол: {len(self._desktop_entries)} элементов")
+
+    def _desktop_make_tile(self, entry: dict) -> Frame:
+        path = entry["path"]
+        selected = path in self._desktop_selected
+        sortable = entry.get("sortable", True)
+
+        outer = Frame(
+            self._desktop_inner,
+            width=self._DESKTOP_TILE_W,
+            height=self._DESKTOP_TILE_H,
+            bg=theme.DESKTOP_TILE_SEL if selected else theme.DESKTOP_TILE,
+            highlightbackground=theme.DESKTOP_TILE_SEL_BORDER if selected else theme.DESKTOP_TILE_BORDER,
+            highlightthickness=2,
+            cursor="hand2",
+        )
+        outer.pack_propagate(False)
+
+        top = Frame(outer, bg=outer["bg"])
+        top.pack(fill=X, padx=4, pady=(4, 0))
+
+        chk_var = BooleanVar(value=selected)
+        chk = ttk.Checkbutton(top, variable=chk_var, command=lambda p=path, v=chk_var: self._desktop_set_selected(p, v.get()))
+        chk.pack(side=LEFT)
+        if not sortable:
+            Label(top, text="⏳", bg=outer["bg"], fg=theme.DESKTOP_MUTED, font=("Segoe UI", 9)).pack(side=RIGHT)
+
+        icon_bg = theme.DESKTOP_ICON_BG if sortable else "#f8fafc"
+        icon_box = Frame(outer, width=96, height=72, bg=icon_bg)
+        icon_box.pack(pady=(2, 4))
+        icon_box.pack_propagate(False)
+        icon_label = Label(icon_box, bg=icon_bg, anchor="center")
+        icon_label.pack(fill=BOTH, expand=True)
+
+        if entry["is_dir"]:
+            icon_label.configure(text="📁", font=("Segoe UI Emoji", 30))
+        else:
+            thumb = get_thumbnail(path, (96, 72))
+            if thumb and _HAS_PIL:
+                photo = ImageTk.PhotoImage(thumb)
+                self._desktop_photos[path] = photo
+                icon_label.configure(image=photo)
+            else:
+                ext = Path(path).suffix.lower().lstrip(".") or "?"
+                icon_label.configure(
+                    text=ext[:6].upper(),
+                    font=("Segoe UI", 10, "bold"),
+                    fg=theme.ACCENT if sortable else theme.DESKTOP_MUTED,
+                )
+
+        name_fg = theme.TEXT if sortable else theme.DESKTOP_MUTED
+        name_label = Label(
+            outer, text=entry["name"], bg=outer["bg"], fg=name_fg,
+            font=("Segoe UI", 9), wraplength=118, justify="center",
+        )
+        name_label.pack(fill=X, padx=4, pady=(0, 6))
+
+        for widget in (outer, icon_box, icon_label, name_label, top):
+            widget.bind("<Button-1>", lambda e, p=path: self._desktop_toggle(p))
+            widget.bind("<Double-1>", lambda e, p=path: reveal_in_explorer(p))
+
+        outer._desktop_chk = chk_var  # type: ignore[attr-defined]
+        return outer
+
+    def _desktop_set_selected(self, path: str, selected: bool) -> None:
+        if selected:
+            self._desktop_selected.add(path)
+        else:
+            self._desktop_selected.discard(path)
+        self._desktop_apply_tile_style(path)
+        self._desktop_update_count()
+
+    def _desktop_toggle(self, path: str) -> None:
+        if path in self._desktop_selected:
+            self._desktop_selected.discard(path)
+        else:
+            self._desktop_selected.add(path)
+        tile = self._desktop_tiles.get(path)
+        if tile and hasattr(tile, "_desktop_chk"):
+            tile._desktop_chk.set(path in self._desktop_selected)  # type: ignore[attr-defined]
+        self._desktop_apply_tile_style(path)
+        self._desktop_update_count()
+
+    def _desktop_apply_tile_style(self, path: str) -> None:
+        tile = self._desktop_tiles.get(path)
+        if not tile:
+            return
+        selected = path in self._desktop_selected
+        bg = theme.DESKTOP_TILE_SEL if selected else theme.DESKTOP_TILE
+        border = theme.DESKTOP_TILE_SEL_BORDER if selected else theme.DESKTOP_TILE_BORDER
+        tile.configure(bg=bg, highlightbackground=border)
+        for child in tile.winfo_children():
+            try:
+                child.configure(bg=bg)
+            except Exception:
+                pass
+            for sub in child.winfo_children():
+                try:
+                    if not isinstance(sub, ttk.Checkbutton):
+                        sub.configure(bg=bg)
+                except Exception:
+                    pass
+
+    def _desktop_reflow(self, _event=None) -> None:
+        if not self._desktop_tiles:
+            return
+        width = max(self._desktop_canvas.winfo_width(), self._DESKTOP_COL_PAD)
+        cols = max(1, width // self._DESKTOP_COL_PAD)
+        for i, entry in enumerate(self._desktop_entries):
+            tile = self._desktop_tiles.get(entry["path"])
+            if tile:
+                row, col = divmod(i, cols)
+                tile.grid(row=row, column=col, padx=6, pady=6)
+        self._desktop_inner.update_idletasks()
+        self._desktop_canvas.configure(scrollregion=self._desktop_canvas.bbox("all"))
+
+    def _desktop_select_all(self) -> None:
+        for entry in self._desktop_entries:
+            if not entry.get("sortable", True):
+                continue
+            self._desktop_selected.add(entry["path"])
+            tile = self._desktop_tiles.get(entry["path"])
+            if tile and hasattr(tile, "_desktop_chk"):
+                tile._desktop_chk.set(True)  # type: ignore[attr-defined]
+            self._desktop_apply_tile_style(entry["path"])
+        self._desktop_update_count()
+
+    def _desktop_select_all_shortcut(self, event=None):
+        self._desktop_select_all()
+        return "break"
+
+    def _desktop_deselect_all(self) -> None:
+        for path in list(self._desktop_selected):
+            tile = self._desktop_tiles.get(path)
+            if tile and hasattr(tile, "_desktop_chk"):
+                tile._desktop_chk.set(False)  # type: ignore[attr-defined]
+            self._desktop_apply_tile_style(path)
+        self._desktop_selected.clear()
+        self._desktop_update_count()
+
+    def _desktop_update_count(self) -> None:
+        n = len(self._desktop_selected)
+        total = len(self._desktop_entries)
+        self._desktop_count_var.set(f"Выбрано: {n} из {total}")
+
+    def _desktop_sort_selected(self) -> None:
+        by_path = {e["path"]: e for e in self._desktop_entries}
+        paths = [
+            p for p in self._desktop_selected
+            if by_path.get(p, {}).get("sortable") and Path(p).exists()
+        ]
+        if not paths:
+            messagebox.showwarning(
+                "Нечего сортировать",
+                "Выберите элементы, готовые к сортировке.\n"
+                "Файлы в процессе загрузки (.crdownload и т.п.) пока пропускаются.",
+            )
+            return
+        skipped = len(self._desktop_selected) - len(paths)
+        msg = f"Сортировать выбранное ({len(paths)} шт.)?"
+        if skipped:
+            msg += f"\n\n{skipped} выбранных элементов пропущено (ещё не готовы)."
+        if not messagebox.askyesno("Сортировать выбранное", msg):
+            return
+        self.status_var.set("Сортирую выбранное...")
+        self.update_idletasks()
+
+        def work():
+            moved = self.sorter.sort_paths(paths)
+            self.after(0, lambda: self._after_sort(moved))
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ---------- вкладка «история» ----------
 
@@ -673,6 +932,8 @@ class App(Tk):
         self._refresh_filters()
         self._reload_table()
         self._reload_history()
+        if hasattr(self, "_desktop_canvas"):
+            self._desktop_refresh()
         messagebox.showinfo("Готово", f"Обработано файлов: {moved}")
 
     def _undo_last(self):
@@ -694,6 +955,8 @@ class App(Tk):
         self._refresh_filters()
         self._reload_table()
         self._reload_history()
+        if hasattr(self, "_desktop_canvas"):
+            self._desktop_refresh()
         if ok == 0 and fail == 0:
             messagebox.showinfo("Отмена", "Нечего отменять.")
         else:
@@ -733,6 +996,8 @@ class App(Tk):
         self._refresh_filters()
         self._reload_table()
         self._reload_history()
+        if hasattr(self, "_desktop_canvas"):
+            self._desktop_refresh()
 
     # ---------- логика вкладки «весь компьютер» ----------
 
@@ -1099,6 +1364,8 @@ class App(Tk):
             self.settings.data["watched_folders"] = folders
             self.settings.save()
             self._update_mode_banner()
+            if hasattr(self, "_desktop_canvas"):
+                self._desktop_refresh()
             if self.watcher.running:
                 self.watcher.stop()
                 self.watcher.start()

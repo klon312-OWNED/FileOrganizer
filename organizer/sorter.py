@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -221,10 +222,58 @@ class Sorter:
                 count += 1
         return count
 
-    def sort_all(self) -> int:
-        total = 0
+    def list_watched_entries(self) -> list[dict]:
+        """Верхнеуровневые элементы из отслеживаемых папок (для «Рабочего стола»)."""
         dest = Path(self.settings.destination).resolve()
-        batch = f"sort-{datetime.now():%Y%m%d-%H%M%S}-{time.time():.0f}"
+        entries: list[dict] = []
+        seen: set[str] = set()
+        for folder in self.settings.watched_folders:
+            try:
+                fpath = Path(folder).resolve()
+            except OSError:
+                continue
+            if fpath == dest or dest in fpath.parents:
+                continue
+            try:
+                children = list(fpath.iterdir())
+            except OSError:
+                continue
+            for entry in children:
+                try:
+                    if entry.resolve() == dest:
+                        continue
+                except OSError:
+                    continue
+                if self._is_protected(entry):
+                    continue
+                if self._is_inside_destination(entry):
+                    continue
+                try:
+                    key = str(entry.resolve())
+                except OSError:
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                is_dir = entry.is_dir()
+                if is_dir:
+                    sortable = bool(self.settings.sort_folders and self._is_ready(entry))
+                else:
+                    sortable = self._is_ready(entry)
+                entries.append({
+                    "path": key,
+                    "name": entry.name,
+                    "is_dir": is_dir,
+                    "sortable": sortable,
+                    "folder": str(fpath),
+                })
+        entries.sort(key=lambda e: (e["folder"].lower(), e["name"].lower()))
+        return entries
+
+    @contextmanager
+    def batch_context(self, prefix: str = "sort"):
+        """Группировать несколько sort_entry в одну запись истории."""
+        batch = f"{prefix}-{datetime.now():%Y%m%d-%H%M%S}-{time.time():.0f}"
         self.current_batch = batch
         self._batch_count = 0
         self.index.start_batch(
@@ -234,14 +283,32 @@ class Sorter:
             ts=time.time(),
         )
         try:
+            yield
+        finally:
+            if self._batch_count > 0:
+                self.index.finish_batch(batch, self._batch_count)
+            else:
+                self.index.delete_batch(batch)
+            self.current_batch = None
+
+    def sort_paths(self, paths: list[str | Path]) -> int:
+        """Сортировать только указанные пути (одна пакетная операция)."""
+        count = 0
+        with self.batch_context("sort"):
+            for raw in paths:
+                if self.sort_entry(raw):
+                    count += 1
+        return count
+
+    def sort_all(self) -> int:
+        total = 0
+        dest = Path(self.settings.destination).resolve()
+        with self.batch_context("sort"):
             for folder in self.settings.watched_folders:
                 fpath = Path(folder).resolve()
                 if fpath == dest or dest in fpath.parents:
                     continue
                 total += self.sort_folder(fpath)
-        finally:
-            self.index.finish_batch(batch, total)
-            self.current_batch = None
         return total
 
     def undo_batch(self, batch: str) -> tuple[int, int]:

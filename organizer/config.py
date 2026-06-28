@@ -68,6 +68,10 @@ FOLDER_CATEGORY = "Папки"
 # Расширения файлов, которые ещё качаются — их трогать нельзя.
 SKIP_EXTENSIONS = [".crdownload", ".part", ".tmp", ".partial", ".download", ".!ut"]
 
+_VALID_SORT_MODES = frozenset({"type_date", "type_only", "date_only", "extension", "flat"})
+_VALID_STORAGE_MODES = frozenset({"move", "copy"})
+_VALID_DATE_SOURCES = frozenset({"download", "modified", "created"})
+
 DEFAULT_SETTINGS: dict = {
     # Папки, за которыми следим и которые сортируем
     "watched_folders": [
@@ -104,9 +108,27 @@ class Settings:
         if SETTINGS_PATH.exists():
             try:
                 saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-                self.data.update(saved)
+                self._apply_saved(saved)
             except (json.JSONDecodeError, OSError):
                 pass  # битый файл — используем значения по умолчанию
+
+    def _apply_saved(self, saved: dict) -> None:
+        """Слить сохранённые настройки с defaults и проверить значения."""
+        merged = json.loads(json.dumps(DEFAULT_SETTINGS))
+        merged.update(saved)
+        if merged.get("sort_mode") not in _VALID_SORT_MODES:
+            merged["sort_mode"] = DEFAULT_SETTINGS["sort_mode"]
+        if merged.get("storage_mode") not in _VALID_STORAGE_MODES:
+            merged["storage_mode"] = DEFAULT_SETTINGS["storage_mode"]
+        if merged.get("date_source") not in _VALID_DATE_SOURCES:
+            merged["date_source"] = DEFAULT_SETTINGS["date_source"]
+        try:
+            merged["min_age_seconds"] = max(0, int(merged.get("min_age_seconds", 5)))
+        except (TypeError, ValueError):
+            merged["min_age_seconds"] = DEFAULT_SETTINGS["min_age_seconds"]
+        if not merged.get("archive_name"):
+            merged["archive_name"] = DEFAULT_SETTINGS["archive_name"]
+        self.data = merged
 
     def save(self) -> None:
         SETTINGS_PATH.write_text(

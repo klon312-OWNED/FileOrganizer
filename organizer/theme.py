@@ -21,6 +21,12 @@ PREVIEW_FG = "#cbd5e1"
 ROW_ALT = "#f8fafc"
 HISTORY_MOVE = "#dbeafe"
 HISTORY_COPY = "#d1fae5"
+DESKTOP_TILE = "#ffffff"
+DESKTOP_TILE_SEL = "#dbeafe"
+DESKTOP_TILE_BORDER = "#e2e8f0"
+DESKTOP_TILE_SEL_BORDER = "#2563eb"
+DESKTOP_ICON_BG = "#f1f5f9"
+DESKTOP_MUTED = "#94a3b8"
 
 
 def apply(root) -> ttk.Style:
