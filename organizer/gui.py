@@ -18,7 +18,7 @@ from tkinter import ttk
 from .classify import classify
 from .config import OTHER_CATEGORY, Settings
 from .database import FileIndex
-from .layouts import DATE_SOURCES, MONTHS_RU, SORT_MODES, STORAGE_MODES, sort_mode_label, storage_mode_label
+from .layouts import DATE_SOURCES, MONTHS_RU, SORT_MODES, STORAGE_MODES, sort_mode_label, sort_mode_preview, storage_mode_label
 from .preview import get_text_preview
 from .scanner import Scanner, fixed_drives
 from .sorter import Sorter
@@ -42,6 +42,18 @@ except ImportError:
 PREVIEW_EXTS = IMAGE_EXTS | VIDEO_EXTS
 
 MONTH_NAMES = {0: "Все месяцы", **{k: v.split("-")[1] for k, v in MONTHS_RU.items()}}
+
+# Эмодзи и цвета для типов файлов на вкладке «Рабочий стол»
+TYPE_EMOJI: dict[str, str] = {
+    "Картинки": "🖼", "Видео": "🎬", "Музыка": "🎵", "Документы": "📄",
+    "Архивы": "📦", "Программы": "⚙", "Код": "💻", "Папки": "📁",
+    OTHER_CATEGORY: "📎",
+}
+TYPE_COLORS: dict[str, str] = {
+    "Картинки": "#e91e63", "Видео": "#9c27b0", "Музыка": "#3f51b5",
+    "Документы": "#1565c0", "Архивы": "#795548", "Программы": "#607d8b",
+    "Код": "#00897b", "Папки": "#f9a825", OTHER_CATEGORY: "#757575",
+}
 
 
 def human_size(num: int) -> str:
@@ -122,6 +134,10 @@ class App(Tk):
         sm = sort_mode_label(self.settings.sort_mode)
         st = storage_mode_label(self.settings.storage_mode)
         self.mode_info_var.set(f"  |  {sm}  |  {st}")
+
+    def _status_suffix(self) -> str:
+        sm = sort_mode_label(self.settings.sort_mode)
+        return f" · {sm} · {self.settings.destination}"
 
     # ---------- построение интерфейса ----------
 
@@ -307,7 +323,16 @@ class App(Tk):
         self._desktop_inner.bind("<Configure>", self._desktop_on_inner_configure)
         self._desktop_canvas.bind("<Configure>", self._desktop_on_canvas_configure)
         self._desktop_canvas.bind("<MouseWheel>", self._desktop_on_mousewheel)
+        if sys.platform.startswith("linux"):
+            self._desktop_canvas.bind(
+                "<Button-4>", lambda e: self._desktop_canvas.yview_scroll(-1, "units"),
+            )
+            self._desktop_canvas.bind(
+                "<Button-5>", lambda e: self._desktop_canvas.yview_scroll(1, "units"),
+            )
         root.bind("<Control-a>", self._desktop_select_all_shortcut)
+        root.bind("<Delete>", self._desktop_key_delete)
+        root.bind("<Return>", self._desktop_key_open)
 
         self._desktop_refresh()
 
@@ -341,7 +366,9 @@ class App(Tk):
                 self._desktop_tiles[entry["path"]] = tile
             self._desktop_reflow()
         self._desktop_update_count()
-        self.status_var.set(f"Рабочий стол: {len(self._desktop_entries)} элементов")
+        self.status_var.set(
+            f"Рабочий стол: {len(self._desktop_entries)} элементов{self._status_suffix()}"
+        )
 
     def _desktop_make_tile(self, entry: dict) -> Frame:
         path = entry["path"]
@@ -384,11 +411,14 @@ class App(Tk):
                 self._desktop_photos[path] = photo
                 icon_label.configure(image=photo)
             else:
-                ext = Path(path).suffix.lower().lstrip(".") or "?"
+                ext = Path(path).suffix.lower()
+                cat = self.settings.category_for_extension(ext)
+                emoji = TYPE_EMOJI.get(cat, "📄")
+                color = TYPE_COLORS.get(cat, theme.ACCENT)
                 icon_label.configure(
-                    text=ext[:6].upper(),
-                    font=("Segoe UI", 10, "bold"),
-                    fg=theme.ACCENT if sortable else theme.DESKTOP_MUTED,
+                    text=emoji,
+                    font=("Segoe UI Emoji", 28),
+                    fg=color if sortable else theme.DESKTOP_MUTED,
                 )
 
         name_fg = theme.TEXT if sortable else theme.DESKTOP_MUTED
@@ -443,6 +473,24 @@ class App(Tk):
                         sub.configure(bg=bg)
                 except Exception:
                     pass
+
+    def _desktop_key_delete(self, event=None):
+        for path in list(self._desktop_selected):
+            self._desktop_selected.discard(path)
+            tile = self._desktop_tiles.get(path)
+            if tile and hasattr(tile, "_desktop_chk"):
+                tile._desktop_chk.set(False)  # type: ignore[attr-defined]
+            self._desktop_apply_tile_style(path)
+        self._desktop_update_count()
+        return "break"
+
+    def _desktop_key_open(self, event=None):
+        paths = list(self._desktop_selected)
+        if len(paths) == 1:
+            p = paths[0]
+            if Path(p).exists():
+                open_path(p)
+        return "break"
 
     def _desktop_reflow(self, _event=None) -> None:
         if not self._desktop_tiles:
@@ -842,27 +890,21 @@ class App(Tk):
             total_size += r["size"] or 0
         self.status_var.set(
             f"Показано: {len(rows)} файлов · {human_size(total_size)} · "
-            f"всего в индексе: {self.index.count()}"
+            f"всего в индексе: {self.index.count()}{self._status_suffix()}"
         )
 
     def _selected_path(self) -> str | None:
-        sel = self.tree.selection()
-        if not sel:
-            return None
-        rows = self.index.query()
-        for r in rows:
-            if str(r["id"]) == sel[0]:
-                return r["path"]
-        return None
+        row = self._selected_row()
+        return row["path"] if row else None
 
     def _selected_row(self):
         sel = self.tree.selection()
         if not sel:
             return None
-        for r in self.index.query():
-            if str(r["id"]) == sel[0]:
-                return r
-        return None
+        try:
+            return self.index.get_by_id(int(sel[0]))
+        except (ValueError, TypeError):
+            return None
 
     def _on_select(self, *_):
         row = self._selected_row()
@@ -962,7 +1004,11 @@ class App(Tk):
         else:
             msg = f"Возвращено: {ok}"
             if fail:
-                msg += f"\nНе удалось вернуть: {fail}"
+                msg += (
+                    f"\nНе удалось вернуть: {fail}"
+                    f"\n\nНеудачные элементы остаются в журнале — "
+                    f"можно повторить отмену позже."
+                )
             messagebox.showinfo("Отмена выполнена", msg)
 
     def _reindex(self):
@@ -979,7 +1025,7 @@ class App(Tk):
     def _after_reindex(self, added: int):
         self._refresh_filters()
         self._reload_table()
-        self.status_var.set(f"Индекс обновлён. Записей: {self.index.count()}")
+        self.status_var.set(f"Индекс обновлён. Записей: {self.index.count()}{self._status_suffix()}")
 
     def _toggle_watcher(self):
         if self.watcher.running:
@@ -1269,11 +1315,23 @@ class App(Tk):
         Label(canvas_frame, text="Схема раскладки файлов",
               font=("Segoe UI", 11, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(14, 4))
         sort_var = StringVar(value=self.settings.sort_mode)
+        preview_var = StringVar()
         for key, label in SORT_MODES.items():
             Radiobutton(
                 canvas_frame, text=label, variable=sort_var, value=key,
                 bg=theme.BG, anchor="w", padx=20,
             ).pack(fill=X)
+
+        def update_sort_preview(*_):
+            example = sort_mode_preview(sort_var.get())
+            preview_var.set(f"Пример структуры: {example}" if example else "")
+
+        sort_var.trace_add("write", update_sort_preview)
+        Label(
+            canvas_frame, textvariable=preview_var, fg=theme.TEXT_MUTED,
+            bg=theme.BG, font=("Segoe UI", 9), anchor="w", padx=36,
+        ).pack(fill=X, pady=(0, 4))
+        update_sort_preview()
 
         Label(canvas_frame, text="Что делать с файлами",
               font=("Segoe UI", 11, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(14, 4))

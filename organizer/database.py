@@ -202,6 +202,34 @@ class FileIndex:
             self._conn.execute("DELETE FROM batches WHERE batch = ?", (batch,))
             self._conn.commit()
 
+    def delete_moves(self, move_ids: list[int]) -> None:
+        if not move_ids:
+            return
+        with self._lock:
+            self._conn.executemany("DELETE FROM moves WHERE id = ?", [(i,) for i in move_ids])
+            self._conn.commit()
+
+    def moves_count(self, batch: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM moves WHERE batch = ?", (batch,)
+            ).fetchone()
+        return row["c"] if row else 0
+
+    def set_batch_item_count(self, batch: str, count: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE batches SET item_count = ? WHERE batch = ?",
+                (count, batch),
+            )
+            self._conn.commit()
+
+    def get_by_id(self, file_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM files WHERE id = ?", (file_id,)
+            ).fetchone()
+
     def query_history(
         self,
         *,

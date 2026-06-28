@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .config import APP_DIR, FOLDER_CATEGORY, SKIP_EXTENSIONS, Settings, app_install_root
 from .database import FileIndex
-from .layouts import dest_directory
+from .layouts import dest_directory, infer_index_fields
 
 APP_ROOT = app_install_root()
 
@@ -313,12 +313,15 @@ class Sorter:
 
     def undo_batch(self, batch: str) -> tuple[int, int]:
         ok = fail = 0
+        removed_ids: list[int] = []
         for mv in self.index.moves_in_batch(batch):
             dst = Path(mv["dst"])
             src = Path(mv["src"])
             action = mv["action"] if "action" in mv.keys() else "move"
+            move_id = mv["id"]
             if not dst.exists():
                 self.index.remove_by_path(str(dst))
+                removed_ids.append(move_id)
                 continue
             try:
                 if action == "copy":
@@ -331,10 +334,15 @@ class Sorter:
                     target = src if not src.exists() else self._unique_target(src)
                     shutil.move(str(dst), str(target))
                 self.index.remove_by_path(str(dst))
+                removed_ids.append(move_id)
                 ok += 1
             except (OSError, shutil.Error):
                 fail += 1
-        self.index.delete_batch(batch)
+        if fail == 0:
+            self.index.delete_batch(batch)
+        else:
+            self.index.delete_moves(removed_ids)
+            self.index.set_batch_item_count(batch, self.index.moves_count(batch))
         return ok, fail
 
     def undo_last(self) -> tuple[int, int]:
@@ -343,26 +351,14 @@ class Sorter:
             return (0, 0)
         return self.undo_batch(batch)
 
-    def _guess_category_from_path(self, entry: Path, archive: Path) -> str:
-        try:
-            rel = entry.relative_to(archive)
-            parts = rel.parts
-            if not parts:
-                return "Другое"
-            if parts[0] == "По расширению" and len(parts) > 1:
-                return f".{parts[1]}"
-            if parts[0].isdigit() and len(parts) >= 2:
-                return "По дате"
-            return parts[0]
-        except ValueError:
-            return "Другое"
-
     def reindex_destination(self) -> int:
         dest = Path(self.settings.destination)
         if not dest.is_dir():
             return 0
         count = 0
         file_paths: set[str] = set()
+        sort_mode = self.settings.sort_mode
+        cat_fn = self.settings.category_for_extension
 
         for entry in dest.rglob("*"):
             if not entry.is_file():
@@ -370,13 +366,15 @@ class Sorter:
             rp = str(entry.resolve())
             file_paths.add(rp)
             ts = self._file_time(entry)
-            dt = datetime.fromtimestamp(ts)
-            category = self._guess_category_from_path(entry, dest)
+            category, year, month = infer_index_fields(
+                dest, entry, sort_mode=sort_mode,
+                category_for_extension=cat_fn, ts=ts,
+            )
             self.index.add_file(
                 name=entry.name, path=rp, source_path="",
                 category=category, extension=entry.suffix.lower(),
                 size=entry.stat().st_size, added_ts=ts,
-                year=dt.year, month=dt.month, kind="file",
+                year=year, month=month, kind="file",
             )
             count += 1
 
@@ -393,12 +391,14 @@ class Sorter:
                 continue
             rp = str(entry.resolve())
             ts = self._file_time(entry)
-            dt = datetime.fromtimestamp(ts)
-            category = self._guess_category_from_path(entry, dest)
+            category, year, month = infer_index_fields(
+                dest, entry, sort_mode=sort_mode,
+                category_for_extension=cat_fn, ts=ts,
+            )
             self.index.add_file(
                 name=entry.name, path=rp, source_path="",
                 category=category, extension="", size=self._folder_size(entry),
-                added_ts=ts, year=dt.year, month=dt.month, kind="dir",
+                added_ts=ts, year=year, month=month, kind="dir",
             )
             count += 1
         return count

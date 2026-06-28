@@ -39,6 +39,16 @@ class TrayAgent:
 
     # --- действия меню ---
 
+    def _reload_settings(self) -> None:
+        """Перечитать settings.json (GUI мог изменить настройки)."""
+        was_watching = self.watcher.running
+        self.watcher.stop()
+        self.settings.load()
+        self.sorter = Sorter(self.settings, self.index)
+        self.watcher = FolderWatcher(self.sorter)
+        if was_watching:
+            self.watcher.start()
+
     def _open_manager(self, *_):
         if getattr(sys, "frozen", False):
             mgr = Path(sys.executable).with_name("FileOrganizer.exe")
@@ -54,7 +64,12 @@ class TrayAgent:
             subprocess.Popen([sys.executable, str(run_py)])
 
     def _sort_now(self, *_):
+        self._reload_settings()
         threading.Thread(target=self.sorter.sort_all, daemon=True).start()
+
+    def _reload_settings_menu(self, icon, *_):
+        self._reload_settings()
+        icon.update_menu()
 
     def _toggle_watch(self, icon, item):
         if self.watcher.running:
@@ -85,6 +100,7 @@ class TrayAgent:
                 "Следить за папками", self._toggle_watch,
                 checked=self._is_watching,
             ),
+            pystray.MenuItem("Обновить настройки", self._reload_settings_menu),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", self._quit),
         )
