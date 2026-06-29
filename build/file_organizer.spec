@@ -6,6 +6,7 @@ from pathlib import Path
 
 block_cipher = None
 root = Path(SPECPATH).parent
+icon_file = str(root / "assets" / "icon.ico")
 
 hidden = [
     "PIL._tkinter_finder",
@@ -29,6 +30,8 @@ hidden = [
     "organizer.thumbs",
     "organizer.tray",
     "organizer.watcher",
+    "organizer.notify",
+    "organizer.icon",
 ]
 
 a_mgr = Analysis(
@@ -84,7 +87,7 @@ exe_mgr = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon=icon_file if Path(icon_file).exists() else None,
 )
 
 exe_agent = EXE(
@@ -103,7 +106,7 @@ exe_agent = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon=icon_file if Path(icon_file).exists() else None,
 )
 
 coll = COLLECT(

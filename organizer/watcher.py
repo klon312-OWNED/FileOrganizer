@@ -114,7 +114,8 @@ class FolderWatcher:
                             self._pending.pop(path, None)
                         if self.on_sorted:
                             try:
-                                self.on_sorted(str(result))
+                                src_name = Path(path).name
+                                self.on_sorted(str(result), src_name)
                             except Exception:
                                 pass
 

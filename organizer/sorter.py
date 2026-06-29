@@ -79,6 +79,8 @@ class Sorter:
             return False
 
     def _is_protected(self, path: Path) -> bool:
+        if self._is_excluded(path):
+            return True
         try:
             rp = path.resolve()
         except OSError:
@@ -97,6 +99,20 @@ class Sorter:
                     return True
             except OSError:
                 continue
+        return False
+
+    def _is_excluded(self, path: Path) -> bool:
+        try:
+            rp = str(path.resolve())
+        except OSError:
+            return False
+        for raw in self.settings.excluded_paths:
+            try:
+                ex = str(Path(raw).resolve())
+            except OSError:
+                ex = raw
+            if rp == ex:
+                return True
         return False
 
     @staticmethod
@@ -256,15 +272,19 @@ class Sorter:
                     continue
                 seen.add(key)
                 is_dir = entry.is_dir()
+                excluded = self._is_excluded(entry)
                 if is_dir:
-                    sortable = bool(self.settings.sort_folders and self._is_ready(entry))
+                    sortable = bool(
+                        self.settings.sort_folders and self._is_ready(entry) and not excluded,
+                    )
                 else:
-                    sortable = self._is_ready(entry)
+                    sortable = self._is_ready(entry) and not excluded
                 entries.append({
                     "path": key,
                     "name": entry.name,
                     "is_dir": is_dir,
                     "sortable": sortable,
+                    "excluded": excluded,
                     "folder": str(fpath),
                 })
         entries.sort(key=lambda e: (e["folder"].lower(), e["name"].lower()))

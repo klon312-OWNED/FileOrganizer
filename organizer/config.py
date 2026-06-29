@@ -92,6 +92,10 @@ DEFAULT_SETTINGS: dict = {
     "date_source": "download",
     # Сколько секунд файл должен быть "спокоен" перед перемещением
     "min_age_seconds": 5,
+    # Пути, которые никогда не сортировать (файлы и папки)
+    "excluded_paths": [],
+    # Toast при фоновой сортировке (Windows)
+    "notify_on_sort": True,
     # Категории по типам
     "categories": DEFAULT_CATEGORIES,
 }
@@ -179,6 +183,34 @@ class Settings:
     @property
     def date_source(self) -> str:
         return self.data.get("date_source", "download")
+
+    @property
+    def excluded_paths(self) -> list[str]:
+        raw = self.data.get("excluded_paths", [])
+        if not isinstance(raw, list):
+            return []
+        return [str(p) for p in raw if p]
+
+    @property
+    def notify_on_sort(self) -> bool:
+        return bool(self.data.get("notify_on_sort", True))
+
+    def add_excluded_path(self, path: str) -> None:
+        try:
+            key = str(Path(path).resolve())
+        except OSError:
+            key = path
+        current = self.excluded_paths
+        if key not in current:
+            current.append(key)
+            self.data["excluded_paths"] = current
+
+    def remove_excluded_path(self, path: str) -> None:
+        try:
+            key = str(Path(path).resolve())
+        except OSError:
+            key = path
+        self.data["excluded_paths"] = [p for p in self.excluded_paths if p != key]
 
     def category_for_extension(self, ext: str) -> str:
         """Определить категорию по расширению файла."""

@@ -8,23 +8,17 @@ import threading
 from pathlib import Path
 
 import pystray
-from PIL import Image, ImageDraw
 
 from .config import Settings
 from .database import FileIndex
+from .icon import make_icon_image
+from .notify import show_toast
 from .sorter import Sorter
 from .watcher import FolderWatcher
 
 
-def _make_icon_image() -> Image.Image:
-    """Простая иконка-папка для трея."""
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle([6, 18, 58, 54], radius=6, fill=(33, 150, 243, 255))
-    d.rounded_rectangle([6, 12, 30, 24], radius=4, fill=(33, 150, 243, 255))
-    d.rectangle([14, 30, 50, 34], fill=(255, 255, 255, 230))
-    d.rectangle([14, 40, 42, 44], fill=(255, 255, 255, 230))
-    return img
+def _make_icon_image():
+    return make_icon_image(64)
 
 
 class TrayAgent:
@@ -34,8 +28,13 @@ class TrayAgent:
         self.settings = Settings()
         self.index = FileIndex()
         self.sorter = Sorter(self.settings, self.index)
-        self.watcher = FolderWatcher(self.sorter)
+        self.watcher = FolderWatcher(self.sorter, on_sorted=self._on_sorted)
         self.icon: pystray.Icon | None = None
+
+    def _on_sorted(self, new_path: str, src_name: str = "") -> None:
+        if self.settings.notify_on_sort:
+            name = src_name or Path(new_path).name
+            show_toast("FileOrganizer", f"Отсортировано: {name}")
 
     # --- действия меню ---
 
@@ -45,7 +44,7 @@ class TrayAgent:
         self.watcher.stop()
         self.settings.load()
         self.sorter = Sorter(self.settings, self.index)
-        self.watcher = FolderWatcher(self.sorter)
+        self.watcher = FolderWatcher(self.sorter, on_sorted=self._on_sorted)
         if was_watching:
             self.watcher.start()
 

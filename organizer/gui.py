@@ -13,7 +13,7 @@ from tkinter import (
     BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, Frame, Label, StringVar, Tk, Toplevel,
     Text, filedialog, messagebox, Canvas,
 )
-from tkinter import ttk
+from tkinter import Menu, ttk
 
 from .classify import classify
 from .config import OTHER_CATEGORY, Settings
@@ -23,6 +23,8 @@ from .preview import get_text_preview
 from .scanner import Scanner, fixed_drives
 from .sorter import Sorter
 from . import theme
+from .icon import icon_path
+from .notify import show_toast
 from .thumbs import IMAGE_EXTS, VIDEO_EXTS, get_thumbnail
 from .watcher import FolderWatcher
 
@@ -99,6 +101,11 @@ class App(Tk):
         self.minsize(900, 520)
 
         theme.apply(self)
+
+        try:
+            self.iconbitmap(str(icon_path()))
+        except Exception:
+            pass
 
         self.settings = Settings()
         self.index = FileIndex()
@@ -230,7 +237,7 @@ class App(Tk):
         table_frame.pack(side=LEFT, fill=BOTH, expand=True)
 
         columns = ("name", "category", "date", "size")
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
         self.tree.heading("name", text="Имя файла")
         self.tree.heading("category", text="Категория")
         self.tree.heading("date", text="Дата загрузки")
@@ -269,10 +276,11 @@ class App(Tk):
         ttk.Button(preview, text="Показать в папке", command=self._reveal_selected).pack(fill=X)
         self._preview_photo = None  # ссылка, чтобы картинку не съел сборщик мусора
 
-        from tkinter import Menu
         self.ctx = Menu(self, tearoff=0)
-        self.ctx.add_command(label="Открыть файл", command=self._open_selected)
+        self.ctx.add_command(label="Открыть", command=self._open_selected)
         self.ctx.add_command(label="Показать в папке", command=self._reveal_selected)
+        self.ctx.add_separator()
+        self.ctx.add_command(label="Копировать пути", command=self._copy_selected_paths)
 
     # ---------- вкладка «рабочий стол» ----------
 
@@ -285,6 +293,9 @@ class App(Tk):
         self._desktop_photos: dict[str, object] = {}
         self._desktop_tiles: dict[str, Frame] = {}
         self._desktop_entries: list[dict] = []
+        self._desktop_thumb_queue: list[tuple[str, Label]] = []
+        self._desktop_drag_start: tuple[int, int] | None = None
+        self._desktop_drag_rect: int | None = None
 
         toolbar = Frame(root, padx=4, pady=8, bg=theme.BG)
         toolbar.pack(side="top", fill=X)
@@ -323,6 +334,10 @@ class App(Tk):
         self._desktop_inner.bind("<Configure>", self._desktop_on_inner_configure)
         self._desktop_canvas.bind("<Configure>", self._desktop_on_canvas_configure)
         self._desktop_canvas.bind("<MouseWheel>", self._desktop_on_mousewheel)
+        self._desktop_canvas.bind("<ButtonPress-1>", self._desktop_canvas_press)
+        self._desktop_canvas.bind("<B1-Motion>", self._desktop_canvas_drag)
+        self._desktop_canvas.bind("<ButtonRelease-1>", self._desktop_canvas_release)
+        self._desktop_canvas.bind("<Button-3>", self._desktop_show_context_menu)
         if sys.platform.startswith("linux"):
             self._desktop_canvas.bind(
                 "<Button-4>", lambda e: self._desktop_canvas.yview_scroll(-1, "units"),
@@ -333,6 +348,9 @@ class App(Tk):
         root.bind("<Control-a>", self._desktop_select_all_shortcut)
         root.bind("<Delete>", self._desktop_key_delete)
         root.bind("<Return>", self._desktop_key_open)
+
+        self._desktop_ctx = Menu(self, tearoff=0)
+        self._desktop_ctx_path: str | None = None
 
         self._desktop_refresh()
 
@@ -350,6 +368,7 @@ class App(Tk):
     def _desktop_refresh(self) -> None:
         self._desktop_selected.clear()
         self._desktop_photos.clear()
+        self._desktop_thumb_queue.clear()
         for widget in self._desktop_inner.winfo_children():
             widget.destroy()
         self._desktop_tiles.clear()
@@ -365,15 +384,55 @@ class App(Tk):
                 tile = self._desktop_make_tile(entry)
                 self._desktop_tiles[entry["path"]] = tile
             self._desktop_reflow()
+            self._desktop_queue_thumbs()
         self._desktop_update_count()
         self.status_var.set(
             f"Рабочий стол: {len(self._desktop_entries)} элементов{self._status_suffix()}"
+        )
+
+    def _desktop_queue_thumbs(self) -> None:
+        self._desktop_thumb_queue.clear()
+        for entry in self._desktop_entries:
+            if entry["is_dir"]:
+                continue
+            path = entry["path"]
+            tile = self._desktop_tiles.get(path)
+            if not tile or not hasattr(tile, "_desktop_icon_label"):
+                continue
+            self._desktop_thumb_queue.append((path, tile._desktop_icon_label))  # type: ignore[attr-defined]
+        self._desktop_load_thumb_batch()
+
+    def _desktop_load_thumb_batch(self, batch_size: int = 10) -> None:
+        loaded = 0
+        while self._desktop_thumb_queue and loaded < batch_size:
+            path, icon_label = self._desktop_thumb_queue.pop(0)
+            if not icon_label.winfo_exists():
+                continue
+            thumb = get_thumbnail(path, (96, 72))
+            if thumb and _HAS_PIL:
+                photo = ImageTk.PhotoImage(thumb)
+                self._desktop_photos[path] = photo
+                icon_label.configure(image=photo, text="")
+            loaded += 1
+        if self._desktop_thumb_queue:
+            self.after(40, self._desktop_load_thumb_batch)
+
+    def _desktop_placeholder_icon(self, icon_label: Label, path: str, sortable: bool) -> None:
+        ext = Path(path).suffix.lower()
+        cat = self.settings.category_for_extension(ext)
+        emoji = TYPE_EMOJI.get(cat, "📄")
+        color = TYPE_COLORS.get(cat, theme.ACCENT)
+        icon_label.configure(
+            text=emoji,
+            font=("Segoe UI Emoji", 28),
+            fg=color if sortable else theme.DESKTOP_MUTED,
         )
 
     def _desktop_make_tile(self, entry: dict) -> Frame:
         path = entry["path"]
         selected = path in self._desktop_selected
         sortable = entry.get("sortable", True)
+        excluded = entry.get("excluded", False)
 
         outer = Frame(
             self._desktop_inner,
@@ -390,9 +449,15 @@ class App(Tk):
         top.pack(fill=X, padx=4, pady=(4, 0))
 
         chk_var = BooleanVar(value=selected)
-        chk = ttk.Checkbutton(top, variable=chk_var, command=lambda p=path, v=chk_var: self._desktop_set_selected(p, v.get()))
+        chk = ttk.Checkbutton(
+            top, variable=chk_var,
+            command=lambda p=path, v=chk_var: self._desktop_set_selected(p, v.get()),
+        )
         chk.pack(side=LEFT)
-        if not sortable:
+        chk.bind("<Button-1>", lambda e: "break")
+        if excluded:
+            Label(top, text="⊘", bg=outer["bg"], fg=theme.DESKTOP_MUTED, font=("Segoe UI", 9)).pack(side=RIGHT)
+        elif not sortable:
             Label(top, text="⏳", bg=outer["bg"], fg=theme.DESKTOP_MUTED, font=("Segoe UI", 9)).pack(side=RIGHT)
 
         icon_bg = theme.DESKTOP_ICON_BG if sortable else "#f8fafc"
@@ -405,21 +470,7 @@ class App(Tk):
         if entry["is_dir"]:
             icon_label.configure(text="📁", font=("Segoe UI Emoji", 30))
         else:
-            thumb = get_thumbnail(path, (96, 72))
-            if thumb and _HAS_PIL:
-                photo = ImageTk.PhotoImage(thumb)
-                self._desktop_photos[path] = photo
-                icon_label.configure(image=photo)
-            else:
-                ext = Path(path).suffix.lower()
-                cat = self.settings.category_for_extension(ext)
-                emoji = TYPE_EMOJI.get(cat, "📄")
-                color = TYPE_COLORS.get(cat, theme.ACCENT)
-                icon_label.configure(
-                    text=emoji,
-                    font=("Segoe UI Emoji", 28),
-                    fg=color if sortable else theme.DESKTOP_MUTED,
-                )
+            self._desktop_placeholder_icon(icon_label, path, sortable)
 
         name_fg = theme.TEXT if sortable else theme.DESKTOP_MUTED
         name_label = Label(
@@ -430,9 +481,11 @@ class App(Tk):
 
         for widget in (outer, icon_box, icon_label, name_label, top):
             widget.bind("<Button-1>", lambda e, p=path: self._desktop_toggle(p))
-            widget.bind("<Double-1>", lambda e, p=path: reveal_in_explorer(p))
+            widget.bind("<Double-1>", lambda e, p=path: open_path(p) if Path(p).exists() else None)
+            widget.bind("<Button-3>", lambda e, p=path: self._desktop_popup_menu(e, p))
 
         outer._desktop_chk = chk_var  # type: ignore[attr-defined]
+        outer._desktop_icon_label = icon_label  # type: ignore[attr-defined]
         return outer
 
     def _desktop_set_selected(self, path: str, selected: bool) -> None:
@@ -562,6 +615,144 @@ class App(Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _desktop_tile_bbox(self, path: str) -> tuple[int, int, int, int] | None:
+        tile = self._desktop_tiles.get(path)
+        if not tile or not tile.winfo_exists():
+            return None
+        tile.update_idletasks()
+        ix, iy = self._desktop_canvas.coords(self._desktop_window)
+        tx, ty = tile.winfo_x(), tile.winfo_y()
+        tw, th = tile.winfo_width(), tile.winfo_height()
+        return (int(ix + tx), int(iy + ty), int(ix + tx + tw), int(iy + ty + th))
+
+    def _desktop_canvas_press(self, event) -> None:
+        self._desktop_drag_start = (event.x, event.y)
+
+    def _desktop_canvas_drag(self, event) -> None:
+        if self._desktop_drag_start is None:
+            return
+        x0, y0 = self._desktop_drag_start
+        if self._desktop_drag_rect is None:
+            if abs(event.x - x0) < 4 and abs(event.y - y0) < 4:
+                return
+            self._desktop_drag_rect = self._desktop_canvas.create_rectangle(
+                x0, y0, event.x, event.y,
+                outline=theme.DESKTOP_TILE_SEL_BORDER, width=1, dash=(4, 2),
+            )
+        else:
+            self._desktop_canvas.coords(self._desktop_drag_rect, x0, y0, event.x, event.y)
+
+    def _desktop_canvas_release(self, event) -> None:
+        if self._desktop_drag_rect is not None:
+            x0, y0 = self._desktop_drag_start or (0, 0)
+            rx0, ry0 = min(x0, event.x), min(y0, event.y)
+            rx1, ry1 = max(x0, event.x), max(y0, event.y)
+            for entry in self._desktop_entries:
+                if not entry.get("sortable", True):
+                    continue
+                bbox = self._desktop_tile_bbox(entry["path"])
+                if not bbox:
+                    continue
+                tx0, ty0, tx1, ty1 = bbox
+                if tx1 >= rx0 and tx0 <= rx1 and ty1 >= ry0 and ty0 <= ry1:
+                    self._desktop_set_selected(entry["path"], True)
+            self._desktop_canvas.delete(self._desktop_drag_rect)
+            self._desktop_drag_rect = None
+        self._desktop_drag_start = None
+
+    def _desktop_popup_menu(self, event, path: str) -> None:
+        self._desktop_ctx_path = path
+        if path not in self._desktop_selected:
+            self._desktop_deselect_all()
+            self._desktop_set_selected(path, True)
+        self._desktop_build_context_menu()
+        self._desktop_ctx.tk_popup(event.x_root, event.y_root)
+
+    def _desktop_show_context_menu(self, event) -> None:
+        hit = self._desktop_hit_tile(event)
+        if hit:
+            self._desktop_popup_menu(event, hit)
+        else:
+            self._desktop_ctx_path = None
+            self._desktop_build_context_menu()
+            self._desktop_ctx.tk_popup(event.x_root, event.y_root)
+
+    def _desktop_hit_tile(self, event) -> str | None:
+        cx = self._desktop_canvas.canvasx(event.x)
+        cy = self._desktop_canvas.canvasy(event.y)
+        for entry in self._desktop_entries:
+            bbox = self._desktop_tile_bbox(entry["path"])
+            if bbox and bbox[0] <= cx <= bbox[2] and bbox[1] <= cy <= bbox[3]:
+                return entry["path"]
+        return None
+
+    def _desktop_build_context_menu(self) -> None:
+        self._desktop_ctx.delete(0, END)
+        paths = list(self._desktop_selected) or (
+            [self._desktop_ctx_path] if self._desktop_ctx_path else []
+        )
+        if not paths:
+            return
+        single = len(paths) == 1
+        path = paths[0]
+        by_path = {e["path"]: e for e in self._desktop_entries}
+
+        self._desktop_ctx.add_command(
+            label="Открыть" if single else f"Открыть ({len(paths)})",
+            command=lambda: self._desktop_open_paths(paths),
+        )
+        self._desktop_ctx.add_command(
+            label="Показать в папке",
+            command=lambda: reveal_in_explorer(path),
+        )
+        self._desktop_ctx.add_separator()
+        sortable = [p for p in paths if by_path.get(p, {}).get("sortable")]
+        if sortable:
+            label = "Сортировать" if single else f"Сортировать ({len(sortable)})"
+            self._desktop_ctx.add_command(
+                label=label,
+                command=lambda: self._desktop_sort_paths(sortable),
+            )
+        excluded = any(by_path.get(p, {}).get("excluded") for p in paths)
+        if excluded:
+            self._desktop_ctx.add_command(
+                label="Включить в сортировку",
+                command=lambda: self._desktop_set_excluded(paths, False),
+            )
+        else:
+            self._desktop_ctx.add_command(
+                label="Исключить из сортировки",
+                command=lambda: self._desktop_set_excluded(paths, True),
+            )
+
+    def _desktop_open_paths(self, paths: list[str]) -> None:
+        for p in paths:
+            if Path(p).exists():
+                open_path(p)
+
+    def _desktop_sort_paths(self, paths: list[str]) -> None:
+        if not paths:
+            return
+        if not messagebox.askyesno("Сортировать", f"Сортировать {len(paths)} элемент(ов)?"):
+            return
+        self.status_var.set("Сортирую выбранное...")
+        self.update_idletasks()
+
+        def work():
+            moved = self.sorter.sort_paths(paths)
+            self.after(0, lambda: self._after_sort(moved))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _desktop_set_excluded(self, paths: list[str], exclude: bool) -> None:
+        for p in paths:
+            if exclude:
+                self.settings.add_excluded_path(p)
+            else:
+                self.settings.remove_excluded_path(p)
+        self.settings.save()
+        self._desktop_refresh()
+
     # ---------- вкладка «история» ----------
 
     def _build_history_tab(self, root) -> None:
@@ -582,6 +773,7 @@ class App(Tk):
         ttk.Entry(top, textvariable=self.hist_search_var, width=24).pack(side=LEFT, padx=(6, 12))
 
         ttk.Button(top, text="Обновить", command=self._reload_history).pack(side=LEFT)
+        ttk.Button(top, text="Экспорт CSV", command=self._export_history_csv).pack(side=LEFT, padx=(8, 0))
         ttk.Button(top, text="Отменить выбранную операцию",
                    command=self._undo_selected_batch).pack(side=LEFT, padx=(8, 0))
 
@@ -732,6 +924,49 @@ class App(Tk):
             self.after(0, lambda: self._after_undo(ok, fail))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _export_history_csv(self) -> None:
+        batch_label = self.hist_batch_var.get()
+        batch = None
+        if batch_label in getattr(self, "_batch_id_map", {}):
+            batch = self._batch_id_map[batch_label]
+        search = self.hist_search_var.get().strip() or None
+        rows = self.index.query_history(batch=batch, search=search, limit=100_000)
+        if not rows:
+            messagebox.showinfo("Экспорт", "Нет записей для экспорта.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Сохранить журнал как CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")],
+            initialfile=f"fileorganizer-history-{datetime.now():%Y%m%d}.csv",
+        )
+        if not path:
+            return
+        import csv
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f, delimiter=";")
+                w.writerow([
+                    "Когда", "Имя", "Действие", "Категория",
+                    "Откуда", "Куда", "Пакет", "Режим", "Хранение",
+                ])
+                for r in rows:
+                    dt = datetime.fromtimestamp(r["ts"])
+                    action = r["action"] if "action" in r.keys() else "move"
+                    action_txt = "Копия" if action == "copy" else "Перенос"
+                    name = r["name"] if "name" in r.keys() and r["name"] else Path(r["dst"]).name
+                    sm = sort_mode_label(r["sort_mode"]) if "sort_mode" in r.keys() and r["sort_mode"] else ""
+                    st = storage_mode_label(r["storage_mode"]) if "storage_mode" in r.keys() and r["storage_mode"] else ""
+                    cat = r["category"] if "category" in r.keys() else ""
+                    w.writerow([
+                        dt.strftime("%d.%m.%Y %H:%M:%S"),
+                        name, action_txt, cat,
+                        r["src"], r["dst"], r["batch"], sm, st,
+                    ])
+            messagebox.showinfo("Экспорт", f"Сохранено записей: {len(rows)}\n{path}")
+        except OSError as e:
+            messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
 
     # ---------- вкладка «весь компьютер» ----------
 
@@ -893,9 +1128,20 @@ class App(Tk):
             f"всего в индексе: {self.index.count()}{self._status_suffix()}"
         )
 
+    def _selected_paths(self) -> list[str]:
+        paths = []
+        for iid in self.tree.selection():
+            try:
+                row = self.index.get_by_id(int(iid))
+                if row:
+                    paths.append(row["path"])
+            except (ValueError, TypeError):
+                continue
+        return paths
+
     def _selected_path(self) -> str | None:
-        row = self._selected_row()
-        return row["path"] if row else None
+        paths = self._selected_paths()
+        return paths[0] if paths else None
 
     def _selected_row(self):
         sel = self.tree.selection()
@@ -939,19 +1185,37 @@ class App(Tk):
     # ---------- действия ----------
 
     def _open_selected(self, *_):
-        path = self._selected_path()
-        if not path:
+        paths = self._selected_paths()
+        if not paths:
             return
-        if not Path(path).exists():
-            messagebox.showwarning("Файл не найден", "Файл был перемещён или удалён.")
+        missing = 0
+        for path in paths:
+            if not Path(path).exists():
+                missing += 1
+                continue
+            open_path(path)
+        if missing:
+            messagebox.showwarning(
+                "Файл не найден",
+                f"Не найдено файлов: {missing}. Обновите индекс.",
+            )
             self._reindex()
-            return
-        open_path(path)
 
     def _reveal_selected(self, *_):
-        path = self._selected_path()
-        if path:
+        paths = self._selected_paths()
+        if not paths:
+            return
+        for path in paths:
             reveal_in_explorer(path)
+
+    def _copy_selected_paths(self) -> None:
+        paths = self._selected_paths()
+        if not paths:
+            return
+        text = "\n".join(paths)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status_var.set(f"Скопировано путей: {len(paths)}")
 
     def _show_context_menu(self, event):
         row = self.tree.identify_row(event.y)
@@ -1035,15 +1299,18 @@ class App(Tk):
             self.watcher.start()
             self.bg_var.set("Фон: ВКЛ")
 
-    def _on_background_sorted(self, new_path: str):
-        self.after(0, self._on_bg_update)
+    def _on_background_sorted(self, new_path: str, src_name: str = "") -> None:
+        self.after(0, lambda: self._on_bg_update(new_path, src_name))
 
-    def _on_bg_update(self):
+    def _on_bg_update(self, new_path: str = "", src_name: str = "") -> None:
         self._refresh_filters()
         self._reload_table()
         self._reload_history()
         if hasattr(self, "_desktop_canvas"):
             self._desktop_refresh()
+        if self.settings.notify_on_sort and new_path:
+            name = src_name or Path(new_path).name
+            show_toast("FileOrganizer", f"Отсортировано: {name}")
 
     # ---------- логика вкладки «весь компьютер» ----------
 
@@ -1391,6 +1658,13 @@ class App(Tk):
             variable=sort_folders_var, onvalue="on", offvalue="off",
         ).pack(anchor="w", padx=16, pady=(8, 0))
 
+        notify_var = StringVar(value="on" if self.settings.notify_on_sort else "off")
+        ttk.Checkbutton(
+            canvas_frame,
+            text="Уведомления при фоновой сортировке (Windows)",
+            variable=notify_var, onvalue="on", offvalue="off",
+        ).pack(anchor="w", padx=16, pady=(4, 0))
+
         Label(canvas_frame, text="Отслеживаемые папки (по одной в строке):",
               font=("Segoe UI", 10, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(12, 2))
         folders_text = Text(canvas_frame, height=5, font=("Consolas", 9))
@@ -1418,6 +1692,7 @@ class App(Tk):
             self.settings.data["archive_location"] = loc_var.get().strip()
             self.settings.data["archive_name"] = name_var.get().strip() or "Архив"
             self.settings.data["sort_folders"] = sort_folders_var.get() == "on"
+            self.settings.data["notify_on_sort"] = notify_var.get() == "on"
             self.settings.data.pop("destination", None)
             self.settings.data["watched_folders"] = folders
             self.settings.save()
