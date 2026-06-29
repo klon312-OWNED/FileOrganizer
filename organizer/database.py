@@ -289,6 +289,41 @@ class FileIndex:
             self._conn.commit()
         return removed
 
+    def all_paths(self) -> set[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT path FROM files").fetchall()
+        return {r["path"] for r in rows}
+
+    def health_check(self, archive_root: Path) -> dict:
+        """Найти битые записи индекса и файлы в архиве без индекса."""
+        broken: list[str] = []
+        with self._lock:
+            rows = self._conn.execute("SELECT path FROM files").fetchall()
+        indexed = set()
+        for row in rows:
+            p = row["path"]
+            indexed.add(p)
+            if not Path(p).exists():
+                broken.append(p)
+
+        orphans: list[str] = []
+        if archive_root.is_dir():
+            try:
+                dest_resolved = archive_root.resolve()
+            except OSError:
+                dest_resolved = archive_root
+            for entry in archive_root.rglob("*"):
+                try:
+                    if not entry.is_file():
+                        continue
+                    rp = str(entry.resolve())
+                except OSError:
+                    continue
+                if rp not in indexed:
+                    orphans.append(rp)
+
+        return {"broken": broken, "orphans": orphans}
+
     def query(
         self,
         *,

@@ -46,6 +46,9 @@ class FolderWatcher:
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
         self._protected: set[str] = set()
+        self._schedule_stop = threading.Event()
+        self._schedule_thread: threading.Thread | None = None
+        self.on_scheduled_sort = None  # callback() для периодической сортировки
 
     def _build_protected(self) -> set[str]:
         """Пути, которые нельзя трогать: сами отслеживаемые папки и архив."""
@@ -119,6 +122,22 @@ class FolderWatcher:
                             except Exception:
                                 pass
 
+    def _schedule_loop(self) -> None:
+        """Периодическая сортировка при включённом интервале."""
+        while not self._schedule_stop.is_set():
+            minutes = self.sorter.settings.scheduled_sort_minutes
+            if minutes <= 0:
+                if self._schedule_stop.wait(30):
+                    break
+                continue
+            if self._schedule_stop.wait(minutes * 60):
+                break
+            if self.on_scheduled_sort:
+                try:
+                    self.on_scheduled_sort()
+                except Exception:
+                    pass
+
     def start(self) -> None:
         if self._observer is not None:
             return
@@ -133,9 +152,16 @@ class FolderWatcher:
         self._observer.start()
         self._worker = threading.Thread(target=self._process_loop, daemon=True)
         self._worker.start()
+        self._schedule_stop.clear()
+        if self.sorter.settings.scheduled_sort_minutes > 0:
+            self._schedule_thread = threading.Thread(
+                target=self._schedule_loop, daemon=True,
+            )
+            self._schedule_thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        self._schedule_stop.set()
         if self._observer is not None:
             self._observer.stop()
             self._observer.join(timeout=3)

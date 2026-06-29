@@ -117,8 +117,10 @@ class App(Tk):
         self.index = FileIndex()
         self.sorter = Sorter(self.settings, self.index)
         self.watcher = FolderWatcher(self.sorter, on_sorted=self._on_background_sorted)
+        self.watcher.on_scheduled_sort = self._scheduled_sort
         self._tray_icon = None
         self._hidden_to_tray = False
+        self._desktop_anchor_idx: int | None = None
 
         self._build_header()
         self._build_ui()
@@ -130,12 +132,14 @@ class App(Tk):
 
         self._notebook.select(self.settings.last_tab)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if not self.settings.onboarding_shown:
+            self.after(300, self._show_onboarding)
 
     def _build_header(self) -> None:
-        hdr = Frame(self, bg=theme.HEADER, height=56)
-        hdr.pack(side="top", fill=X)
-        hdr.pack_propagate(False)
-        inner = Frame(hdr, bg=theme.HEADER)
+        self._hdr_frame = Frame(self, bg=theme.HEADER, height=56)
+        self._hdr_frame.pack(side="top", fill=X)
+        self._hdr_frame.pack_propagate(False)
+        inner = Frame(self._hdr_frame, bg=theme.HEADER)
         inner.pack(fill=BOTH, expand=True, padx=16, pady=8)
         Label(
             inner, text="FileOrganizer", bg=theme.HEADER, fg=theme.HEADER_FG,
@@ -167,11 +171,11 @@ class App(Tk):
         style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
 
         self.status_var = StringVar(value="Готово")
-        status = Label(
+        self._status_label = Label(
             self, textvariable=self.status_var, anchor="w", padx=12,
             pady=6, bg=theme.SIDEBAR, fg=theme.TEXT_MUTED,
         )
-        status.pack(side="bottom", fill=X)
+        self._status_label.pack(side="bottom", fill=X)
 
         nb = ttk.Notebook(self)
         nb.pack(side="top", fill=BOTH, expand=True, padx=10, pady=(6, 10))
@@ -202,6 +206,9 @@ class App(Tk):
                    command=self._sort_now).pack(side=LEFT)
         ttk.Button(toolbar, text="Отменить последнюю", command=self._undo_last).pack(side=LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="Обновить индекс", command=self._reindex).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(toolbar, text="Проверка индекса", command=self._archive_health_check).pack(
+            side=LEFT, padx=(8, 0),
+        )
 
         self.bg_var = StringVar(value="Фон: выкл")
         self.bg_btn = ttk.Button(toolbar, textvariable=self.bg_var, command=self._toggle_watcher)
@@ -295,10 +302,6 @@ class App(Tk):
         self._preview_photo = None  # ссылка, чтобы картинку не съел сборщик мусора
 
         self.ctx = Menu(self, tearoff=0)
-        self.ctx.add_command(label="Открыть", command=self._open_selected)
-        self.ctx.add_command(label="Показать в папке", command=self._reveal_selected)
-        self.ctx.add_separator()
-        self.ctx.add_command(label="Копировать пути", command=self._copy_selected_paths)
 
     # ---------- вкладка «рабочий стол» ----------
 
@@ -378,6 +381,7 @@ class App(Tk):
         self._desktop_canvas.bind("<Configure>", self._desktop_on_canvas_configure)
         self._desktop_canvas.bind("<MouseWheel>", self._desktop_on_mousewheel)
         self._desktop_canvas.bind("<ButtonPress-1>", self._desktop_canvas_press)
+        self._desktop_canvas.bind("<Double-Button-1>", self._desktop_canvas_double)
         self._desktop_canvas.bind("<B1-Motion>", self._desktop_canvas_drag)
         self._desktop_canvas.bind("<ButtonRelease-1>", self._desktop_canvas_release)
         self._desktop_canvas.bind("<Button-3>", self._desktop_show_context_menu)
@@ -547,7 +551,7 @@ class App(Tk):
         name_label.pack(fill=X, padx=4, pady=(0, 6))
 
         for widget in (outer, icon_box, icon_label, name_label, top):
-            widget.bind("<Button-1>", lambda e, p=path: self._desktop_toggle(p))
+            widget.bind("<Button-1>", lambda e, p=path: self._desktop_toggle(p, e))
             widget.bind("<Double-1>", lambda e, p=path: open_path(p) if Path(p).exists() else None)
             widget.bind("<Button-3>", lambda e, p=path: self._desktop_popup_menu(e, p))
 
@@ -563,11 +567,23 @@ class App(Tk):
         self._desktop_apply_tile_style(path)
         self._desktop_update_count()
 
-    def _desktop_toggle(self, path: str) -> None:
+    def _desktop_toggle(self, path: str, event=None) -> None:
+        idx = next(
+            (i for i, e in enumerate(self._desktop_entries) if e["path"] == path),
+            None,
+        )
+        shift = bool(event and (event.state & 0x1))
+        if shift and self._desktop_anchor_idx is not None and idx is not None:
+            lo, hi = sorted((self._desktop_anchor_idx, idx))
+            for i in range(lo, hi + 1):
+                self._desktop_set_selected(self._desktop_entries[i]["path"], True)
+            return
         if path in self._desktop_selected:
             self._desktop_selected.discard(path)
         else:
             self._desktop_selected.add(path)
+        if idx is not None:
+            self._desktop_anchor_idx = idx
         tile = self._desktop_tiles.get(path)
         if tile and hasattr(tile, "_desktop_chk"):
             tile._desktop_chk.set(path in self._desktop_selected)  # type: ignore[attr-defined]
@@ -718,6 +734,10 @@ class App(Tk):
     def _desktop_canvas_press(self, event) -> None:
         self._desktop_drag_start = (event.x, event.y)
 
+    def _desktop_canvas_double(self, event) -> None:
+        if self._desktop_hit_tile(event) is None:
+            self._desktop_deselect_all()
+
     def _desktop_canvas_drag(self, event) -> None:
         if self._desktop_drag_start is None:
             return
@@ -811,7 +831,7 @@ class App(Tk):
             )
         else:
             self._desktop_ctx.add_command(
-                label="Исключить из сортировки",
+                label="Не сортировать",
                 command=lambda: self._desktop_set_excluded(paths, True),
             )
 
@@ -852,8 +872,24 @@ class App(Tk):
 
         body = Frame(root, bg=theme.BG)
         body.pack(side="top", fill=BOTH, expand=True, padx=8, pady=(0, 8))
+
+        chart_frame = Frame(
+            body, width=300, bg=theme.CARD,
+            highlightbackground=theme.BORDER, highlightthickness=1,
+        )
+        chart_frame.pack(side=RIGHT, fill=Y, padx=(8, 0))
+        chart_frame.pack_propagate(False)
+        Label(
+            chart_frame, text="По категориям", font=("Segoe UI", 10, "bold"),
+            bg=theme.CARD,
+        ).pack(anchor="w", padx=10, pady=(8, 4))
+        self._stats_canvas = Canvas(
+            chart_frame, bg=theme.CARD, highlightthickness=0, width=280,
+        )
+        self._stats_canvas.pack(fill=BOTH, expand=True, padx=8, pady=(0, 8))
+
         table_frame = Frame(body, bg=theme.CARD, highlightbackground=theme.BORDER, highlightthickness=1)
-        table_frame.pack(fill=BOTH, expand=True)
+        table_frame.pack(side=LEFT, fill=BOTH, expand=True)
 
         cols = ("category", "count", "size", "share")
         self._stats_tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse")
@@ -886,6 +922,7 @@ class App(Tk):
             f"последняя сортировка: {last_txt} · операций в журнале: {self.index.history_count()}"
         )
         self._stats_tree.delete(*self._stats_tree.get_children())
+        chart_rows: list[tuple[str, int, int]] = []
         for r in rows:
             size = int(r["total_size"] or 0)
             cnt = int(r["cnt"] or 0)
@@ -894,6 +931,54 @@ class App(Tk):
                 "", END,
                 values=(r["category"], cnt, human_size(size), share),
             )
+            chart_rows.append((r["category"], size, cnt))
+        self._draw_stats_chart(chart_rows, total_size)
+
+    def _draw_stats_chart(self, rows: list[tuple[str, int, int]], total_size: int) -> None:
+        if not hasattr(self, "_stats_canvas"):
+            return
+        c = self._stats_canvas
+        c.delete("all")
+        c.update_idletasks()
+        w = max(c.winfo_width(), 260)
+        h = max(c.winfo_height(), 120)
+        if not rows or total_size <= 0:
+            c.create_text(
+                w // 2, h // 2, text="Нет данных", fill=theme.TEXT_MUTED,
+                font=("Segoe UI", 10),
+            )
+            return
+        bar_h = 22
+        gap = 8
+        label_w = 110
+        bar_max_w = w - label_w - 50
+        y = 12
+        colors = [
+            theme.ACCENT, theme.SUCCESS, "#8b5cf6", "#f59e0b",
+            "#ec4899", "#14b8a6", "#6366f1", "#64748b",
+        ]
+        for i, (cat, size, _cnt) in enumerate(rows[:12]):
+            frac = size / total_size
+            bw = max(4, int(bar_max_w * frac))
+            color = colors[i % len(colors)]
+            c.create_text(
+                4, y + bar_h // 2, text=cat[:14], anchor="w",
+                fill=theme.TEXT, font=("Segoe UI", 9),
+            )
+            x0 = label_w
+            c.create_rectangle(
+                x0, y, x0 + bar_max_w, y + bar_h,
+                fill=theme.SIDEBAR, outline=theme.BORDER,
+            )
+            c.create_rectangle(x0, y, x0 + bw, y + bar_h, fill=color, outline="")
+            pct = f"{100 * frac:.0f}%"
+            c.create_text(
+                x0 + bar_max_w + 6, y + bar_h // 2, text=pct, anchor="w",
+                fill=theme.TEXT_MUTED, font=("Segoe UI", 8),
+            )
+            y += bar_h + gap
+            if y > h - bar_h:
+                break
 
     # ---------- вкладка «история» ----------
 
@@ -1395,11 +1480,31 @@ class App(Tk):
         self.clipboard_append(text)
         self.status_var.set(f"Скопировано путей: {len(paths)}")
 
+    def _build_archive_context_menu(self) -> None:
+        self.ctx.delete(0, END)
+        paths = self._selected_paths()
+        if not paths:
+            return
+        n = len(paths)
+        open_lbl = "Открыть" if n == 1 else f"Открыть ({n})"
+        folder_lbl = "Показать в папке" if n == 1 else f"Показать в папке ({n})"
+        copy_lbl = "Копировать пути" if n == 1 else f"Копировать пути ({n})"
+        self.ctx.add_command(label=open_lbl, command=self._open_selected)
+        self.ctx.add_command(label=folder_lbl, command=self._reveal_selected)
+        self.ctx.add_separator()
+        self.ctx.add_command(label=copy_lbl, command=self._copy_selected_paths)
+
     def _show_context_menu(self, event):
         row = self.tree.identify_row(event.y)
-        if row:
+        if not row:
+            return
+        if row not in self.tree.selection():
             self.tree.selection_set(row)
+        self._build_archive_context_menu()
+        try:
             self.ctx.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.ctx.grab_release()
 
     def _sort_now(self):
         if not self._confirm_duplicates([
@@ -1479,7 +1584,107 @@ class App(Tk):
     def _after_reindex(self, added: int):
         self._refresh_filters()
         self._reload_table()
+        if hasattr(self, "_stats_tree"):
+            self._reload_stats()
         self.status_var.set(f"Индекс обновлён. Записей: {self.index.count()}{self._status_suffix()}")
+
+    def _archive_health_check(self) -> None:
+        dest = Path(self.settings.destination)
+        report = self.index.health_check(dest)
+        broken = report["broken"]
+        orphans = report["orphans"]
+        lines = [
+            f"Записей в индексе: {self.index.count()}",
+            f"Битые записи (файл отсутствует): {len(broken)}",
+            f"Файлы без записи в индексе: {len(orphans)}",
+        ]
+        if broken:
+            preview = "\n".join(f"• {p}" for p in broken[:8])
+            more = f"\n…и ещё {len(broken) - 8}" if len(broken) > 8 else ""
+            lines.append(f"\nБитые:\n{preview}{more}")
+        if orphans:
+            preview = "\n".join(f"• {p}" for p in orphans[:8])
+            more = f"\n…и ещё {len(orphans) - 8}" if len(orphans) > 8 else ""
+            lines.append(f"\nБез индекса:\n{preview}{more}")
+        if broken and messagebox.askyesno(
+            "Проверка индекса",
+            "\n".join(lines) + "\n\nУдалить битые записи из индекса?",
+        ):
+            removed = self.index.remove_missing()
+            self._reload_table()
+            if hasattr(self, "_stats_tree"):
+                self._reload_stats()
+            messagebox.showinfo("Готово", f"Удалено битых записей: {removed}")
+        else:
+            messagebox.showinfo("Проверка индекса", "\n".join(lines))
+
+    def _scheduled_sort(self) -> None:
+        def work():
+            result = self.sorter.sort_all()
+            self.after(0, lambda: self._after_scheduled_sort(result))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_scheduled_sort(self, result: SortResult) -> None:
+        if result.moved <= 0:
+            return
+        self._refresh_filters()
+        self._reload_table()
+        self._reload_history()
+        if hasattr(self, "_desktop_canvas"):
+            self._desktop_refresh()
+        if hasattr(self, "_stats_tree"):
+            self._reload_stats()
+        self.status_var.set(f"Авто-сортировка: {result.moved} файлов{self._status_suffix()}")
+        if self.settings.notify_on_sort:
+            show_toast("FileOrganizer", f"Авто-сортировка: {result.moved} файлов")
+
+    def _apply_live_theme(self, was_dark: bool) -> None:
+        from_palette = "dark" if was_dark else "light"
+        theme.apply(self, dark=self.settings.dark_mode)
+        theme.recolor_widgets(self, from_palette, theme.current_palette())
+        self.hist_tree.tag_configure("move", background=theme.HISTORY_MOVE)
+        self.hist_tree.tag_configure("copy", background=theme.HISTORY_COPY)
+        if hasattr(self, "_desktop_canvas"):
+            self._desktop_canvas.configure(bg=theme.BG)
+            self._desktop_inner.configure(bg=theme.BG)
+            for path in list(self._desktop_selected):
+                self._desktop_apply_tile_style(path)
+        if hasattr(self, "_stats_canvas") and hasattr(self, "_stats_tree"):
+            self._reload_stats()
+
+    def _show_onboarding(self) -> None:
+        win = Toplevel(self)
+        win.title("Добро пожаловать в FileOrganizer")
+        win.geometry("520x380")
+        win.configure(bg=theme.BG)
+        win.transient(self)
+        win.grab_set()
+        Label(
+            win, text="FileOrganizer", font=("Segoe UI", 14, "bold"),
+            bg=theme.BG, fg=theme.ACCENT,
+        ).pack(anchor="w", padx=20, pady=(16, 8))
+        text = (
+            "Вкладки приложения:\n\n"
+            "• Архив — просмотр отсортированных файлов, фильтры и предпросмотр\n"
+            "• Рабочий стол — файлы в отслеживаемых папках, выбор и сортировка\n"
+            "• Статистика — объём и распределение по категориям\n"
+            "• История — журнал операций с возможностью отмены\n"
+            "• Поиск по ПК — быстрый поиск файлов на дисках\n\n"
+            "Настройте папки и схему сортировки в «Настройки сортировки»."
+        )
+        Label(
+            win, text=text, justify="left", anchor="nw", bg=theme.BG,
+            fg=theme.TEXT, font=("Segoe UI", 10), wraplength=480,
+        ).pack(fill=BOTH, expand=True, padx=20, pady=(0, 8))
+
+        def close():
+            self.settings.data["onboarding_shown"] = True
+            self.settings.save()
+            win.destroy()
+
+        ttk.Button(win, text="Понятно", style="Accent.TButton", command=close).pack(
+            padx=20, pady=(0, 16), anchor="e",
+        )
 
     def _toggle_watcher(self):
         if self.watcher.running:
@@ -1759,7 +1964,7 @@ class App(Tk):
     def _open_settings(self):
         win = Toplevel(self)
         win.title("Настройки сортировки")
-        win.geometry("720x720")
+        win.geometry("720x820")
         win.configure(bg=theme.BG)
         win.transient(self)
         win.grab_set()
@@ -1857,7 +2062,7 @@ class App(Tk):
 
         dark_var = StringVar(value="on" if self.settings.dark_mode else "off")
         ttk.Checkbutton(
-            canvas_frame, text="Тёмная тема (применится после перезапуска)",
+            canvas_frame, text="Тёмная тема",
             variable=dark_var, onvalue="on", offvalue="off",
         ).pack(anchor="w", padx=16, pady=(4, 0))
 
@@ -1866,6 +2071,22 @@ class App(Tk):
             canvas_frame, text="При закрытии окна — сворачивать в трей",
             variable=tray_var, onvalue="on", offvalue="off",
         ).pack(anchor="w", padx=16, pady=(4, 0))
+
+        sched_var = StringVar(value=str(self.settings.scheduled_sort_minutes))
+        sched_frame = Frame(canvas_frame, bg=theme.BG)
+        sched_frame.pack(fill=X, padx=16, pady=(8, 0))
+        Label(
+            sched_frame,
+            text="Авто-сортировка при фоне (мин., 0 = выкл):",
+            bg=theme.BG,
+        ).pack(side=LEFT)
+        ttk.Entry(sched_frame, textvariable=sched_var, width=6).pack(side=LEFT, padx=(8, 0))
+
+        Label(canvas_frame, text="Правила категорий (.расширение → категория):",
+              font=("Segoe UI", 10, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(12, 2))
+        rules_text = Text(canvas_frame, height=3, font=("Consolas", 9))
+        rules_text.pack(fill=X, padx=16)
+        rules_text.insert("1.0", Settings.format_category_rules(self.settings.category_rules))
 
         Label(canvas_frame, text="Исключённые пути (не сортировать, по одному в строке):",
               font=("Segoe UI", 10, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(12, 2))
@@ -1889,6 +2110,7 @@ class App(Tk):
         ttk.Button(btns, text="Добавить папку...", command=add_folder).pack(side=LEFT)
 
         def save():
+            was_dark = self.settings.dark_mode
             folders = [
                 line.strip()
                 for line in folders_text.get("1.0", END).splitlines()
@@ -1903,6 +2125,15 @@ class App(Tk):
             self.settings.data["notify_on_sort"] = notify_var.get() == "on"
             self.settings.data["dark_mode"] = dark_var.get() == "on"
             self.settings.data["close_to_tray"] = tray_var.get() == "on"
+            try:
+                self.settings.data["scheduled_sort_minutes"] = max(
+                    0, int(sched_var.get().strip() or "0"),
+                )
+            except ValueError:
+                self.settings.data["scheduled_sort_minutes"] = 0
+            self.settings.data["category_rules"] = Settings.parse_category_rules_text(
+                rules_text.get("1.0", END),
+            )
             excluded = [
                 line.strip()
                 for line in excluded_text.get("1.0", END).splitlines()
@@ -1913,10 +2144,14 @@ class App(Tk):
             self.settings.data["watched_folders"] = folders
             self.settings.save()
             self._update_mode_banner()
+            if was_dark != self.settings.dark_mode:
+                self._apply_live_theme(was_dark)
             if hasattr(self, "_desktop_canvas"):
                 self._desktop_refresh()
-            if self.watcher.running:
+            watcher_was_on = self.watcher.running
+            if watcher_was_on:
                 self.watcher.stop()
+            if watcher_was_on:
                 self.watcher.start()
             messagebox.showinfo("Сохранено", "Настройки сортировки сохранены.")
             win.destroy()

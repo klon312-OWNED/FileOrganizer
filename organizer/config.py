@@ -102,6 +102,12 @@ DEFAULT_SETTINGS: dict = {
     "close_to_tray": True,
     # Индекс последней открытой вкладки (0 = Архив)
     "last_tab": 0,
+    # Правила: расширение → категория (переопределяют defaults)
+    "category_rules": {},
+    # Авто-сортировка каждые N минут при включённом фоне (0 = выкл)
+    "scheduled_sort_minutes": 0,
+    # Показано ли приветствие при первом запуске
+    "onboarding_shown": False,
     # Категории по типам
     "categories": DEFAULT_CATEGORIES,
 }
@@ -138,6 +144,21 @@ class Settings:
             merged["min_age_seconds"] = DEFAULT_SETTINGS["min_age_seconds"]
         if not merged.get("archive_name"):
             merged["archive_name"] = DEFAULT_SETTINGS["archive_name"]
+        rules = merged.get("category_rules")
+        if not isinstance(rules, dict):
+            merged["category_rules"] = {}
+        else:
+            merged["category_rules"] = {
+                (k if k.startswith(".") else f".{k}").lower(): str(v)
+                for k, v in rules.items() if k and v
+            }
+        try:
+            merged["scheduled_sort_minutes"] = max(
+                0, int(merged.get("scheduled_sort_minutes", 0)),
+            )
+        except (TypeError, ValueError):
+            merged["scheduled_sort_minutes"] = 0
+        merged["onboarding_shown"] = bool(merged.get("onboarding_shown", False))
         self.data = merged
 
     def save(self) -> None:
@@ -216,6 +237,27 @@ class Settings:
         except (TypeError, ValueError):
             return 0
 
+    @property
+    def category_rules(self) -> dict[str, str]:
+        raw = self.data.get("category_rules", {})
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            (k if k.startswith(".") else f".{k}").lower(): str(v)
+            for k, v in raw.items() if k and v
+        }
+
+    @property
+    def scheduled_sort_minutes(self) -> int:
+        try:
+            return max(0, int(self.data.get("scheduled_sort_minutes", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def onboarding_shown(self) -> bool:
+        return bool(self.data.get("onboarding_shown", False))
+
     def add_excluded_path(self, path: str) -> None:
         try:
             key = str(Path(path).resolve())
@@ -236,7 +278,36 @@ class Settings:
     def category_for_extension(self, ext: str) -> str:
         """Определить категорию по расширению файла."""
         ext = ext.lower()
+        if not ext.startswith("."):
+            ext = f".{ext}"
+        rule = self.category_rules.get(ext)
+        if rule:
+            return rule
         for name, exts in self.categories.items():
             if ext in exts:
                 return name
         return OTHER_CATEGORY
+
+    @staticmethod
+    def parse_category_rules_text(text: str) -> dict[str, str]:
+        """Разобрать правила из текста: «.pdf → Документы» или «.pdf=Документы»."""
+        rules: dict[str, str] = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            for sep in ("→", "->", "=", ":"):
+                if sep in line:
+                    left, right = line.split(sep, 1)
+                    ext = left.strip().lower()
+                    cat = right.strip()
+                    if ext and cat:
+                        if not ext.startswith("."):
+                            ext = f".{ext}"
+                        rules[ext] = cat
+                    break
+        return rules
+
+    @staticmethod
+    def format_category_rules(rules: dict[str, str]) -> str:
+        return "\n".join(f"{ext} → {cat}" for ext, cat in sorted(rules.items()))

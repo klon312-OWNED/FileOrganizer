@@ -113,6 +113,36 @@ def _activate_palette(name: str) -> None:
     DESKTOP_MUTED = p["DESKTOP_MUTED"]
 
 
+def current_palette() -> str:
+    return _current
+
+
+def recolor_widgets(root, from_palette: str, to_palette: str) -> None:
+    """Обновить bg/fg у Tk-виджетов после смены палитры без перезапуска."""
+    old = _PALETTES.get(from_palette, {})
+    new = _PALETTES.get(to_palette, {})
+    if not old or not new:
+        return
+
+    def visit(widget) -> None:
+        for prop in ("bg", "fg", "highlightbackground", "activebackground"):
+            try:
+                val = widget.cget(prop)
+            except Exception:
+                continue
+            for key, old_color in old.items():
+                if val == old_color and key in new:
+                    try:
+                        widget.configure(**{prop: new[key]})
+                    except Exception:
+                        pass
+                    break
+        for child in widget.winfo_children():
+            visit(child)
+
+    visit(root)
+
+
 def apply(root, *, dark: bool = False) -> ttk.Style:
     _activate_palette("dark" if dark else "light")
     style = ttk.Style(root)
