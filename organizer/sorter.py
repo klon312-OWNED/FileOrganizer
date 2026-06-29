@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -13,6 +14,17 @@ from .database import FileIndex
 from .layouts import dest_directory, infer_index_fields
 
 APP_ROOT = app_install_root()
+
+
+@dataclass
+class SortResult:
+    """Итог сортировки: число обработанных файлов и список ошибок."""
+
+    moved: int = 0
+    errors: list[tuple[str, str]] = field(default_factory=list)
+
+    def add_error(self, path: str, reason: str) -> None:
+        self.errors.append((path, reason))
 
 
 class Sorter:
@@ -141,7 +153,7 @@ class Sorter:
             is_dir=is_dir,
         )
 
-    def _transfer(self, src: Path, dst: Path) -> bool:
+    def _transfer(self, src: Path, dst: Path) -> tuple[bool, str]:
         try:
             if self.settings.storage_mode == "copy":
                 if src.is_dir():
@@ -150,11 +162,43 @@ class Sorter:
                     shutil.copy2(str(src), str(dst))
             else:
                 shutil.move(str(src), str(dst))
-            return True
-        except (OSError, shutil.Error):
-            return False
+            return True, ""
+        except OSError as e:
+            return False, str(e)
+        except shutil.Error as e:
+            return False, str(e)
 
-    def sort_file(self, file_path: str | Path) -> Path | None:
+    def find_duplicates(self, paths: list[str | Path]) -> list[dict]:
+        """Предупреждение: в архиве уже есть файл с таким именем в целевой папке."""
+        conflicts: list[dict] = []
+        seen_names: set[str] = set()
+        for raw in paths:
+            path = Path(raw)
+            if not path.exists():
+                continue
+            if path.is_dir():
+                if not self.settings.sort_folders:
+                    continue
+                category = FOLDER_CATEGORY
+                ext = ""
+                is_dir = True
+            else:
+                category = self.settings.category_for_extension(path.suffix.lower())
+                ext = path.suffix.lower()
+                is_dir = False
+            ts = self._file_time(path)
+            dest_dir, _, _ = self._dest_dir(category, ts, ext, is_dir=is_dir)
+            target = dest_dir / path.name
+            if target.exists() and path.name not in seen_names:
+                seen_names.add(path.name)
+                conflicts.append({
+                    "path": str(path),
+                    "name": path.name,
+                    "existing": str(target),
+                })
+        return conflicts
+
+    def sort_file(self, file_path: str | Path, result: SortResult | None = None) -> Path | None:
         path = Path(file_path)
         if not path.is_file():
             return None
@@ -169,7 +213,10 @@ class Sorter:
         dest_dir, year, month = self._dest_dir(category, ts, ext)
         target = self._unique_target(dest_dir / path.name)
 
-        if not self._transfer(path, target):
+        ok, err = self._transfer(path, target)
+        if not ok:
+            if result is not None:
+                result.add_error(str(path), err or "не удалось переместить")
             return None
 
         src_str = str(path)
@@ -181,7 +228,7 @@ class Sorter:
         self._record_move(src_str, str(target), "file", ts, category=category, name=target.name)
         return target
 
-    def sort_directory(self, dir_path: str | Path) -> Path | None:
+    def sort_directory(self, dir_path: str | Path, result: SortResult | None = None) -> Path | None:
         path = Path(dir_path)
         if not path.is_dir():
             return None
@@ -197,7 +244,10 @@ class Sorter:
         dest_dir, year, month = self._dest_dir(FOLDER_CATEGORY, ts, is_dir=True)
         target = self._unique_target(dest_dir / path.name)
 
-        if not self._transfer(path, target):
+        ok, err = self._transfer(path, target)
+        if not ok:
+            if result is not None:
+                result.add_error(str(path), err or "не удалось переместить")
             return None
 
         src_str = str(path)
@@ -212,13 +262,13 @@ class Sorter:
         )
         return target
 
-    def sort_entry(self, entry_path: str | Path) -> Path | None:
+    def sort_entry(self, entry_path: str | Path, result: SortResult | None = None) -> Path | None:
         path = Path(entry_path)
         if path.is_dir():
-            return self.sort_directory(path)
-        return self.sort_file(path)
+            return self.sort_directory(path, result)
+        return self.sort_file(path, result)
 
-    def sort_folder(self, folder: str | Path) -> int:
+    def sort_folder(self, folder: str | Path, result: SortResult | None = None) -> int:
         folder = Path(folder)
         if not folder.is_dir():
             return 0
@@ -234,7 +284,7 @@ class Sorter:
                     continue
             except OSError:
                 continue
-            if self.sort_entry(entry):
+            if self.sort_entry(entry, result):
                 count += 1
         return count
 
@@ -279,6 +329,17 @@ class Sorter:
                     )
                 else:
                     sortable = self._is_ready(entry) and not excluded
+                try:
+                    st = entry.stat()
+                    mtime = st.st_mtime
+                    size = self._folder_size(entry) if is_dir else st.st_size
+                except OSError:
+                    mtime = 0.0
+                    size = 0
+                category = (
+                    FOLDER_CATEGORY if is_dir
+                    else self.settings.category_for_extension(entry.suffix.lower())
+                )
                 entries.append({
                     "path": key,
                     "name": entry.name,
@@ -286,6 +347,9 @@ class Sorter:
                     "sortable": sortable,
                     "excluded": excluded,
                     "folder": str(fpath),
+                    "size": size,
+                    "mtime": mtime,
+                    "category": category,
                 })
         entries.sort(key=lambda e: (e["folder"].lower(), e["name"].lower()))
         return entries
@@ -311,25 +375,25 @@ class Sorter:
                 self.index.delete_batch(batch)
             self.current_batch = None
 
-    def sort_paths(self, paths: list[str | Path]) -> int:
+    def sort_paths(self, paths: list[str | Path]) -> SortResult:
         """Сортировать только указанные пути (одна пакетная операция)."""
-        count = 0
+        result = SortResult()
         with self.batch_context("sort"):
             for raw in paths:
-                if self.sort_entry(raw):
-                    count += 1
-        return count
+                if self.sort_entry(raw, result):
+                    result.moved += 1
+        return result
 
-    def sort_all(self) -> int:
-        total = 0
+    def sort_all(self) -> SortResult:
+        result = SortResult()
         dest = Path(self.settings.destination).resolve()
         with self.batch_context("sort"):
             for folder in self.settings.watched_folders:
                 fpath = Path(folder).resolve()
                 if fpath == dest or dest in fpath.parents:
                     continue
-                total += self.sort_folder(fpath)
-        return total
+                result.moved += self.sort_folder(fpath, result)
+        return result
 
     def undo_batch(self, batch: str) -> tuple[int, int]:
         ok = fail = 0
@@ -370,6 +434,40 @@ class Sorter:
         if not batch:
             return (0, 0)
         return self.undo_batch(batch)
+
+    def undo_move(self, move_id: int) -> tuple[bool, str]:
+        """Вернуть один файл из журнала на исходное место."""
+        mv = self.index.get_move_by_id(move_id)
+        if not mv:
+            return False, "Запись не найдена"
+        dst = Path(mv["dst"])
+        src = Path(mv["src"])
+        action = mv["action"] if "action" in mv.keys() else "move"
+        if not dst.exists():
+            self.index.remove_by_path(str(dst))
+            self.index.delete_moves([move_id])
+            return False, "Файл уже отсутствует в архиве"
+        try:
+            if action == "copy":
+                if dst.is_dir():
+                    shutil.rmtree(dst)
+                else:
+                    dst.unlink()
+            else:
+                src.parent.mkdir(parents=True, exist_ok=True)
+                target = src if not src.exists() else self._unique_target(src)
+                shutil.move(str(dst), str(target))
+            self.index.remove_by_path(str(dst))
+            self.index.delete_moves([move_id])
+            batch = mv["batch"]
+            remaining = self.index.moves_count(batch)
+            if remaining == 0:
+                self.index.delete_batch(batch)
+            else:
+                self.index.set_batch_item_count(batch, remaining)
+            return True, ""
+        except (OSError, shutil.Error) as e:
+            return False, str(e)
 
     def reindex_destination(self) -> int:
         dest = Path(self.settings.destination)

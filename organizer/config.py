@@ -96,6 +96,12 @@ DEFAULT_SETTINGS: dict = {
     "excluded_paths": [],
     # Toast при фоновой сортировке (Windows)
     "notify_on_sort": True,
+    # Тёмная тема оформления
+    "dark_mode": False,
+    # Сворачивать в трей при закрытии окна (иначе — выход)
+    "close_to_tray": True,
+    # Индекс последней открытой вкладки (0 = Архив)
+    "last_tab": 0,
     # Категории по типам
     "categories": DEFAULT_CATEGORIES,
 }
@@ -194,6 +200,21 @@ class Settings:
     @property
     def notify_on_sort(self) -> bool:
         return bool(self.data.get("notify_on_sort", True))
+
+    @property
+    def dark_mode(self) -> bool:
+        return bool(self.data.get("dark_mode", False))
+
+    @property
+    def close_to_tray(self) -> bool:
+        return bool(self.data.get("close_to_tray", True))
+
+    @property
+    def last_tab(self) -> int:
+        try:
+            return max(0, min(4, int(self.data.get("last_tab", 0))))
+        except (TypeError, ValueError):
+            return 0
 
     def add_excluded_path(self, path: str) -> None:
         try:

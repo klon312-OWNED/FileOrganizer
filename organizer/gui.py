@@ -21,12 +21,18 @@ from .database import FileIndex
 from .layouts import DATE_SOURCES, MONTHS_RU, SORT_MODES, STORAGE_MODES, sort_mode_label, sort_mode_preview, storage_mode_label
 from .preview import get_text_preview
 from .scanner import Scanner, fixed_drives
-from .sorter import Sorter
+from .sorter import Sorter, SortResult
 from . import theme
-from .icon import icon_path
+from .icon import icon_path, make_icon_image
 from .notify import show_toast
 from .thumbs import IMAGE_EXTS, VIDEO_EXTS, get_thumbnail
 from .watcher import FolderWatcher
+
+try:
+    import pystray
+    _HAS_TRAY = True
+except ImportError:
+    _HAS_TRAY = False
 
 try:
     from PIL import ImageTk  # вывод миниатюр в Tkinter
@@ -100,24 +106,29 @@ class App(Tk):
         self.geometry("1140x700")
         self.minsize(900, 520)
 
-        theme.apply(self)
+        self.settings = Settings()
+        theme.apply(self, dark=self.settings.dark_mode)
 
         try:
             self.iconbitmap(str(icon_path()))
         except Exception:
             pass
 
-        self.settings = Settings()
         self.index = FileIndex()
         self.sorter = Sorter(self.settings, self.index)
         self.watcher = FolderWatcher(self.sorter, on_sorted=self._on_background_sorted)
+        self._tray_icon = None
+        self._hidden_to_tray = False
 
         self._build_header()
         self._build_ui()
         self._refresh_filters()
         self._reload_table()
         self._reload_history()
+        if hasattr(self, "_stats_tree"):
+            self._reload_stats()
 
+        self._notebook.select(self.settings.last_tab)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_header(self) -> None:
@@ -136,6 +147,8 @@ class App(Tk):
             inner, textvariable=self.mode_info_var, bg=theme.HEADER, fg="#93c5fd",
             font=("Segoe UI", 9),
         ).pack(side=LEFT, padx=(16, 0))
+        if _HAS_TRAY:
+            ttk.Button(inner, text="В трей", command=self._minimize_to_tray).pack(side=RIGHT, padx=(8, 0))
 
     def _update_mode_banner(self) -> None:
         sm = sort_mode_label(self.settings.sort_mode)
@@ -162,17 +175,22 @@ class App(Tk):
 
         nb = ttk.Notebook(self)
         nb.pack(side="top", fill=BOTH, expand=True, padx=10, pady=(6, 10))
+        self._notebook = nb
         tab_archive = Frame(nb, bg=theme.BG)
         tab_desktop = Frame(nb, bg=theme.BG)
+        tab_stats = Frame(nb, bg=theme.BG)
         tab_history = Frame(nb, bg=theme.BG)
         tab_pc = Frame(nb, bg=theme.BG)
         nb.add(tab_archive, text="  Архив  ")
         nb.add(tab_desktop, text="  Рабочий стол  ")
+        nb.add(tab_stats, text="  Статистика  ")
         nb.add(tab_history, text="  История  ")
         nb.add(tab_pc, text="  Поиск по ПК  ")
+        nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         self._build_archive_tab(tab_archive)
         self._build_desktop_tab(tab_desktop)
+        self._build_stats_tab(tab_stats)
         self._build_history_tab(tab_history)
         self._build_pc_tab(tab_pc)
 
@@ -292,6 +310,7 @@ class App(Tk):
         self._desktop_selected: set[str] = set()
         self._desktop_photos: dict[str, object] = {}
         self._desktop_tiles: dict[str, Frame] = {}
+        self._desktop_all_entries: list[dict] = []
         self._desktop_entries: list[dict] = []
         self._desktop_thumb_queue: list[tuple[str, Label]] = []
         self._desktop_drag_start: tuple[int, int] | None = None
@@ -310,6 +329,30 @@ class App(Tk):
         ).pack(side=LEFT, padx=(16, 0))
         ttk.Button(toolbar, text="Сортировать всё", command=self._sort_now).pack(side=LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="Обновить", command=self._desktop_refresh).pack(side=LEFT, padx=(8, 0))
+
+        Label(toolbar, text="Поиск:", bg=theme.BG).pack(side=LEFT, padx=(16, 4))
+        self._desktop_search_var = StringVar()
+        self._desktop_search_var.trace_add("write", lambda *_: self._desktop_apply_filter())
+        ttk.Entry(toolbar, textvariable=self._desktop_search_var, width=16).pack(side=LEFT)
+
+        Label(toolbar, text="Тип:", bg=theme.BG).pack(side=LEFT, padx=(10, 4))
+        self._desktop_type_var = StringVar(value="Все типы")
+        type_vals = ["Все типы"] + list(TYPE_EMOJI.keys())
+        self._desktop_type_box = ttk.Combobox(
+            toolbar, textvariable=self._desktop_type_var, state="readonly",
+            values=type_vals, width=12,
+        )
+        self._desktop_type_box.pack(side=LEFT)
+        self._desktop_type_box.bind("<<ComboboxSelected>>", lambda *_: self._desktop_apply_filter())
+
+        Label(toolbar, text="Сортировка:", bg=theme.BG).pack(side=LEFT, padx=(10, 4))
+        self._desktop_sort_var = StringVar(value="По имени")
+        self._desktop_sort_box = ttk.Combobox(
+            toolbar, textvariable=self._desktop_sort_var, state="readonly",
+            values=["По имени", "По дате", "По размеру"], width=10,
+        )
+        self._desktop_sort_box.pack(side=LEFT)
+        self._desktop_sort_box.bind("<<ComboboxSelected>>", lambda *_: self._desktop_apply_filter())
 
         self._desktop_count_var = StringVar(value="Выбрано: 0")
         Label(
@@ -367,27 +410,51 @@ class App(Tk):
 
     def _desktop_refresh(self) -> None:
         self._desktop_selected.clear()
+        self._desktop_all_entries = self.sorter.list_watched_entries()
+        self._desktop_apply_filter()
+
+    def _desktop_sort_key(self, entry: dict):
+        mode = self._desktop_sort_var.get()
+        if mode == "По дате":
+            return (-entry.get("mtime", 0), entry["name"].lower())
+        if mode == "По размеру":
+            return (-entry.get("size", 0), entry["name"].lower())
+        return entry["name"].lower()
+
+    def _desktop_apply_filter(self) -> None:
+        search = self._desktop_search_var.get().strip().lower()
+        type_filter = self._desktop_type_var.get()
+        entries = list(self._desktop_all_entries)
+        if search:
+            entries = [e for e in entries if search in e["name"].lower()]
+        if type_filter and type_filter != "Все типы":
+            entries = [e for e in entries if e.get("category") == type_filter]
+        entries.sort(key=self._desktop_sort_key)
+        self._desktop_render(entries)
+
+    def _desktop_render(self, entries: list[dict]) -> None:
         self._desktop_photos.clear()
         self._desktop_thumb_queue.clear()
         for widget in self._desktop_inner.winfo_children():
             widget.destroy()
         self._desktop_tiles.clear()
-        self._desktop_entries = self.sorter.list_watched_entries()
-        if not self._desktop_entries:
+        self._desktop_entries = entries
+        if not entries:
             Label(
-                self._desktop_inner, text="Нет элементов в отслеживаемых папках.\n"
-                "Проверьте настройки или нажмите «Обновить».",
+                self._desktop_inner, text="Нет элементов.\n"
+                "Измените фильтр или проверьте настройки отслеживаемых папок.",
                 bg=theme.BG, fg=theme.TEXT_MUTED, font=("Segoe UI", 11), justify="center",
             ).pack(pady=40)
         else:
-            for entry in self._desktop_entries:
+            for entry in entries:
                 tile = self._desktop_make_tile(entry)
                 self._desktop_tiles[entry["path"]] = tile
             self._desktop_reflow()
             self._desktop_queue_thumbs()
         self._desktop_update_count()
+        total = len(self._desktop_all_entries)
         self.status_var.set(
-            f"Рабочий стол: {len(self._desktop_entries)} элементов{self._status_suffix()}"
+            f"Рабочий стол: {len(entries)} из {total}{self._status_suffix()}"
         )
 
     def _desktop_queue_thumbs(self) -> None:
@@ -606,12 +673,35 @@ class App(Tk):
             msg += f"\n\n{skipped} выбранных элементов пропущено (ещё не готовы)."
         if not messagebox.askyesno("Сортировать выбранное", msg):
             return
-        self.status_var.set("Сортирую выбранное...")
+        if not self._confirm_duplicates(paths):
+            return
+        self._run_sort(paths)
+
+    def _confirm_duplicates(self, paths: list[str]) -> bool:
+        dupes = self.sorter.find_duplicates(paths)
+        if not dupes:
+            return True
+        preview = "\n".join(
+            f"• {d['name']} → уже есть: {d['existing']}" for d in dupes[:8]
+        )
+        more = f"\n…и ещё {len(dupes) - 8}" if len(dupes) > 8 else ""
+        return messagebox.askyesno(
+            "Возможные дубликаты",
+            f"В архиве уже есть {len(dupes)} файл(ов) с такими именами "
+            f"в целевых папках. Будут созданы копии с суффиксом (1), (2)…\n\n"
+            f"{preview}{more}\n\nПродолжить сортировку?",
+        )
+
+    def _run_sort(self, paths: list[str] | None = None) -> None:
+        self.status_var.set("Сортирую...")
         self.update_idletasks()
 
         def work():
-            moved = self.sorter.sort_paths(paths)
-            self.after(0, lambda: self._after_sort(moved))
+            if paths is not None:
+                result = self.sorter.sort_paths(paths)
+            else:
+                result = self.sorter.sort_all()
+            self.after(0, lambda: self._after_sort(result))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -735,14 +825,9 @@ class App(Tk):
             return
         if not messagebox.askyesno("Сортировать", f"Сортировать {len(paths)} элемент(ов)?"):
             return
-        self.status_var.set("Сортирую выбранное...")
-        self.update_idletasks()
-
-        def work():
-            moved = self.sorter.sort_paths(paths)
-            self.after(0, lambda: self._after_sort(moved))
-
-        threading.Thread(target=work, daemon=True).start()
+        if not self._confirm_duplicates(paths):
+            return
+        self._run_sort(paths)
 
     def _desktop_set_excluded(self, paths: list[str], exclude: bool) -> None:
         for p in paths:
@@ -752,6 +837,63 @@ class App(Tk):
                 self.settings.remove_excluded_path(p)
         self.settings.save()
         self._desktop_refresh()
+
+    # ---------- вкладка «статистика» ----------
+
+    def _build_stats_tab(self, root) -> None:
+        top = Frame(root, bg=theme.BG, padx=8, pady=8)
+        top.pack(side="top", fill=X)
+        ttk.Button(top, text="Обновить", command=self._reload_stats).pack(side=LEFT)
+        self._stats_summary_var = StringVar(value="")
+        Label(
+            top, textvariable=self._stats_summary_var, bg=theme.BG,
+            fg=theme.TEXT_MUTED, font=("Segoe UI", 10),
+        ).pack(side=LEFT, padx=(16, 0))
+
+        body = Frame(root, bg=theme.BG)
+        body.pack(side="top", fill=BOTH, expand=True, padx=8, pady=(0, 8))
+        table_frame = Frame(body, bg=theme.CARD, highlightbackground=theme.BORDER, highlightthickness=1)
+        table_frame.pack(fill=BOTH, expand=True)
+
+        cols = ("category", "count", "size", "share")
+        self._stats_tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse")
+        self._stats_tree.heading("category", text="Категория")
+        self._stats_tree.heading("count", text="Файлов")
+        self._stats_tree.heading("size", text="Размер")
+        self._stats_tree.heading("share", text="Доля")
+        self._stats_tree.column("category", width=200, anchor="w")
+        self._stats_tree.column("count", width=100, anchor="e")
+        self._stats_tree.column("size", width=120, anchor="e")
+        self._stats_tree.column("share", width=80, anchor="e")
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self._stats_tree.yview)
+        self._stats_tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=RIGHT, fill=Y)
+        self._stats_tree.pack(side=LEFT, fill=BOTH, expand=True)
+
+    def _reload_stats(self) -> None:
+        if not hasattr(self, "_stats_tree"):
+            return
+        rows = self.index.stats_by_category()
+        total_size = self.index.total_size()
+        total_count = self.index.count()
+        last_ts = self.index.last_sort_time()
+        if last_ts:
+            last_txt = datetime.fromtimestamp(last_ts).strftime("%d.%m.%Y %H:%M")
+        else:
+            last_txt = "ещё не было"
+        self._stats_summary_var.set(
+            f"Всего: {total_count} · {human_size(total_size)} · "
+            f"последняя сортировка: {last_txt} · операций в журнале: {self.index.history_count()}"
+        )
+        self._stats_tree.delete(*self._stats_tree.get_children())
+        for r in rows:
+            size = int(r["total_size"] or 0)
+            cnt = int(r["cnt"] or 0)
+            share = f"{100 * size / total_size:.1f}%" if total_size else "—"
+            self._stats_tree.insert(
+                "", END,
+                values=(r["category"], cnt, human_size(size), share),
+            )
 
     # ---------- вкладка «история» ----------
 
@@ -818,6 +960,10 @@ class App(Tk):
               wraplength=250, bg=theme.CARD, fg=theme.TEXT).pack(fill=BOTH, expand=True, pady=8)
         ttk.Button(side, text="Показать в папке (куда)", command=self._hist_reveal_dst).pack(fill=X, pady=2)
         ttk.Button(side, text="Показать исходную папку", command=self._hist_reveal_src).pack(fill=X, pady=2)
+        ttk.Button(
+            side, text="Восстановить файл", style="Accent.TButton",
+            command=self._hist_restore_one,
+        ).pack(fill=X, pady=(8, 2))
 
         self._hist_rows: dict[str, dict] = {}
 
@@ -908,6 +1054,38 @@ class App(Tk):
                 reveal_in_explorer(str(parent))
             else:
                 messagebox.showinfo("Нет папки", "Исходная папка недоступна.")
+
+    def _hist_restore_one(self) -> None:
+        row = self._hist_selected()
+        if not row:
+            messagebox.showinfo("Выберите запись", "Выберите файл в журнале для восстановления.")
+            return
+        name = row.get("name") or Path(row["dst"]).name
+        if not messagebox.askyesno(
+            "Восстановить файл",
+            f"Вернуть на исходное место?\n\n{name}",
+        ):
+            return
+        self.status_var.set("Восстанавливаю файл...")
+
+        def work():
+            ok, err = self.sorter.undo_move(int(row["id"]))
+            self.after(0, lambda: self._after_hist_restore(ok, err, name))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_hist_restore(self, ok: bool, err: str, name: str) -> None:
+        self._refresh_filters()
+        self._reload_table()
+        self._reload_history()
+        if hasattr(self, "_desktop_canvas"):
+            self._desktop_refresh()
+        if hasattr(self, "_stats_tree"):
+            self._reload_stats()
+        if ok:
+            messagebox.showinfo("Готово", f"Файл восстановлен: {name}")
+        else:
+            messagebox.showerror("Ошибка", f"Не удалось восстановить {name}:\n{err}")
 
     def _undo_selected_batch(self):
         batch_label = self.hist_batch_var.get()
@@ -1224,23 +1402,33 @@ class App(Tk):
             self.ctx.tk_popup(event.x_root, event.y_root)
 
     def _sort_now(self):
-        self.status_var.set("Сортирую...")
-        self.update_idletasks()
+        if not self._confirm_duplicates([
+            e["path"] for e in self.sorter.list_watched_entries() if e.get("sortable")
+        ]):
+            return
+        self._run_sort()
 
-        def work():
-            moved = self.sorter.sort_all()
-            self.after(0, lambda: self._after_sort(moved))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _after_sort(self, moved: int):
+    def _after_sort(self, result: SortResult):
         self._update_mode_banner()
         self._refresh_filters()
         self._reload_table()
         self._reload_history()
         if hasattr(self, "_desktop_canvas"):
             self._desktop_refresh()
-        messagebox.showinfo("Готово", f"Обработано файлов: {moved}")
+        if hasattr(self, "_stats_tree"):
+            self._reload_stats()
+        msg = f"Обработано файлов: {result.moved}"
+        if result.errors:
+            preview = "\n".join(
+                f"• {Path(p).name}: {reason}" for p, reason in result.errors[:12]
+            )
+            more = f"\n…и ещё {len(result.errors) - 12}" if len(result.errors) > 12 else ""
+            messagebox.showwarning(
+                "Сортировка завершена с ошибками",
+                f"{msg}\n\nОшибки ({len(result.errors)}):\n{preview}{more}",
+            )
+        else:
+            messagebox.showinfo("Готово", msg)
 
     def _undo_last(self):
         if not messagebox.askyesno(
@@ -1263,6 +1451,8 @@ class App(Tk):
         self._reload_history()
         if hasattr(self, "_desktop_canvas"):
             self._desktop_refresh()
+        if hasattr(self, "_stats_tree"):
+            self._reload_stats()
         if ok == 0 and fail == 0:
             messagebox.showinfo("Отмена", "Нечего отменять.")
         else:
@@ -1569,7 +1759,7 @@ class App(Tk):
     def _open_settings(self):
         win = Toplevel(self)
         win.title("Настройки сортировки")
-        win.geometry("720x620")
+        win.geometry("720x720")
         win.configure(bg=theme.BG)
         win.transient(self)
         win.grab_set()
@@ -1665,6 +1855,24 @@ class App(Tk):
             variable=notify_var, onvalue="on", offvalue="off",
         ).pack(anchor="w", padx=16, pady=(4, 0))
 
+        dark_var = StringVar(value="on" if self.settings.dark_mode else "off")
+        ttk.Checkbutton(
+            canvas_frame, text="Тёмная тема (применится после перезапуска)",
+            variable=dark_var, onvalue="on", offvalue="off",
+        ).pack(anchor="w", padx=16, pady=(4, 0))
+
+        tray_var = StringVar(value="on" if self.settings.close_to_tray else "off")
+        ttk.Checkbutton(
+            canvas_frame, text="При закрытии окна — сворачивать в трей",
+            variable=tray_var, onvalue="on", offvalue="off",
+        ).pack(anchor="w", padx=16, pady=(4, 0))
+
+        Label(canvas_frame, text="Исключённые пути (не сортировать, по одному в строке):",
+              font=("Segoe UI", 10, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(12, 2))
+        excluded_text = Text(canvas_frame, height=4, font=("Consolas", 9))
+        excluded_text.pack(fill=X, padx=16)
+        excluded_text.insert("1.0", "\n".join(self.settings.excluded_paths))
+
         Label(canvas_frame, text="Отслеживаемые папки (по одной в строке):",
               font=("Segoe UI", 10, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(12, 2))
         folders_text = Text(canvas_frame, height=5, font=("Consolas", 9))
@@ -1693,6 +1901,14 @@ class App(Tk):
             self.settings.data["archive_name"] = name_var.get().strip() or "Архив"
             self.settings.data["sort_folders"] = sort_folders_var.get() == "on"
             self.settings.data["notify_on_sort"] = notify_var.get() == "on"
+            self.settings.data["dark_mode"] = dark_var.get() == "on"
+            self.settings.data["close_to_tray"] = tray_var.get() == "on"
+            excluded = [
+                line.strip()
+                for line in excluded_text.get("1.0", END).splitlines()
+                if line.strip()
+            ]
+            self.settings.data["excluded_paths"] = excluded
             self.settings.data.pop("destination", None)
             self.settings.data["watched_folders"] = folders
             self.settings.save()
@@ -1708,14 +1924,68 @@ class App(Tk):
         ttk.Button(btns, text="Сохранить", style="Accent.TButton", command=save).pack(side=RIGHT)
         ttk.Button(btns, text="Отмена", command=win.destroy).pack(side=RIGHT, padx=(0, 8))
 
-    # ---------- закрытие ----------
+    # ---------- вкладки / трей / закрытие ----------
 
-    def _on_close(self):
+    def _on_tab_changed(self, _event=None) -> None:
         try:
+            idx = self._notebook.index(self._notebook.select())
+            self.settings.data["last_tab"] = idx
+            self.settings.save()
+            if idx == 2 and hasattr(self, "_stats_tree"):
+                self._reload_stats()
+        except Exception:
+            pass
+
+    def _minimize_to_tray(self) -> None:
+        if not _HAS_TRAY:
+            self.iconify()
+            return
+        self._ensure_tray()
+        self.withdraw()
+        self._hidden_to_tray = True
+
+    def _ensure_tray(self) -> None:
+        if self._tray_icon is not None:
+            return
+
+        def show(_icon=None, _item=None):
+            self.after(0, self._restore_from_tray)
+
+        def quit_app(icon, _item=None):
+            self.after(0, self._final_quit)
+            icon.stop()
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Показать FileOrganizer", show, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Выход", quit_app),
+        )
+        self._tray_icon = pystray.Icon(
+            "FileOrganizerGUI", make_icon_image(64), "FileOrganizer", menu,
+        )
+        threading.Thread(target=self._tray_icon.run, daemon=True).start()
+
+    def _restore_from_tray(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        self._hidden_to_tray = False
+
+    def _final_quit(self) -> None:
+        try:
+            if self._tray_icon is not None:
+                self._tray_icon.stop()
+                self._tray_icon = None
             self.watcher.stop()
             self.index.close()
         finally:
             self.destroy()
+
+    def _on_close(self):
+        if self.settings.close_to_tray and _HAS_TRAY:
+            self._minimize_to_tray()
+            return
+        self._final_quit()
 
 
 def main() -> None:

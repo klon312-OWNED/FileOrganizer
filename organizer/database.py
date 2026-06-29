@@ -333,6 +333,41 @@ class FileIndex:
         with self._lock:
             return self._conn.execute("SELECT COUNT(*) AS c FROM files").fetchone()["c"]
 
+    def total_size(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(size), 0) AS s FROM files"
+            ).fetchone()
+        return int(row["s"]) if row else 0
+
+    def stats_by_category(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                """
+                SELECT category,
+                       COUNT(*) AS cnt,
+                       COALESCE(SUM(size), 0) AS total_size
+                FROM files
+                GROUP BY category
+                ORDER BY total_size DESC
+                """
+            ).fetchall()
+
+    def last_sort_time(self) -> float | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(ts) AS t FROM batches"
+            ).fetchone()
+        if row and row["t"]:
+            return float(row["t"])
+        return None
+
+    def get_move_by_id(self, move_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM moves WHERE id = ?", (move_id,)
+            ).fetchone()
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
