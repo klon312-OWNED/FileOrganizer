@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ class Sorter:
         self.current_batch: str | None = None
         self._batch_count = 0
         self._batch_zip_queue: list[Path] = []
+        self._operation_lock = threading.Lock()
 
     def _should_compress(self) -> bool:
         return (
@@ -229,6 +231,8 @@ class Sorter:
         )
 
     def _transfer(self, src: Path, dst: Path) -> tuple[bool, str]:
+        if self.settings.data.get("dry_run", False):
+            return True, ""
         try:
             if self.settings.storage_mode == "copy":
                 if src.is_dir():
@@ -275,6 +279,7 @@ class Sorter:
 
     def sort_file(self, file_path: str | Path, result: SortResult | None = None) -> Path | None:
         path = Path(file_path)
+        dry_run = bool(self.settings.data.get("dry_run", False))
         if not path.is_file():
             return None
         if not self._is_ready(path):
@@ -293,6 +298,9 @@ class Sorter:
             if result is not None:
                 result.add_error(str(path), err or "не удалось переместить")
             return None
+
+        if dry_run:
+            return target
 
         final = self._compress_after_move(target)
         if final != target:
@@ -318,6 +326,7 @@ class Sorter:
 
     def sort_directory(self, dir_path: str | Path, result: SortResult | None = None) -> Path | None:
         path = Path(dir_path)
+        dry_run = bool(self.settings.data.get("dry_run", False))
         if not path.is_dir():
             return None
         if not self.settings.sort_folders:
@@ -337,6 +346,9 @@ class Sorter:
             if result is not None:
                 result.add_error(str(path), err or "не удалось переместить")
             return None
+
+        if dry_run:
+            return target
 
         final = self._compress_after_move(target)
         if final != target:
@@ -450,46 +462,103 @@ class Sorter:
         return entries
 
     @contextmanager
-    def batch_context(self, prefix: str = "sort"):
+    def batch_context(self, prefix: str = "sort", *, blocking: bool = True):
         """Группировать несколько sort_entry в одну запись истории."""
+        acquired = self._operation_lock.acquire(blocking=blocking)
+        if not acquired:
+            raise RuntimeError("Операция сортировки уже выполняется")
         batch = f"{prefix}-{datetime.now():%Y%m%d-%H%M%S}-{time.time():.0f}"
         self.current_batch = batch
         self._batch_count = 0
         self._batch_zip_queue = []
-        self.index.start_batch(
-            batch=batch,
-            sort_mode=self.settings.sort_mode,
-            storage_mode=self.settings.storage_mode,
-            ts=time.time(),
-        )
+        dry_run = bool(self.settings.data.get("dry_run", False))
+        if not dry_run:
+            self.index.start_batch(
+                batch=batch,
+                sort_mode=self.settings.sort_mode,
+                storage_mode=self.settings.storage_mode,
+                ts=time.time(),
+            )
         try:
             yield
         finally:
-            self._finish_batch_zip()
-            if self._batch_count > 0:
-                self.index.finish_batch(batch, self._batch_count)
-            else:
-                self.index.delete_batch(batch)
-            self.current_batch = None
+            try:
+                self._finish_batch_zip()
+                if dry_run:
+                    self._batch_count = 0
+                if not dry_run:
+                    if self._batch_count > 0:
+                        self.index.finish_batch(batch, self._batch_count)
+                    else:
+                        self.index.delete_batch(batch)
+                self.current_batch = None
+            finally:
+                self._operation_lock.release()
 
-    def sort_paths(self, paths: list[str | Path]) -> SortResult:
+    def sort_paths(
+        self,
+        paths: list[str | Path],
+        *,
+        on_progress=None,
+        should_cancel=None,
+    ) -> SortResult:
         """Сортировать только указанные пути (одна пакетная операция)."""
         result = SortResult()
         with self.batch_context("sort"):
-            for raw in paths:
+            total = len(paths)
+            for i, raw in enumerate(paths, start=1):
+                if should_cancel and should_cancel():
+                    break
                 if self.sort_entry(raw, result):
                     result.moved += 1
+                if on_progress:
+                    try:
+                        on_progress(i, total, str(raw))
+                    except Exception:
+                        pass
         return result
 
-    def sort_all(self) -> SortResult:
+    def sort_all(self, *, on_progress=None, should_cancel=None, blocking: bool = True) -> SortResult:
         result = SortResult()
+        entries: list[Path] = []
         dest = Path(self.settings.destination).resolve()
-        with self.batch_context("sort"):
+        for folder in self.settings.watched_folders:
+            fpath = Path(folder).resolve()
+            if fpath == dest or dest in fpath.parents:
+                continue
+            try:
+                entries.extend([e for e in fpath.iterdir() if e.exists()])
+            except OSError:
+                continue
+        with self.batch_context("sort", blocking=blocking):
+            total = len(entries)
+            done = 0
             for folder in self.settings.watched_folders:
                 fpath = Path(folder).resolve()
                 if fpath == dest or dest in fpath.parents:
                     continue
-                result.moved += self.sort_folder(fpath, result)
+                try:
+                    items = list(fpath.iterdir())
+                except OSError:
+                    continue
+                for entry in items:
+                    if should_cancel and should_cancel():
+                        return result
+                    try:
+                        if entry.resolve() == dest:
+                            done += 1
+                            continue
+                    except OSError:
+                        done += 1
+                        continue
+                    if self.sort_entry(entry, result):
+                        result.moved += 1
+                    done += 1
+                    if on_progress:
+                        try:
+                            on_progress(done, total, str(entry))
+                        except Exception:
+                            pass
         return result
 
     def undo_batch(self, batch: str) -> tuple[int, int]:

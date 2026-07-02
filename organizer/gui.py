@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 import shutil
@@ -123,6 +124,11 @@ class App(Tk):
         self._tray_icon = None
         self._hidden_to_tray = False
         self._desktop_anchor_idx: int | None = None
+        self._busy_lock = threading.Lock()
+        self._busy_task = ""
+        self._desktop_cancel_event = threading.Event()
+        self._desktop_sort_active = False
+        self._bg_refresh_after = None
 
         self._build_header()
         self._build_ui()
@@ -164,6 +170,36 @@ class App(Tk):
     def _status_suffix(self) -> str:
         sm = sort_mode_label(self.settings.sort_mode)
         return f" · {sm} · {self.settings.destination}"
+
+    def _begin_task(self, name: str) -> bool:
+        if not self._busy_lock.acquire(blocking=False):
+            messagebox.showinfo(
+                "Операция уже выполняется",
+                f"Сейчас выполняется: {self._busy_task or 'другая операция'}.\n"
+                "Дождитесь завершения.",
+            )
+            return False
+        self._busy_task = name
+        return True
+
+    def _end_task(self) -> None:
+        self._busy_task = ""
+        try:
+            self._busy_lock.release()
+        except RuntimeError:
+            pass
+
+    def _confirm_sort_operation(self, paths: list[str], *, title: str = "Сортировка") -> bool:
+        count = len(paths)
+        msg = (
+            f"Элементов: {count}\n"
+            f"Назначение: {self.settings.destination}\n"
+            f"Режим: {storage_mode_label(self.settings.storage_mode)}"
+        )
+        msg += self._compression_notice(count, paths=paths)
+        if self.settings.dry_run:
+            msg += "\n\nТестовый режим (dry run): файлы НЕ будут изменены."
+        return messagebox.askyesno(title, msg + "\n\nПродолжить?")
 
     # ---------- построение интерфейса ----------
 
@@ -341,6 +377,10 @@ class App(Tk):
         ).pack(side=LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="Сортировать всё", command=self._sort_now).pack(side=LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="Обновить", command=self._desktop_refresh).pack(side=LEFT, padx=(8, 0))
+        self._desktop_cancel_btn = ttk.Button(
+            toolbar, text="Отменить сортировку", command=self._desktop_cancel_sort, state="disabled",
+        )
+        self._desktop_cancel_btn.pack(side=LEFT, padx=(8, 0))
 
         Label(toolbar, text="Поиск:", bg=theme.BG).pack(side=LEFT, padx=(16, 4))
         self._desktop_search_var = StringVar()
@@ -721,6 +761,10 @@ class App(Tk):
         total = len(self._desktop_entries)
         self._desktop_count_var.set(f"Выбрано: {n} из {total}")
 
+    def _desktop_cancel_sort(self) -> None:
+        self._desktop_cancel_event.set()
+        self.status_var.set("Останавливаю сортировку выбранного...")
+
     def _desktop_sort_selected(self) -> None:
         by_path = {e["path"]: e for e in self._desktop_entries}
         paths = [
@@ -735,15 +779,20 @@ class App(Tk):
             )
             return
         skipped = len(self._desktop_selected) - len(paths)
-        msg = f"Сортировать выбранное ({len(paths)} шт.)?"
-        msg += self._compression_notice(len(paths), enabled=self._desktop_compress_var.get(), paths=paths)
-        if skipped:
-            msg += f"\n\n{skipped} выбранных элементов пропущено (ещё не готовы)."
-        if not messagebox.askyesno("Сортировать выбранное", msg):
+        if not self._confirm_sort_operation(paths, title="Сортировать выбранное"):
             return
+        if skipped:
+            self.status_var.set(f"Пропущено неготовых элементов: {skipped}")
         if not self._confirm_duplicates(paths):
             return
-        self._run_sort(paths, compress_override=self._desktop_compress_var.get())
+        self._desktop_cancel_event.clear()
+        self._desktop_sort_active = True
+        self._desktop_cancel_btn.configure(state="normal")
+        self._run_sort(
+            paths,
+            compress_override=self._desktop_compress_var.get(),
+            cancel_event=self._desktop_cancel_event,
+        )
 
     def _compression_notice(self, count: int, *, enabled: bool | None = None, paths: list[str] | None = None) -> str:
         on = self.settings.compression_enabled if enabled is None else enabled
@@ -777,7 +826,15 @@ class App(Tk):
             f"{preview}{more}\n\nПродолжить сортировку?",
         )
 
-    def _run_sort(self, paths: list[str] | None = None, *, compress_override: bool | None = None) -> None:
+    def _run_sort(
+        self,
+        paths: list[str] | None = None,
+        *,
+        compress_override: bool | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        if not self._begin_task("Сортировка"):
+            return
         self.status_var.set("Сортирую...")
         self.update_idletasks()
         prev_enabled = self.settings.data.get("compression_enabled", False)
@@ -785,17 +842,38 @@ class App(Tk):
             self.settings.data["compression_enabled"] = compress_override and (
                 self.settings.compression_mode != "none"
             )
+        cancelled = {"value": False}
+
+        def on_progress(done: int, total: int, raw_path: str) -> None:
+            if total <= 0:
+                return
+            name = Path(raw_path).name
+            self.after(0, lambda: self.status_var.set(f"Сортировка: {done}/{total} · {name}"))
+
+        def should_cancel() -> bool:
+            if cancel_event and cancel_event.is_set():
+                cancelled["value"] = True
+                return True
+            return False
 
         def work():
+            result = SortResult()
             try:
                 if paths is not None:
-                    result = self.sorter.sort_paths(paths)
+                    result = self.sorter.sort_paths(
+                        paths, on_progress=on_progress, should_cancel=should_cancel,
+                    )
                 else:
-                    result = self.sorter.sort_all()
+                    result = self.sorter.sort_all(on_progress=on_progress, should_cancel=should_cancel)
+            except RuntimeError as e:
+                result.add_error("", str(e))
+            except Exception as e:
+                result.add_error("", str(e))
             finally:
                 if compress_override is not None:
                     self.settings.data["compression_enabled"] = prev_enabled
-            self.after(0, lambda: self._after_sort(result))
+            self.after(0, lambda: self._after_sort(result, cancelled["value"]))
+            self.after(0, self._end_task)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -921,7 +999,7 @@ class App(Tk):
     def _desktop_sort_paths(self, paths: list[str]) -> None:
         if not paths:
             return
-        if not messagebox.askyesno("Сортировать", f"Сортировать {len(paths)} элемент(ов)?"):
+        if not self._confirm_sort_operation(paths, title="Сортировать"):
             return
         if not self._confirm_duplicates(paths):
             return
@@ -999,6 +1077,8 @@ class App(Tk):
             f"Всего: {total_count} · {human_size(total_size)} · "
             f"последняя сортировка: {last_txt} · операций в журнале: {self.index.history_count()}"
         )
+        if total_count == 0:
+            self._stats_summary_var.set("Нет данных статистики. Добавьте файлы через сортировку.")
         self._stats_tree.delete(*self._stats_tree.get_children())
         chart_rows: list[tuple[str, int, int]] = []
         for r in rows:
@@ -1170,6 +1250,11 @@ class App(Tk):
                     dt.strftime("%d.%m.%Y %H:%M"),
                     name, action_txt, cat, r["src"], r["dst"],
                 ),
+            )
+        if not rows:
+            self.hist_detail.set(
+                "История пока пуста.\n\n"
+                "Запустите сортировку, чтобы увидеть операции и затем при необходимости откатить их.",
             )
 
     def _hist_selected(self) -> dict | None:
@@ -1457,6 +1542,9 @@ class App(Tk):
             f"Показано: {len(rows)} файлов · {human_size(total_size)} · "
             f"всего в индексе: {self.index.count()}{self._status_suffix()}"
         )
+        if not rows:
+            self._archive_preview.set_metadata("Архив пока пуст.\nЗапустите сортировку, чтобы добавить файлы.")
+            self._archive_preview.clear()
 
     def _selected_paths(self) -> list[str]:
         paths = []
@@ -1501,8 +1589,11 @@ class App(Tk):
         self._archive_preview.show(path, kind=kind)
 
     def _archive_compress_selected(self) -> None:
+        if not self._begin_task("Сжатие"):
+            return
         paths = [p for p in self._selected_paths() if Path(p).exists()]
         if not paths:
+            self._end_task()
             messagebox.showwarning("Сжатие", "Выберите файлы или папки в архиве.")
             return
         level = self.settings.compression_level
@@ -1512,25 +1603,33 @@ class App(Tk):
             f"Уровень: {compression_level_label(level)}.\n\n"
             "Исходные файлы будут удалены после упаковки.",
         ):
+            self._end_task()
             return
-        ok = fail = 0
-        for raw in paths:
-            p = Path(raw)
-            try:
-                zip_path = zip_item(p, level=level)
-                remove_source(p)
-                self.index.remove_by_path(str(p))
-                ts = zip_path.stat().st_mtime
-                dt = datetime.fromtimestamp(ts)
-                self.index.add_file(
-                    name=zip_path.name, path=str(zip_path), source_path=str(p),
-                    category=self.settings.category_for_extension(".zip"),
-                    extension=".zip", size=zip_path.stat().st_size,
-                    added_ts=ts, year=dt.year, month=dt.month, kind="file",
-                )
-                ok += 1
-            except OSError:
-                fail += 1
+        def work():
+            ok = fail = 0
+            for i, raw in enumerate(paths, start=1):
+                self.after(0, lambda i=i: self.status_var.set(f"Сжатие: {i}/{len(paths)}"))
+                p = Path(raw)
+                try:
+                    zip_path = zip_item(p, level=level)
+                    remove_source(p)
+                    self.index.remove_by_path(str(p))
+                    ts = zip_path.stat().st_mtime
+                    dt = datetime.fromtimestamp(ts)
+                    self.index.add_file(
+                        name=zip_path.name, path=str(zip_path), source_path=str(p),
+                        category=self.settings.category_for_extension(".zip"),
+                        extension=".zip", size=zip_path.stat().st_size,
+                        added_ts=ts, year=dt.year, month=dt.month, kind="file",
+                    )
+                    ok += 1
+                except Exception:
+                    fail += 1
+            self.after(0, lambda: self._after_archive_compress(ok, fail))
+            self.after(0, self._end_task)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_archive_compress(self, ok: int, fail: int) -> None:
         self._reload_table()
         self._refresh_filters()
         msg = f"Создано архивов: {ok}"
@@ -1555,39 +1654,50 @@ class App(Tk):
         self._reload_table()
 
     def _archive_unzip_selected(self) -> None:
+        if not self._begin_task("Распаковка"):
+            return
         paths = [
             p for p in self._selected_paths()
             if Path(p).suffix.lower() == ".zip" and Path(p).is_file()
         ]
         if not paths:
+            self._end_task()
             messagebox.showwarning("Распаковка", "Выберите один или несколько ZIP-архивов.")
             return
         if not messagebox.askyesno(
             "Распаковать ZIP",
             f"Распаковать {len(paths)} архив(ов) в папки рядом с файлами?",
         ):
+            self._end_task()
             return
-        ok = fail = 0
-        for raw in paths:
-            try:
-                dest = unzip_item(Path(raw))
-                for child in dest.rglob("*"):
-                    if child.is_file():
-                        try:
-                            st = child.stat()
-                            dt = datetime.fromtimestamp(st.st_mtime)
-                            self.index.add_file(
-                                name=child.name, path=str(child), source_path=str(raw),
-                                category=self.settings.category_for_extension(child.suffix.lower()),
-                                extension=child.suffix.lower(), size=st.st_size,
-                                added_ts=st.st_mtime, year=dt.year, month=dt.month,
-                                kind="file",
-                            )
-                        except OSError:
-                            pass
-                ok += 1
-            except OSError:
-                fail += 1
+        def work():
+            ok = fail = 0
+            for i, raw in enumerate(paths, start=1):
+                self.after(0, lambda i=i: self.status_var.set(f"Распаковка: {i}/{len(paths)}"))
+                try:
+                    dest = unzip_item(Path(raw))
+                    for child in dest.rglob("*"):
+                        if child.is_file():
+                            try:
+                                st = child.stat()
+                                dt = datetime.fromtimestamp(st.st_mtime)
+                                self.index.add_file(
+                                    name=child.name, path=str(child), source_path=str(raw),
+                                    category=self.settings.category_for_extension(child.suffix.lower()),
+                                    extension=child.suffix.lower(), size=st.st_size,
+                                    added_ts=st.st_mtime, year=dt.year, month=dt.month,
+                                    kind="file",
+                                )
+                            except OSError:
+                                pass
+                    ok += 1
+                except Exception:
+                    fail += 1
+            self.after(0, lambda: self._after_archive_unzip(ok, fail))
+            self.after(0, self._end_task)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_archive_unzip(self, ok: int, fail: int) -> None:
         self._reload_table()
         self._refresh_filters()
         msg = f"Распаковано: {ok}"
@@ -1669,15 +1779,16 @@ class App(Tk):
         if not paths:
             messagebox.showinfo("Сортировка", "Нет готовых файлов для сортировки.")
             return
-        msg = f"Сортировать все готовые элементы ({len(paths)} шт.)?"
-        msg += self._compression_notice(len(paths), paths=paths)
-        if not messagebox.askyesno("Сортировать всё", msg):
+        if not self._confirm_sort_operation(paths, title="Сортировать всё"):
             return
         if not self._confirm_duplicates(paths):
             return
         self._run_sort()
 
-    def _after_sort(self, result: SortResult):
+    def _after_sort(self, result: SortResult, cancelled: bool = False):
+        if self._desktop_sort_active:
+            self._desktop_sort_active = False
+            self._desktop_cancel_btn.configure(state="disabled")
         self._update_mode_banner()
         self._refresh_filters()
         self._reload_table()
@@ -1686,7 +1797,12 @@ class App(Tk):
             self._desktop_refresh()
         if hasattr(self, "_stats_tree"):
             self._reload_stats()
-        msg = f"Обработано файлов: {result.moved}"
+        if self.settings.dry_run:
+            msg = f"Dry run: подходящих элементов {result.moved}"
+        else:
+            msg = f"Обработано файлов: {result.moved}"
+        if cancelled:
+            msg += "\nОперация отменена пользователем."
         if result.errors:
             preview = "\n".join(
                 f"• {Path(p).name}: {reason}" for p, reason in result.errors[:12]
@@ -1735,13 +1851,20 @@ class App(Tk):
             messagebox.showinfo("Отмена выполнена", msg)
 
     def _reindex(self):
+        if not self._begin_task("Переиндексация"):
+            return
         self.status_var.set("Обновляю индекс...")
         self.update_idletasks()
 
         def work():
-            self.index.remove_missing()
-            added = self.sorter.reindex_destination()
+            added = 0
+            try:
+                self.index.remove_missing()
+                added = self.sorter.reindex_destination()
+            except Exception:
+                added = 0
             self.after(0, lambda: self._after_reindex(added))
+            self.after(0, self._end_task)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1783,8 +1906,13 @@ class App(Tk):
             messagebox.showinfo("Проверка индекса", "\n".join(lines))
 
     def _scheduled_sort(self) -> None:
+        if self._busy_lock.locked():
+            return
         def work():
-            result = self.sorter.sort_all()
+            try:
+                result = self.sorter.sort_all(blocking=False)
+            except RuntimeError:
+                return
             self.after(0, lambda: self._after_scheduled_sort(result))
         threading.Thread(target=work, daemon=True).start()
 
@@ -1862,14 +1990,23 @@ class App(Tk):
         self.after(0, lambda: self._on_bg_update(new_path, src_name))
 
     def _on_bg_update(self, new_path: str = "", src_name: str = "") -> None:
+        if self._bg_refresh_after is not None:
+            try:
+                self.after_cancel(self._bg_refresh_after)
+            except Exception:
+                pass
+        self._bg_refresh_after = self.after(350, self._flush_bg_refresh)
+        if self.settings.notify_on_sort and new_path:
+            name = src_name or Path(new_path).name
+            show_toast("FileOrganizer", f"Отсортировано: {name}")
+
+    def _flush_bg_refresh(self) -> None:
+        self._bg_refresh_after = None
         self._refresh_filters()
         self._reload_table()
         self._reload_history()
         if hasattr(self, "_desktop_canvas"):
             self._desktop_refresh()
-        if self.settings.notify_on_sort and new_path:
-            name = src_name or Path(new_path).name
-            show_toast("FileOrganizer", f"Отсортировано: {name}")
 
     # ---------- логика вкладки «весь компьютер» ----------
 
@@ -2164,6 +2301,11 @@ class App(Tk):
                 variable=compress_level_var, value=key,
                 bg=theme.BG, anchor="w",
             ).pack(side=LEFT, padx=(8, 0))
+        dry_run_var = StringVar(value="on" if self.settings.dry_run else "off")
+        ttk.Checkbutton(
+            canvas_frame, text="Тестовый режим (dry run, без изменений файлов)",
+            variable=dry_run_var, onvalue="on", offvalue="off",
+        ).pack(anchor="w", padx=28, pady=(4, 0))
 
         Label(canvas_frame, text="Дата для папок",
               font=("Segoe UI", 11, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(14, 4))
@@ -2286,6 +2428,7 @@ class App(Tk):
             self.settings.data["compression_enabled"] = compress_var.get() == "on"
             self.settings.data["compression_mode"] = compress_mode_var.get()
             self.settings.data["compression_level"] = compress_level_var.get()
+            self.settings.data["dry_run"] = dry_run_var.get() == "on"
             self.settings.data["notify_on_sort"] = notify_var.get() == "on"
             self.settings.data["dark_mode"] = dark_var.get() == "on"
             self.settings.data["close_to_tray"] = tray_var.get() == "on"

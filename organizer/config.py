@@ -116,6 +116,8 @@ DEFAULT_SETTINGS: dict = {
     "compression_enabled": False,
     "compression_mode": "none",
     "compression_level": "fast",
+    # Тестовый режим: показывать результат, ничего не перемещая
+    "dry_run": False,
 }
 
 
@@ -170,6 +172,7 @@ class Settings:
         if merged.get("compression_level") not in _VALID_COMPRESSION_LEVELS:
             merged["compression_level"] = DEFAULT_SETTINGS["compression_level"]
         merged["compression_enabled"] = bool(merged.get("compression_enabled", False))
+        merged["dry_run"] = bool(merged.get("dry_run", False))
         self.data = merged
 
     def save(self) -> None:
@@ -282,6 +285,10 @@ class Settings:
     def compression_level(self) -> str:
         level = self.data.get("compression_level", "fast")
         return level if level in _VALID_COMPRESSION_LEVELS else "fast"
+
+    @property
+    def dry_run(self) -> bool:
+        return bool(self.data.get("dry_run", False))
 
     def add_excluded_path(self, path: str) -> None:
         try:

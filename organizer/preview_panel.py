@@ -130,11 +130,14 @@ class PreviewPanel:
 
         showed_image = False
         if _HAS_PIL and ext in PREVIEW_EXTS:
-            img = fit_preview_image(get_thumbnail(path, max_size=(900, 900)), (360, 320))
-            if img is not None:
-                self._photo = ImageTk.PhotoImage(img)
-                self._img_label.configure(image=self._photo, text="")
-                showed_image = True
+            try:
+                img = fit_preview_image(get_thumbnail(path, max_size=(900, 900)), (360, 320))
+                if img is not None:
+                    self._photo = ImageTk.PhotoImage(img)
+                    self._img_label.configure(image=self._photo, text="")
+                    showed_image = True
+            except Exception:
+                showed_image = False
 
         if not showed_image:
             if ext in IMAGE_EXTS:
@@ -146,9 +149,15 @@ class PreviewPanel:
             else:
                 self._show_image_placeholder("")
 
-        rich = get_rich_preview(path)
+        try:
+            rich = get_rich_preview(path)
+        except Exception:
+            rich = RichPreview(kind="unavailable", note="Ошибка предпросмотра.")
         if rich is not None:
-            self._render_rich(rich, ext)
+            try:
+                self._render_rich(rich, ext)
+            except Exception:
+                self._fill_doc_text("Не удалось отобразить предпросмотр этого файла.")
         elif ext in PDF_EXTS:
             self._fill_doc_text("PDF — первая страница показана выше.\nНажмите «Открыть» для полного просмотра.")
         elif ext in VIDEO_EXTS:
@@ -226,7 +235,10 @@ class PreviewPanel:
         if ext not in PREVIEW_EXTS:
             return
         base = (int(360 * self._zoom), int(320 * self._zoom))
-        img = fit_preview_image(get_thumbnail(self._current_path, max_size=(1200, 1200)), base)
+        try:
+            img = fit_preview_image(get_thumbnail(self._current_path, max_size=(1200, 1200)), base)
+        except Exception:
+            img = None
         if img is not None:
             self._photo = ImageTk.PhotoImage(img)
             self._img_label.configure(image=self._photo)

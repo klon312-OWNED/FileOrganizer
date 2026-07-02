@@ -150,6 +150,36 @@ class TestSorterWithRules(unittest.TestCase):
             self.assertTrue(target.exists())
             index.close()
 
+    def test_dry_run_keeps_source_file(self):
+        from organizer.config import Settings
+        from organizer.database import FileIndex
+        from organizer.sorter import Sorter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inbox = root / "inbox"
+            inbox.mkdir()
+            src = inbox / "note.txt"
+            src.write_text("x", encoding="utf-8")
+
+            settings = Settings()
+            settings.data["watched_folders"] = [str(inbox)]
+            settings.data["archive_location"] = str(root)
+            settings.data["archive_name"] = "Arch"
+            settings.data["sort_mode"] = "type_only"
+            settings.data["min_age_seconds"] = 0
+            settings.data["dry_run"] = True
+
+            index = FileIndex(root / "test.db")
+            sorter = Sorter(settings, index)
+            result = sorter.sort_paths([str(src)])
+            self.assertEqual(result.moved, 1)
+            self.assertTrue(src.exists())
+            target = root / "Arch" / "Документы" / "note.txt"
+            self.assertFalse(target.exists())
+            self.assertEqual(index.count(), 0)
+            index.close()
+
 
 if __name__ == "__main__":
     unittest.main()

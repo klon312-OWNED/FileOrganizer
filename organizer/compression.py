@@ -148,6 +148,16 @@ def unzip_item(zip_path: Path, dest_dir: Path | None = None) -> Path:
         dest_dir = zip_path.parent / zip_path.stem
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(dest_dir)
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for info in zf.infolist():
+                name = info.filename
+                if not name or name.endswith("/"):
+                    continue
+                target = (dest_dir / name).resolve()
+                if dest_dir.resolve() not in target.parents and target != dest_dir.resolve():
+                    raise OSError(f"Опасный путь в архиве: {name}")
+            zf.extractall(dest_dir)
+    except (zipfile.BadZipFile, zipfile.LargeZipFile) as e:
+        raise OSError(f"Не удалось распаковать ZIP: {e}") from e
     return dest_dir

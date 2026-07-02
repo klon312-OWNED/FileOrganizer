@@ -57,7 +57,13 @@ def is_previewable_media(ext: str) -> bool:
 def _cache_key(path: Path, max_size: tuple[int, int]) -> str:
     try:
         st = path.stat()
-        payload = f"{path.resolve()}|{st.st_mtime_ns}|{st.st_size}|{max_size}"
+        digest = ""
+        try:
+            with open(path, "rb") as fh:
+                digest = hashlib.sha256(fh.read(65536)).hexdigest()[:16]
+        except OSError:
+            digest = ""
+        payload = f"{path.resolve()}|{st.st_mtime_ns}|{st.st_size}|{digest}|{max_size}"
     except OSError:
         payload = f"{path}|{max_size}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

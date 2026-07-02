@@ -40,6 +40,17 @@ class TestV180(unittest.TestCase):
             self.assertTrue((dest / "inside.txt").is_file())
             self.assertEqual((dest / "inside.txt").read_text(encoding="utf-8"), "hello")
 
+    def test_unzip_blocks_path_traversal(self):
+        from organizer.compression import unzip_item
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            zpath = root / "bad.zip"
+            with zipfile.ZipFile(zpath, "w") as zf:
+                zf.writestr("../escape.txt", "nope")
+            with self.assertRaises(OSError):
+                unzip_item(zpath, root / "out")
+
     def test_thumb_cache(self):
         from organizer import thumbs
 
