@@ -7,7 +7,7 @@ from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Frame, Label, Text, Toplevel, 
 
 from . import theme
 from .preview import RichPreview, code_highlight_spans, get_rich_preview
-from .thumbs import IMAGE_EXTS, VIDEO_EXTS, fit_preview_image, get_thumbnail
+from .thumbs import IMAGE_EXTS, PDF_EXTS, VIDEO_EXTS, fit_preview_image, get_thumbnail
 
 try:
     from PIL import ImageTk
@@ -15,7 +15,7 @@ try:
 except ImportError:
     _HAS_PIL = False
 
-PREVIEW_EXTS = IMAGE_EXTS | VIDEO_EXTS
+PREVIEW_EXTS = IMAGE_EXTS | VIDEO_EXTS | PDF_EXTS
 
 _DOC_FONT = ("Segoe UI", 11)
 _CODE_FONT = ("Consolas", 10)
@@ -141,12 +141,16 @@ class PreviewPanel:
                 self._show_image_placeholder("Не удалось загрузить\nизображение")
             elif ext in VIDEO_EXTS:
                 self._show_image_placeholder("Видео")
+            elif ext in PDF_EXTS:
+                self._show_image_placeholder("PDF")
             else:
                 self._show_image_placeholder("")
 
         rich = get_rich_preview(path)
         if rich is not None:
             self._render_rich(rich, ext)
+        elif ext in PDF_EXTS:
+            self._fill_doc_text("PDF — первая страница показана выше.\nНажмите «Открыть» для полного просмотра.")
         elif ext in VIDEO_EXTS:
             self._fill_doc_text("Видео — кадр показан выше.\nНажмите «Открыть», чтобы воспроизвести.")
         elif ext in IMAGE_EXTS and showed_image:
@@ -182,6 +186,9 @@ class PreviewPanel:
                 lines.append("  ".join(cell.ljust(14)[:14] for cell in row))
             self._doc_text.configure(font=("Consolas", 9))
             self._doc_text.insert("1.0", "\n".join(lines))
+            if rich.note:
+                self._doc_text.insert(END, "\n\n", ())
+                self._doc_text.insert(END, rich.note, "muted")
             self._doc_text.configure(state="disabled")
             return
 

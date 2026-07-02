@@ -106,3 +106,48 @@ def remove_source(path: Path) -> None:
         shutil.rmtree(path)
     elif path.is_file():
         path.unlink()
+
+
+def _source_bytes(source: Path) -> int:
+    source = Path(source)
+    if not source.exists():
+        return 0
+    if source.is_file():
+        try:
+            return source.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    try:
+        for child in source.rglob("*"):
+            if child.is_file():
+                try:
+                    total += child.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        return 0
+    return total
+
+
+def estimate_zip_size(sources: list[Path], *, level: str = "fast") -> int:
+    """Оценка размера ZIP до упаковки (эвристика по сумме файлов)."""
+    total = sum(_source_bytes(Path(s)) for s in sources)
+    if level == "store":
+        return total
+    ratio = 0.40 if level == "best" else 0.60
+    return max(0, int(total * ratio))
+
+
+def unzip_item(zip_path: Path, dest_dir: Path | None = None) -> Path:
+    """Распаковать .zip в папку рядом (или в dest_dir)."""
+    zip_path = Path(zip_path)
+    if not zip_path.is_file():
+        raise FileNotFoundError(zip_path)
+    if dest_dir is None:
+        dest_dir = zip_path.parent / zip_path.stem
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(dest_dir)
+    return dest_dir

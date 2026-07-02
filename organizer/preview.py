@@ -28,6 +28,12 @@ MAX_TABLE_COLS = 12
 _W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _X_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 
+try:
+    import fitz  # PyMuPDF
+    _HAS_PDF = True
+except Exception:
+    _HAS_PDF = False
+
 
 @dataclass
 class TextSpan:
@@ -86,8 +92,38 @@ def _docx_runs_from_paragraph(p_elem) -> list[TextSpan]:
     return spans
 
 
+def _docx_cell_text(tc_elem) -> str:
+    parts: list[str] = []
+    for p in tc_elem.findall(f".{_W_NS}p"):
+        for span in _docx_runs_from_paragraph(p):
+            parts.append(span.text)
+    return _unescape_xml("".join(parts)).strip()
+
+
+def _docx_table_rows(tbl_elem) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for tr in tbl_elem.findall(f"{_W_NS}tr"):
+        cells = [_docx_cell_text(tc) for tc in tr.findall(f"{_W_NS}tc")]
+        if any(cells):
+            rows.append(cells)
+    return rows
+
+
+def _trim_table(table: list[list[str]]) -> list[list[str]]:
+    if not table:
+        return table
+    max_cols = min(max(len(r) for r in table), MAX_TABLE_COLS)
+    trimmed: list[list[str]] = []
+    for row in table[:MAX_TABLE_ROWS]:
+        cells = list(row[:max_cols])
+        while len(cells) < max_cols:
+            cells.append("")
+        trimmed.append(cells)
+    return trimmed
+
+
 def parse_docx_rich(path: Path) -> RichPreview:
-    """Разбор .docx: абзацы, жирный/курсив из XML."""
+    """Разбор .docx: абзацы, таблицы, жирный/курсив из XML."""
     try:
         with zipfile.ZipFile(path) as zf:
             with zf.open("word/document.xml") as f:
@@ -96,6 +132,7 @@ def parse_docx_rich(path: Path) -> RichPreview:
         return RichPreview(kind="unavailable", note="Не удалось прочитать документ Word (.docx).")
 
     spans: list[TextSpan] = []
+    tables: list[list[list[str]]] = []
     body = root.find(f".{_W_NS}body")
     if body is None:
         return RichPreview(kind="unavailable", note="Пустой документ Word.")
@@ -111,13 +148,49 @@ def parse_docx_rich(path: Path) -> RichPreview:
         elif tag == f"{_W_NS}tbl":
             if not first_para:
                 spans.append(TextSpan(text="\n"))
-            spans.append(TextSpan(text="[Таблица в документе — откройте файл для просмотра]\n"))
             first_para = False
+            table = _trim_table(_docx_table_rows(child))
+            if table:
+                tables.append(table)
 
     plain = "".join(s.text for s in spans)
+    if tables:
+        best = max(tables, key=lambda t: sum(len(r) for r in t))
+        note = ""
+        if plain.strip():
+            note = plain[:500] + ("…" if len(plain) > 500 else "")
+        return RichPreview(kind="table", table=best, plain=plain[:MAX_CHARS], note=note)
+
     if not plain.strip():
         return RichPreview(kind="unavailable", note="Документ Word пуст.")
     return RichPreview(kind="rich", plain=plain[:MAX_CHARS], spans=spans[:500])
+
+
+def parse_pdf_text(path: Path) -> RichPreview:
+    """Текст первой страницы PDF (если установлен PyMuPDF)."""
+    if not _HAS_PDF:
+        return RichPreview(
+            kind="unavailable",
+            note="Для текста PDF установите PyMuPDF (pip install PyMuPDF).\n"
+                 "Миниатюра первой страницы может отображаться отдельно.",
+        )
+    try:
+        doc = fitz.open(path)
+        try:
+            if doc.page_count < 1:
+                return RichPreview(kind="unavailable", note="PDF без страниц.")
+            text = doc.load_page(0).get_text().strip()
+        finally:
+            doc.close()
+    except Exception:
+        return RichPreview(kind="unavailable", note="Не удалось прочитать PDF.")
+    if not text:
+        return RichPreview(
+            kind="unavailable",
+            note="На первой странице PDF нет извлекаемого текста.\n"
+                 "См. миниатюру выше или откройте файл в просмотрщике.",
+        )
+    return RichPreview(kind="plain", plain=text[:MAX_CHARS])
 
 
 def _xlsx_col_row(ref: str) -> tuple[int, int]:
@@ -275,6 +348,8 @@ def get_rich_preview(path: str | Path) -> RichPreview | None:
             )
         if ext == ".xlsx":
             return parse_xlsx_table(p)
+        if ext == ".pdf":
+            return parse_pdf_text(p)
         if ext == ".rtf":
             text = _simple_rtf_to_text(_read_text_file(p))
             return RichPreview(kind="plain", plain=text) if text else None

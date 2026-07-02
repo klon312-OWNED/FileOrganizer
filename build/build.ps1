@@ -2,6 +2,7 @@
 $ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
 Set-Location $Root
+$env:PYTHONPATH = ""
 
 $Python = $null
 foreach ($v in 313, 312, 311, 310) {

@@ -18,7 +18,10 @@ from tkinter import Menu, ttk
 from .classify import classify
 from .config import OTHER_CATEGORY, Settings
 from .database import FileIndex
-from .compression import compression_level_label, compression_mode_label, remove_source, zip_item
+from .compression import (
+    compression_level_label, compression_mode_label, estimate_zip_size,
+    remove_source, unzip_item, zip_item,
+)
 from .layouts import DATE_SOURCES, MONTHS_RU, SORT_MODES, STORAGE_MODES, sort_mode_label, sort_mode_preview, storage_mode_label
 from .preview_panel import PreviewPanel
 from .scanner import Scanner, fixed_drives
@@ -265,11 +268,21 @@ class App(Tk):
         table_frame.pack(side=LEFT, fill=BOTH, expand=True)
 
         columns = ("name", "category", "date", "size")
+        self._archive_sort_col = "date"
+        self._archive_sort_rev = True
+        self._archive_headings = {
+            "name": "Имя файла",
+            "category": "Категория",
+            "date": "Дата загрузки",
+            "size": "Размер",
+        }
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
-        self.tree.heading("name", text="Имя файла")
-        self.tree.heading("category", text="Категория")
-        self.tree.heading("date", text="Дата загрузки")
-        self.tree.heading("size", text="Размер")
+        for col in columns:
+            self.tree.heading(
+                col,
+                text=self._archive_heading_text(col),
+                command=lambda c=col: self._archive_sort_by(c),
+            )
         self.tree.column("name", width=420, anchor="w")
         self.tree.column("category", width=130, anchor="w")
         self.tree.column("date", width=150, anchor="center")
@@ -305,6 +318,8 @@ class App(Tk):
         self._desktop_thumb_queue: list[tuple[str, Label]] = []
         self._desktop_drag_start: tuple[int, int] | None = None
         self._desktop_drag_rect: int | None = None
+        self._desktop_layout_items: list[tuple[str, str]] = []
+        self._desktop_header_labels: dict[str, Label] = {}
 
         toolbar = Frame(root, padx=4, pady=8, bg=theme.BG)
         toolbar.pack(side="top", fill=X)
@@ -430,12 +445,26 @@ class App(Tk):
         entries.sort(key=self._desktop_sort_key)
         self._desktop_render(entries)
 
+    def _desktop_folder_label(self, folder: str) -> str:
+        try:
+            p = Path(folder).resolve()
+            home = Path.home().resolve()
+            if p == home / "Downloads":
+                return "📥 Загрузки"
+            if p == home / "Desktop":
+                return "🖥 Рабочий стол"
+            return f"📁 {p.name}"
+        except OSError:
+            return f"📁 {folder}"
+
     def _desktop_render(self, entries: list[dict]) -> None:
         self._desktop_photos.clear()
         self._desktop_thumb_queue.clear()
         for widget in self._desktop_inner.winfo_children():
             widget.destroy()
         self._desktop_tiles.clear()
+        self._desktop_layout_items.clear()
+        self._desktop_header_labels.clear()
         self._desktop_entries = entries
         if not entries:
             Label(
@@ -444,9 +473,15 @@ class App(Tk):
                 bg=theme.BG, fg=theme.TEXT_MUTED, font=("Segoe UI", 11), justify="center",
             ).pack(pady=40)
         else:
+            groups: dict[str, list[dict]] = {}
             for entry in entries:
-                tile = self._desktop_make_tile(entry)
-                self._desktop_tiles[entry["path"]] = tile
+                groups.setdefault(entry["folder"], []).append(entry)
+            for folder in sorted(groups.keys(), key=str.lower):
+                self._desktop_layout_items.append(("header", folder))
+                for entry in groups[folder]:
+                    tile = self._desktop_make_tile(entry)
+                    self._desktop_tiles[entry["path"]] = tile
+                    self._desktop_layout_items.append(("tile", entry["path"]))
             self._desktop_reflow()
             self._desktop_queue_thumbs()
         self._desktop_update_count()
@@ -623,15 +658,37 @@ class App(Tk):
         return "break"
 
     def _desktop_reflow(self, _event=None) -> None:
-        if not self._desktop_tiles:
+        if not self._desktop_layout_items:
             return
         width = max(self._desktop_canvas.winfo_width(), self._DESKTOP_COL_PAD)
         cols = max(1, width // self._DESKTOP_COL_PAD)
-        for i, entry in enumerate(self._desktop_entries):
-            tile = self._desktop_tiles.get(entry["path"])
+        row = 0
+        col = 0
+        for kind, data in self._desktop_layout_items:
+            if kind == "header":
+                if col != 0:
+                    row += 1
+                    col = 0
+                hdr = self._desktop_header_labels.get(data)
+                if hdr is None or not hdr.winfo_exists():
+                    hdr = Label(
+                        self._desktop_inner,
+                        text=self._desktop_folder_label(data),
+                        bg=theme.BG, fg=theme.TEXT,
+                        font=("Segoe UI", 11, "bold"), anchor="w",
+                    )
+                    self._desktop_header_labels[data] = hdr
+                hdr.grid(row=row, column=0, columnspan=cols, sticky="w", padx=10, pady=(12, 4))
+                row += 1
+                col = 0
+                continue
+            tile = self._desktop_tiles.get(data)
             if tile:
-                row, col = divmod(i, cols)
                 tile.grid(row=row, column=col, padx=6, pady=6)
+                col += 1
+                if col >= cols:
+                    col = 0
+                    row += 1
         self._desktop_inner.update_idletasks()
         self._desktop_canvas.configure(scrollregion=self._desktop_canvas.bbox("all"))
 
@@ -679,7 +736,7 @@ class App(Tk):
             return
         skipped = len(self._desktop_selected) - len(paths)
         msg = f"Сортировать выбранное ({len(paths)} шт.)?"
-        msg += self._compression_notice(len(paths), enabled=self._desktop_compress_var.get())
+        msg += self._compression_notice(len(paths), enabled=self._desktop_compress_var.get(), paths=paths)
         if skipped:
             msg += f"\n\n{skipped} выбранных элементов пропущено (ещё не готовы)."
         if not messagebox.askyesno("Сортировать выбранное", msg):
@@ -688,14 +745,22 @@ class App(Tk):
             return
         self._run_sort(paths, compress_override=self._desktop_compress_var.get())
 
-    def _compression_notice(self, count: int, *, enabled: bool | None = None) -> str:
+    def _compression_notice(self, count: int, *, enabled: bool | None = None, paths: list[str] | None = None) -> str:
         on = self.settings.compression_enabled if enabled is None else enabled
         if not on or self.settings.compression_mode == "none" or count <= 0:
             return ""
-        return (
+        msg = (
             f"\n\nСжатие: {compression_mode_label(self.settings.compression_mode)}, "
             f"уровень — {compression_level_label(self.settings.compression_level)}."
         )
+        if paths:
+            est = estimate_zip_size(
+                [Path(p) for p in paths],
+                level=self.settings.compression_level,
+            )
+            if est > 0:
+                msg += f"\nОриентировочный размер ZIP: ~{human_size(est)}."
+        return msg
 
     def _confirm_duplicates(self, paths: list[str]) -> bool:
         dupes = self.sorter.find_duplicates(paths)
@@ -1365,6 +1430,15 @@ class App(Tk):
 
         rows = self.index.query(category=category, year=year, month=month, search=search)
 
+        sort_keys = {
+            "name": lambda r: (r["name"] or "").lower(),
+            "category": lambda r: (r["category"] or "").lower(),
+            "date": lambda r: r["added_ts"] or 0,
+            "size": lambda r: r["size"] or 0,
+        }
+        key_fn = sort_keys.get(self._archive_sort_col, sort_keys["date"])
+        rows = sorted(rows, key=key_fn, reverse=self._archive_sort_rev)
+
         self.tree.delete(*self.tree.get_children())
         total_size = 0
         for r in rows:
@@ -1464,6 +1538,63 @@ class App(Tk):
             msg += f"\nОшибок: {fail}"
         messagebox.showinfo("Сжатие", msg)
 
+    def _archive_heading_text(self, col: str) -> str:
+        base = self._archive_headings.get(col, col)
+        if self._archive_sort_col == col:
+            return f"{base} {'▼' if self._archive_sort_rev else '▲'}"
+        return base
+
+    def _archive_sort_by(self, col: str) -> None:
+        if self._archive_sort_col == col:
+            self._archive_sort_rev = not self._archive_sort_rev
+        else:
+            self._archive_sort_col = col
+            self._archive_sort_rev = col in ("date", "size")
+        for c in self._archive_headings:
+            self.tree.heading(c, text=self._archive_heading_text(c))
+        self._reload_table()
+
+    def _archive_unzip_selected(self) -> None:
+        paths = [
+            p for p in self._selected_paths()
+            if Path(p).suffix.lower() == ".zip" and Path(p).is_file()
+        ]
+        if not paths:
+            messagebox.showwarning("Распаковка", "Выберите один или несколько ZIP-архивов.")
+            return
+        if not messagebox.askyesno(
+            "Распаковать ZIP",
+            f"Распаковать {len(paths)} архив(ов) в папки рядом с файлами?",
+        ):
+            return
+        ok = fail = 0
+        for raw in paths:
+            try:
+                dest = unzip_item(Path(raw))
+                for child in dest.rglob("*"):
+                    if child.is_file():
+                        try:
+                            st = child.stat()
+                            dt = datetime.fromtimestamp(st.st_mtime)
+                            self.index.add_file(
+                                name=child.name, path=str(child), source_path=str(raw),
+                                category=self.settings.category_for_extension(child.suffix.lower()),
+                                extension=child.suffix.lower(), size=st.st_size,
+                                added_ts=st.st_mtime, year=dt.year, month=dt.month,
+                                kind="file",
+                            )
+                        except OSError:
+                            pass
+                ok += 1
+            except OSError:
+                fail += 1
+        self._reload_table()
+        self._refresh_filters()
+        msg = f"Распаковано: {ok}"
+        if fail:
+            msg += f"\nОшибок: {fail}"
+        messagebox.showinfo("Распаковка", msg)
+
     # ---------- действия ----------
 
     def _open_selected(self, *_):
@@ -1509,10 +1640,14 @@ class App(Tk):
         folder_lbl = "Показать в папке" if n == 1 else f"Показать в папке ({n})"
         copy_lbl = "Копировать пути" if n == 1 else f"Копировать пути ({n})"
         zip_lbl = "Сжать в ZIP" if n == 1 else f"Сжать в ZIP ({n})"
+        zip_only = [p for p in paths if Path(p).suffix.lower() == ".zip" and Path(p).is_file()]
+        unzip_lbl = "Распаковать ZIP" if len(zip_only) == 1 else f"Распаковать ZIP ({len(zip_only)})"
         self.ctx.add_command(label=open_lbl, command=self._open_selected)
         self.ctx.add_command(label=folder_lbl, command=self._reveal_selected)
         self.ctx.add_separator()
         self.ctx.add_command(label=zip_lbl, command=self._archive_compress_selected)
+        if zip_only:
+            self.ctx.add_command(label=unzip_lbl, command=self._archive_unzip_selected)
         self.ctx.add_command(label=copy_lbl, command=self._copy_selected_paths)
 
     def _show_context_menu(self, event):
@@ -1528,9 +1663,17 @@ class App(Tk):
             self.ctx.grab_release()
 
     def _sort_now(self):
-        if not self._confirm_duplicates([
+        paths = [
             e["path"] for e in self.sorter.list_watched_entries() if e.get("sortable")
-        ]):
+        ]
+        if not paths:
+            messagebox.showinfo("Сортировка", "Нет готовых файлов для сортировки.")
+            return
+        msg = f"Сортировать все готовые элементы ({len(paths)} шт.)?"
+        msg += self._compression_notice(len(paths), paths=paths)
+        if not messagebox.askyesno("Сортировать всё", msg):
+            return
+        if not self._confirm_duplicates(paths):
             return
         self._run_sort()
 
