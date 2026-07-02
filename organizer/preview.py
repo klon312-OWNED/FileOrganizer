@@ -128,8 +128,18 @@ def parse_docx_rich(path: Path) -> RichPreview:
         with zipfile.ZipFile(path) as zf:
             with zf.open("word/document.xml") as f:
                 root = ET.fromstring(f.read())
-    except (zipfile.BadZipFile, KeyError, OSError, ET.ParseError):
-        return RichPreview(kind="unavailable", note="Не удалось прочитать документ Word (.docx).")
+    except zipfile.BadZipFile:
+        return RichPreview(
+            kind="unavailable",
+            note="Файл .docx повреждён или имеет неверный формат.\n"
+                 "Проверьте файл в Word и сохраните копию заново.",
+        )
+    except (KeyError, OSError, ET.ParseError):
+        return RichPreview(
+            kind="unavailable",
+            note="Не удалось разобрать документ Word (.docx).\n"
+                 "Попробуйте открыть файл в Word и пересохранить как .docx.",
+        )
 
     spans: list[TextSpan] = []
     tables: list[list[list[str]]] = []
@@ -183,7 +193,11 @@ def parse_pdf_text(path: Path) -> RichPreview:
         finally:
             doc.close()
     except Exception:
-        return RichPreview(kind="unavailable", note="Не удалось прочитать PDF.")
+        return RichPreview(
+            kind="unavailable",
+            note="Не удалось прочитать PDF.\n"
+                 "Файл может быть повреждён или защищён. Откройте его во внешнем просмотрщике.",
+        )
     if not text:
         return RichPreview(
             kind="unavailable",
@@ -253,8 +267,18 @@ def parse_xlsx_table(path: Path) -> RichPreview:
                 return RichPreview(kind="unavailable", note="Лист Excel не найден.")
             with zf.open(sheet_path) as f:
                 root = ET.fromstring(f.read())
-    except (zipfile.BadZipFile, OSError, ET.ParseError):
-        return RichPreview(kind="unavailable", note="Не удалось прочитать таблицу Excel (.xlsx).")
+    except zipfile.BadZipFile:
+        return RichPreview(
+            kind="unavailable",
+            note="Файл .xlsx повреждён или не является валидным архивом Office.\n"
+                 "Откройте таблицу в Excel и сохраните копию.",
+        )
+    except (OSError, ET.ParseError):
+        return RichPreview(
+            kind="unavailable",
+            note="Не удалось разобрать таблицу Excel (.xlsx).\n"
+                 "Попробуйте пересохранить файл и повторить предпросмотр.",
+        )
 
     cells: dict[tuple[int, int], str] = {}
     max_col = max_row = 0
@@ -360,7 +384,11 @@ def get_rich_preview(path: str | Path) -> RichPreview | None:
             kind = "code" if ext in CODE_EXTS else "plain"
             return RichPreview(kind=kind, plain=text)
     except Exception:
-        return RichPreview(kind="unavailable", note="Ошибка чтения файла.")
+        return RichPreview(
+            kind="unavailable",
+            note="Ошибка чтения файла.\n"
+                 "Проверьте права доступа и целостность файла.",
+        )
     return None
 
 

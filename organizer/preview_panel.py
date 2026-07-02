@@ -165,8 +165,11 @@ class PreviewPanel:
         elif ext in IMAGE_EXTS and showed_image:
             self._fill_doc_text("Изображение — см. предпросмотр выше.\nДвойной щелчок по картинке — увеличение.")
         else:
+            pretty_ext = ext or "(без расширения)"
             self._fill_doc_text(
-                "Предпросмотр для этого типа недоступен.\nНажмите «Открыть», чтобы посмотреть файл.",
+                "Предпросмотр для этого типа недоступен.\n"
+                f"Тип файла: {pretty_ext}\n"
+                "Совет: откройте файл внешней программой или конвертируйте его в .txt/.pdf/.docx/.xlsx.",
             )
 
     def _show_image_placeholder(self, text: str) -> None:

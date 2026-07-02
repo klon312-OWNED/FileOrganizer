@@ -26,6 +26,18 @@ class TestImports(unittest.TestCase):
         import organizer.sorter  # noqa: F401
         import organizer.watcher  # noqa: F401
 
+    def test_operation_summary_text(self):
+        from organizer.gui import App
+
+        text = App._format_operation_summary(
+            action="Распаковано",
+            total=5,
+            ok=4,
+            fail=1,
+        )
+        self.assertIn("4 из 5", text)
+        self.assertIn("Ошибок: 1", text)
+
 
 class TestExcludedPaths(unittest.TestCase):
     def test_exclude_blocks_sort(self):

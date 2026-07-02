@@ -145,6 +145,26 @@ class TestPreview(unittest.TestCase):
             self.assertEqual(rich.kind, "plain")
             self.assertIn("Title", rich.plain)
 
+    def test_docx_corrupt_has_actionable_note(self):
+        from organizer.preview import parse_docx_rich
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docx = Path(tmp) / "broken.docx"
+            docx.write_bytes(b"not a zip")
+            rich = parse_docx_rich(docx)
+            self.assertEqual(rich.kind, "unavailable")
+            self.assertIn("поврежд", rich.note.lower())
+
+    def test_xlsx_corrupt_has_actionable_note(self):
+        from organizer.preview import parse_xlsx_table
+
+        with tempfile.TemporaryDirectory() as tmp:
+            xlsx = Path(tmp) / "broken.xlsx"
+            xlsx.write_bytes(b"not a zip")
+            rich = parse_xlsx_table(xlsx)
+            self.assertEqual(rich.kind, "unavailable")
+            self.assertIn("xlsx", rich.note.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

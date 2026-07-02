@@ -66,6 +66,9 @@ TYPE_COLORS: dict[str, str] = {
     "Код": "#00897b", "Папки": "#f9a825", OTHER_CATEGORY: "#757575",
 }
 
+BG_REFRESH_DEBOUNCE_MS = 900
+BG_REFRESH_THROTTLE_SEC = 1.5
+
 
 def human_size(num: int) -> str:
     for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
@@ -129,6 +132,8 @@ class App(Tk):
         self._desktop_cancel_event = threading.Event()
         self._desktop_sort_active = False
         self._bg_refresh_after = None
+        self._bg_pending_events = 0
+        self._bg_last_refresh_ts = 0.0
 
         self._build_header()
         self._build_ui()
@@ -173,6 +178,7 @@ class App(Tk):
 
     def _begin_task(self, name: str) -> bool:
         if not self._busy_lock.acquire(blocking=False):
+            self.status_var.set(f"Ожидание: уже выполняется «{self._busy_task or 'операция'}»")
             messagebox.showinfo(
                 "Операция уже выполняется",
                 f"Сейчас выполняется: {self._busy_task or 'другая операция'}.\n"
@@ -786,13 +792,14 @@ class App(Tk):
         if not self._confirm_duplicates(paths):
             return
         self._desktop_cancel_event.clear()
-        self._desktop_sort_active = True
-        self._desktop_cancel_btn.configure(state="normal")
-        self._run_sort(
+        started = self._run_sort(
             paths,
             compress_override=self._desktop_compress_var.get(),
             cancel_event=self._desktop_cancel_event,
         )
+        if started:
+            self._desktop_sort_active = True
+            self._desktop_cancel_btn.configure(state="normal")
 
     def _compression_notice(self, count: int, *, enabled: bool | None = None, paths: list[str] | None = None) -> str:
         on = self.settings.compression_enabled if enabled is None else enabled
@@ -832,9 +839,9 @@ class App(Tk):
         *,
         compress_override: bool | None = None,
         cancel_event: threading.Event | None = None,
-    ) -> None:
+    ) -> bool:
         if not self._begin_task("Сортировка"):
-            return
+            return False
         self.status_var.set("Сортирую...")
         self.update_idletasks()
         prev_enabled = self.settings.data.get("compression_enabled", False)
@@ -848,7 +855,10 @@ class App(Tk):
             if total <= 0:
                 return
             name = Path(raw_path).name
-            self.after(0, lambda: self.status_var.set(f"Сортировка: {done}/{total} · {name}"))
+            self.after(
+                0,
+                lambda: self.status_var.set(f"Сортировка: {done}/{total} · {name}"),
+            )
 
         def should_cancel() -> bool:
             if cancel_event and cancel_event.is_set():
@@ -876,6 +886,14 @@ class App(Tk):
             self.after(0, self._end_task)
 
         threading.Thread(target=work, daemon=True).start()
+        return True
+
+    @staticmethod
+    def _format_operation_summary(*, action: str, total: int, ok: int, fail: int) -> str:
+        lines = [f"{action}: {ok} из {total}"]
+        if fail:
+            lines.append(f"Ошибок: {fail}")
+        return "\n".join(lines)
 
     def _desktop_tile_bbox(self, path: str) -> tuple[int, int, int, int] | None:
         tile = self._desktop_tiles.get(path)
@@ -1607,8 +1625,15 @@ class App(Tk):
             return
         def work():
             ok = fail = 0
+            failed_items: list[str] = []
             for i, raw in enumerate(paths, start=1):
-                self.after(0, lambda i=i: self.status_var.set(f"Сжатие: {i}/{len(paths)}"))
+                name = Path(raw).name
+                self.after(
+                    0,
+                    lambda i=i, name=name: self.status_var.set(
+                        f"Сжатие: {i}/{len(paths)} · {name}"
+                    ),
+                )
                 p = Path(raw)
                 try:
                     zip_path = zip_item(p, level=level)
@@ -1625,16 +1650,20 @@ class App(Tk):
                     ok += 1
                 except Exception:
                     fail += 1
-            self.after(0, lambda: self._after_archive_compress(ok, fail))
+                    failed_items.append(p.name)
+            self.after(0, lambda: self._after_archive_compress(ok, fail, len(paths), failed_items))
             self.after(0, self._end_task)
         threading.Thread(target=work, daemon=True).start()
 
-    def _after_archive_compress(self, ok: int, fail: int) -> None:
+    def _after_archive_compress(self, ok: int, fail: int, total: int, failed_items: list[str]) -> None:
         self._reload_table()
         self._refresh_filters()
-        msg = f"Создано архивов: {ok}"
-        if fail:
-            msg += f"\nОшибок: {fail}"
+        msg = self._format_operation_summary(action="Создано архивов", total=total, ok=ok, fail=fail)
+        if failed_items:
+            preview = "\n".join(f"• {name}" for name in failed_items[:8])
+            more = f"\n…и ещё {len(failed_items) - 8}" if len(failed_items) > 8 else ""
+            msg += f"\n\nНе удалось обработать:\n{preview}{more}"
+        self.status_var.set(f"Сжатие завершено: {ok}/{total}")
         messagebox.showinfo("Сжатие", msg)
 
     def _archive_heading_text(self, col: str) -> str:
@@ -1672,8 +1701,15 @@ class App(Tk):
             return
         def work():
             ok = fail = 0
+            failed_items: list[str] = []
             for i, raw in enumerate(paths, start=1):
-                self.after(0, lambda i=i: self.status_var.set(f"Распаковка: {i}/{len(paths)}"))
+                name = Path(raw).name
+                self.after(
+                    0,
+                    lambda i=i, name=name: self.status_var.set(
+                        f"Распаковка: {i}/{len(paths)} · {name}"
+                    ),
+                )
                 try:
                     dest = unzip_item(Path(raw))
                     for child in dest.rglob("*"):
@@ -1693,16 +1729,20 @@ class App(Tk):
                     ok += 1
                 except Exception:
                     fail += 1
-            self.after(0, lambda: self._after_archive_unzip(ok, fail))
+                    failed_items.append(Path(raw).name)
+            self.after(0, lambda: self._after_archive_unzip(ok, fail, len(paths), failed_items))
             self.after(0, self._end_task)
         threading.Thread(target=work, daemon=True).start()
 
-    def _after_archive_unzip(self, ok: int, fail: int) -> None:
+    def _after_archive_unzip(self, ok: int, fail: int, total: int, failed_items: list[str]) -> None:
         self._reload_table()
         self._refresh_filters()
-        msg = f"Распаковано: {ok}"
-        if fail:
-            msg += f"\nОшибок: {fail}"
+        msg = self._format_operation_summary(action="Распаковано", total=total, ok=ok, fail=fail)
+        if failed_items:
+            preview = "\n".join(f"• {name}" for name in failed_items[:8])
+            more = f"\n…и ещё {len(failed_items) - 8}" if len(failed_items) > 8 else ""
+            msg += f"\n\nНе удалось распаковать:\n{preview}{more}"
+        self.status_var.set(f"Распаковка завершена: {ok}/{total}")
         messagebox.showinfo("Распаковка", msg)
 
     # ---------- действия ----------
@@ -1740,6 +1780,18 @@ class App(Tk):
         self.clipboard_append(text)
         self.status_var.set(f"Скопировано путей: {len(paths)}")
 
+    def _open_selected_parent_folders(self) -> None:
+        paths = self._selected_paths()
+        if not paths:
+            return
+        parents = sorted({str(Path(p).parent) for p in paths if Path(p).exists()})
+        if not parents:
+            messagebox.showinfo("Папки недоступны", "У выбранных элементов нет доступных родительских папок.")
+            return
+        for folder in parents:
+            reveal_in_explorer(folder)
+        self.status_var.set(f"Открыто папок: {len(parents)}")
+
     def _build_archive_context_menu(self) -> None:
         self.ctx.delete(0, END)
         paths = self._selected_paths()
@@ -1748,12 +1800,14 @@ class App(Tk):
         n = len(paths)
         open_lbl = "Открыть" if n == 1 else f"Открыть ({n})"
         folder_lbl = "Показать в папке" if n == 1 else f"Показать в папке ({n})"
+        parent_lbl = "Открыть родительские папки" if n == 1 else f"Открыть родительские папки ({n})"
         copy_lbl = "Копировать пути" if n == 1 else f"Копировать пути ({n})"
         zip_lbl = "Сжать в ZIP" if n == 1 else f"Сжать в ZIP ({n})"
         zip_only = [p for p in paths if Path(p).suffix.lower() == ".zip" and Path(p).is_file()]
         unzip_lbl = "Распаковать ZIP" if len(zip_only) == 1 else f"Распаковать ZIP ({len(zip_only)})"
         self.ctx.add_command(label=open_lbl, command=self._open_selected)
         self.ctx.add_command(label=folder_lbl, command=self._reveal_selected)
+        self.ctx.add_command(label=parent_lbl, command=self._open_selected_parent_folders)
         self.ctx.add_separator()
         self.ctx.add_command(label=zip_lbl, command=self._archive_compress_selected)
         if zip_only:
@@ -1801,6 +1855,9 @@ class App(Tk):
             msg = f"Dry run: подходящих элементов {result.moved}"
         else:
             msg = f"Обработано файлов: {result.moved}"
+        self.status_var.set(
+            f"Сортировка завершена: {result.moved} обработано, ошибок {len(result.errors)}"
+        )
         if cancelled:
             msg += "\nОперация отменена пользователем."
         if result.errors:
@@ -1990,23 +2047,34 @@ class App(Tk):
         self.after(0, lambda: self._on_bg_update(new_path, src_name))
 
     def _on_bg_update(self, new_path: str = "", src_name: str = "") -> None:
+        self._bg_pending_events += 1
         if self._bg_refresh_after is not None:
             try:
                 self.after_cancel(self._bg_refresh_after)
             except Exception:
                 pass
-        self._bg_refresh_after = self.after(350, self._flush_bg_refresh)
+        self._bg_refresh_after = self.after(BG_REFRESH_DEBOUNCE_MS, self._flush_bg_refresh)
         if self.settings.notify_on_sort and new_path:
             name = src_name or Path(new_path).name
             show_toast("FileOrganizer", f"Отсортировано: {name}")
 
     def _flush_bg_refresh(self) -> None:
+        now = time.time()
+        elapsed = now - self._bg_last_refresh_ts
+        if elapsed < BG_REFRESH_THROTTLE_SEC:
+            delay = int((BG_REFRESH_THROTTLE_SEC - elapsed) * 1000)
+            self._bg_refresh_after = self.after(max(delay, 100), self._flush_bg_refresh)
+            return
         self._bg_refresh_after = None
+        pending = self._bg_pending_events
+        self._bg_pending_events = 0
+        self._bg_last_refresh_ts = now
         self._refresh_filters()
         self._reload_table()
         self._reload_history()
-        if hasattr(self, "_desktop_canvas"):
+        if hasattr(self, "_desktop_canvas") and self.settings.last_tab == 1:
             self._desktop_refresh()
+        self.status_var.set(f"Фоновые обновления: {pending} событ.")
 
     # ---------- логика вкладки «весь компьютер» ----------
 
