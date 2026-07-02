@@ -122,6 +122,10 @@ DEFAULT_SETTINGS: dict = {
     "large_text": False,
     # Удалять исходники после ручного сжатия в ZIP на вкладке «Архив»
     "delete_originals_after_zip": True,
+    # Геометрия главного окна (WxH+X+Y), пусто — по умолчанию
+    "window_geometry": "",
+    # Последний уровень масштаба предпросмотра (0.5–2.0)
+    "preview_zoom": 1.0,
 }
 
 
@@ -181,6 +185,12 @@ class Settings:
         merged["delete_originals_after_zip"] = bool(
             merged.get("delete_originals_after_zip", True),
         )
+        try:
+            merged["preview_zoom"] = max(0.5, min(2.0, float(merged.get("preview_zoom", 1.0))))
+        except (TypeError, ValueError):
+            merged["preview_zoom"] = 1.0
+        geo = merged.get("window_geometry")
+        merged["window_geometry"] = str(geo) if geo else ""
         self.data = merged
 
     def save(self) -> None:
@@ -305,6 +315,17 @@ class Settings:
     @property
     def delete_originals_after_zip(self) -> bool:
         return bool(self.data.get("delete_originals_after_zip", True))
+
+    @property
+    def window_geometry(self) -> str:
+        return str(self.data.get("window_geometry") or "")
+
+    @property
+    def preview_zoom(self) -> float:
+        try:
+            return max(0.5, min(2.0, float(self.data.get("preview_zoom", 1.0))))
+        except (TypeError, ValueError):
+            return 1.0
 
     def add_excluded_path(self, path: str) -> None:
         try:

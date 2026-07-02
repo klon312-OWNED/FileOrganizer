@@ -30,7 +30,7 @@ from .scanner import Scanner, fixed_drives
 from .sorter import Sorter, SortResult
 from . import theme
 from .icon import icon_path, make_icon_image
-from .notify import show_toast
+from .notify import SortNotifyBatcher, show_toast
 from .thumbs import get_thumbnail
 from .watcher import FolderWatcher
 from .win_drop import bind_file_drop
@@ -123,9 +123,18 @@ class App(Tk):
         self.title("FileOrganizer — умная сортировка файлов")
         self.geometry("1140x700")
         self.minsize(900, 520)
+        self._geom_save_after: str | None = None
+        self._sort_notifier = SortNotifyBatcher()
 
         self.settings = Settings()
         theme.apply(self, dark=self.settings.dark_mode, large_text=self.settings.large_text)
+        saved_geo = self.settings.window_geometry
+        if saved_geo:
+            try:
+                self.geometry(saved_geo)
+            except Exception:
+                pass
+        self.bind("<Configure>", self._on_window_configure)
 
         try:
             self.iconbitmap(str(icon_path()))
@@ -292,6 +301,9 @@ class App(Tk):
         ttk.Button(toolbar, text="Сжать в ZIP", command=self._archive_compress_selected).pack(
             side=LEFT, padx=(8, 0),
         )
+        ttk.Button(toolbar, text="Экспорт CSV", command=self._export_archive_csv).pack(
+            side=LEFT, padx=(8, 0),
+        )
 
         self.bg_var = StringVar(value="Фон: выкл")
         self.bg_btn = ttk.Button(toolbar, textvariable=self.bg_var, command=self._toggle_watcher)
@@ -386,7 +398,11 @@ class App(Tk):
         ttk.Button(pager, text="◀ Назад", command=self._archive_prev_page).pack(side=RIGHT, padx=(4, 0))
         ttk.Button(pager, text="Вперёд ▶", command=self._archive_next_page).pack(side=RIGHT)
 
-        self._archive_preview = PreviewPanel(body, width=380)
+        self._archive_preview = PreviewPanel(
+            body, width=380,
+            initial_zoom=self.settings.preview_zoom,
+            on_zoom_change=self._on_preview_zoom_change,
+        )
         self._archive_preview.add_button("Открыть файл", self._open_selected)
         self._archive_preview.add_button("Показать в папке", self._reveal_selected)
 
@@ -415,6 +431,9 @@ class App(Tk):
 
         ttk.Button(toolbar, text="Выбрать всё", command=self._desktop_select_all).pack(side=LEFT)
         ttk.Button(toolbar, text="Снять выбор", command=self._desktop_deselect_all).pack(
+            side=LEFT, padx=(8, 0),
+        )
+        ttk.Button(toolbar, text="Инвертировать", command=self._desktop_invert_selection).pack(
             side=LEFT, padx=(8, 0),
         )
         ttk.Button(
@@ -496,6 +515,7 @@ class App(Tk):
                 "<Button-5>", lambda e: self._desktop_canvas.yview_scroll(1, "units"),
             )
         root.bind("<Control-a>", self._desktop_select_all_shortcut)
+        root.bind("<Control-i>", self._desktop_invert_shortcut)
         root.bind("<Delete>", self._desktop_key_delete)
         root.bind("<Return>", self._desktop_key_open)
 
@@ -847,6 +867,27 @@ class App(Tk):
             self._desktop_apply_tile_style(path)
         self._desktop_selected.clear()
         self._desktop_update_count()
+
+    def _desktop_invert_selection(self) -> None:
+        for entry in self._desktop_entries:
+            if not entry.get("sortable", True):
+                continue
+            path = entry["path"]
+            tile = self._desktop_tiles.get(path)
+            if path in self._desktop_selected:
+                self._desktop_selected.discard(path)
+                if tile and hasattr(tile, "_desktop_chk"):
+                    tile._desktop_chk.set(False)  # type: ignore[attr-defined]
+            else:
+                self._desktop_selected.add(path)
+                if tile and hasattr(tile, "_desktop_chk"):
+                    tile._desktop_chk.set(True)  # type: ignore[attr-defined]
+            self._desktop_apply_tile_style(path)
+        self._desktop_update_count()
+
+    def _desktop_invert_shortcut(self, event=None):
+        self._desktop_invert_selection()
+        return "break"
 
     def _desktop_update_count(self) -> None:
         n = len(self._desktop_selected)
@@ -1568,6 +1609,74 @@ class App(Tk):
         except OSError as e:
             messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
 
+    def _export_archive_csv(self) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Экспорт", "Выберите файлы в таблице архива.")
+            return
+        rows = []
+        for iid in sel:
+            try:
+                row = self.index.get_by_id(int(iid))
+            except (ValueError, TypeError):
+                continue
+            if row:
+                rows.append(row)
+        if not rows:
+            messagebox.showinfo("Экспорт", "Нет данных для экспорта.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Сохранить список файлов как CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")],
+            initialfile=f"fileorganizer-archive-{datetime.now():%Y%m%d}.csv",
+        )
+        if not path:
+            return
+        import csv
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f, delimiter=";")
+                w.writerow(["Имя", "Категория", "Тип", "Размер (байт)", "Дата", "Путь"])
+                for r in rows:
+                    dt = datetime.fromtimestamp(r["added_ts"])
+                    kind = r["kind"] if "kind" in r.keys() else "file"
+                    w.writerow([
+                        r["name"],
+                        r["category"],
+                        "Папка" if kind == "dir" else (r["extension"] or ""),
+                        r["size"] or 0,
+                        dt.strftime("%d.%m.%Y %H:%M:%S"),
+                        r["path"],
+                    ])
+            messagebox.showinfo("Экспорт", f"Сохранено записей: {len(rows)}\n{path}")
+        except OSError as e:
+            messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
+
+    def _on_preview_zoom_change(self, zoom: float) -> None:
+        self.settings.data["preview_zoom"] = max(0.5, min(2.0, zoom))
+        self.settings.save()
+
+    def _on_window_configure(self, _event=None) -> None:
+        if self._geom_save_after is not None:
+            try:
+                self.after_cancel(self._geom_save_after)
+            except Exception:
+                pass
+        self._geom_save_after = self.after(800, self._save_window_geometry)
+
+    def _save_window_geometry(self) -> None:
+        self._geom_save_after = None
+        try:
+            if self.state() == "iconic":
+                return
+            geo = self.geometry()
+            if geo and geo != self.settings.window_geometry:
+                self.settings.data["window_geometry"] = geo
+                self.settings.save()
+        except Exception:
+            pass
+
     # ---------- вкладка «весь компьютер» ----------
 
     def _build_pc_tab(self, root) -> None:
@@ -1634,7 +1743,11 @@ class App(Tk):
         self.pc_tree.bind("<Double-1>", self._pc_open)
         self.pc_tree.bind("<<TreeviewSelect>>", self._pc_on_select)
 
-        self._pc_preview = PreviewPanel(body, width=360, show_meta=False)
+        self._pc_preview = PreviewPanel(
+            body, width=360, show_meta=False,
+            initial_zoom=self.settings.preview_zoom,
+            on_zoom_change=self._on_preview_zoom_change,
+        )
         self._pc_preview.add_button("Открыть", self._pc_open)
         self._pc_preview.add_button("Открыть папку с файлом", self._pc_reveal)
         self._pc_preview.add_button("Копировать в...", self._pc_copy)
@@ -2372,8 +2485,7 @@ class App(Tk):
                 pass
         self._bg_refresh_after = self.after(BG_REFRESH_DEBOUNCE_MS, self._flush_bg_refresh)
         if self.settings.notify_on_sort and new_path:
-            name = src_name or Path(new_path).name
-            show_toast("FileOrganizer", f"Отсортировано: {name}")
+            self._sort_notifier.add(src_name or Path(new_path).name)
 
     def _flush_bg_refresh(self) -> None:
         now = time.time()
@@ -2869,6 +2981,10 @@ class App(Tk):
 
     def _on_tab_changed(self, _event=None) -> None:
         try:
+            if hasattr(self, "_archive_preview"):
+                self._archive_preview.pause_video()
+            if hasattr(self, "_pc_preview"):
+                self._pc_preview.pause_video()
             idx = self._notebook.index(self._notebook.select())
             self.settings.data["last_tab"] = idx
             self.settings.save()
@@ -2914,6 +3030,7 @@ class App(Tk):
 
     def _final_quit(self) -> None:
         try:
+            self._save_window_geometry()
             if self._tray_icon is not None:
                 self._tray_icon.stop()
                 self._tray_icon = None

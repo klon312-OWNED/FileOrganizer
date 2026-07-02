@@ -12,7 +12,7 @@ import pystray
 from .config import Settings
 from .database import FileIndex
 from .icon import make_icon_image
-from .notify import show_toast
+from .notify import SortNotifyBatcher
 from .sorter import Sorter
 from .watcher import FolderWatcher
 
@@ -30,11 +30,11 @@ class TrayAgent:
         self.sorter = Sorter(self.settings, self.index)
         self.watcher = FolderWatcher(self.sorter, on_sorted=self._on_sorted)
         self.icon: pystray.Icon | None = None
+        self._sort_notifier = SortNotifyBatcher()
 
     def _on_sorted(self, new_path: str, src_name: str = "") -> None:
         if self.settings.notify_on_sort:
-            name = src_name or Path(new_path).name
-            show_toast("FileOrganizer", f"Отсортировано: {name}")
+            self._sort_notifier.add(src_name or Path(new_path).name)
 
     # --- действия меню ---
 

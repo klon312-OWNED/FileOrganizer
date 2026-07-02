@@ -8,7 +8,7 @@ from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Frame, Label, Text, Toplevel, 
 from . import theme
 from .preview import RichPreview, code_highlight_spans, get_rich_preview
 from .thumbs import IMAGE_EXTS, PDF_EXTS, VIDEO_EXTS, fit_preview_image, get_thumbnail
-from .video_player import VideoPlayer
+from .video_player import VideoPlayer, probe_video_failure
 
 try:
     from PIL import ImageTk
@@ -25,11 +25,15 @@ _CODE_FONT = ("Consolas", 10)
 class PreviewPanel:
     """Панель: изображение сверху, «страница» документа снизу, метаданные."""
 
-    def __init__(self, parent, *, width: int = 380, show_meta: bool = True) -> None:
+    def __init__(
+        self, parent, *, width: int = 380, show_meta: bool = True,
+        initial_zoom: float = 1.0, on_zoom_change=None,
+    ) -> None:
         self._photo = None
         self._full_photo = None
         self._current_path: Path | None = None
-        self._zoom = 1.0
+        self._zoom = max(0.5, min(2.0, initial_zoom))
+        self._on_zoom_change = on_zoom_change
 
         root = Frame(
             parent, width=width, bg=theme.CARD, padx=10, pady=10,
@@ -61,7 +65,7 @@ class PreviewPanel:
         zoom_row = Frame(img_outer, bg=theme.CARD)
         zoom_row.pack(fill=X, pady=(2, 0))
         self._zoom_var = ttk.Scale(zoom_row, from_=0.5, to=2.0, orient="horizontal", command=self._on_zoom)
-        self._zoom_var.set(1.0)
+        self._zoom_var.set(self._zoom)
         self._zoom_var.pack(fill=X)
         self._zoom_row = zoom_row
 
@@ -119,6 +123,11 @@ class PreviewPanel:
     def add_button(self, text: str, command) -> None:
         ttk.Button(self._btn_frame, text=text, command=command).pack(fill=X, pady=(2, 0))
 
+    def pause_video(self) -> None:
+        """Поставить видео на паузу (например при смене вкладки)."""
+        if self._video_mode:
+            self._video_player.pause()
+
     def clear(self) -> None:
         self._stop_video()
         self._photo = None
@@ -132,8 +141,7 @@ class PreviewPanel:
 
     def show(self, path: Path, *, kind: str = "file") -> None:
         self._current_path = path
-        self._zoom_var.set(1.0)
-        self._zoom = 1.0
+        self._zoom_var.set(self._zoom)
         ext = path.suffix.lower()
 
         if kind == "dir":
@@ -175,6 +183,9 @@ class PreviewPanel:
             else:
                 self._show_image_placeholder("")
 
+        if showed_image and self._zoom != 1.0:
+            self._refresh_image_zoom()
+
         try:
             rich = get_rich_preview(path)
         except Exception:
@@ -189,12 +200,15 @@ class PreviewPanel:
         elif ext in VIDEO_EXTS and showed_video:
             self._fill_doc_text(
                 "Видео — воспроизведение выше.\n"
-                "▶/⏸ — play/pause, ползунок — перемотка.",
+                "▶/⏸ — play/pause · ползунок — перемотка · скорость 0.5–2×\n"
+                "Звук недоступен во встроенном плеере — используйте «Открыть».",
             )
         elif ext in VIDEO_EXTS and video_fallback:
+            reason = probe_video_failure(path)
             self._fill_doc_text(
-                "Видео — кодек не поддерживается встроенным плеером.\n"
-                "Показан кадр выше. Нажмите «Открыть», чтобы воспроизвести в системном плеере.",
+                "Видео — встроенный плеер не смог воспроизвести файл.\n"
+                f"Причина: {reason}.\n"
+                "Показан кадр-миниатюра выше. Нажмите «Открыть» для системного плеера.",
             )
         elif ext in VIDEO_EXTS:
             self._fill_doc_text("Видео — кадр показан выше.\nНажмите «Открыть», чтобы воспроизвести.")
@@ -295,12 +309,24 @@ class PreviewPanel:
             self._zoom = float(value)
         except ValueError:
             return
+        if self._on_zoom_change is not None:
+            try:
+                self._on_zoom_change(self._zoom)
+            except Exception:
+                pass
+        self._refresh_image_zoom()
+
+    def _refresh_image_zoom(self) -> None:
+        if self._video_mode or not self._current_path or not _HAS_PIL:
+            return
         ext = self._current_path.suffix.lower()
         if ext not in PREVIEW_EXTS:
             return
         base = (int(360 * self._zoom), int(320 * self._zoom))
         try:
-            img = fit_preview_image(get_thumbnail(self._current_path, max_size=(1200, 1200)), base)
+            img = fit_preview_image(
+                get_thumbnail(self._current_path, max_size=(1200, 1200)), base,
+            )
         except Exception:
             img = None
         if img is not None:

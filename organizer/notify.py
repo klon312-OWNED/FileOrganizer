@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
 
 
 def can_notify() -> bool:
@@ -37,3 +38,35 @@ def show_toast(title: str, message: str, *, app_id: str = "FileOrganizer") -> No
         )
     except OSError:
         pass
+
+
+class SortNotifyBatcher:
+    """Группирует уведомления о фоновой сортировке в одно сводное toast."""
+
+    def __init__(self, *, debounce_sec: float = 4.0) -> None:
+        self._debounce_sec = debounce_sec
+        self._lock = threading.Lock()
+        self._count = 0
+        self._timer: threading.Timer | None = None
+
+    def add(self, _name: str = "") -> None:
+        """Зарегистрировать отсортированный файл; toast уйдёт после паузы."""
+        with self._lock:
+            self._count += 1
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self._debounce_sec, self._flush)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _flush(self) -> None:
+        with self._lock:
+            count = self._count
+            self._count = 0
+            self._timer = None
+        if count <= 0:
+            return
+        if count == 1:
+            show_toast("FileOrganizer", "Отсортирован 1 файл")
+        else:
+            show_toast("FileOrganizer", f"Отсортировано: {count} файлов")
