@@ -71,6 +71,14 @@ BG_REFRESH_THROTTLE_SEC = 1.5
 TABLE_RENDER_BATCH = 220
 
 
+def filter_entries_by_name(entries: list[dict], query: str) -> list[dict]:
+    """Отфильтровать список элементов по подстроке в имени (для быстрого поиска)."""
+    q = query.strip().lower()
+    if not q:
+        return list(entries)
+    return [e for e in entries if q in e.get("name", "").lower()]
+
+
 def human_size(num: int) -> str:
     for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
         if num < 1024:
@@ -404,6 +412,7 @@ class App(Tk):
             variable=self._desktop_compress_var,
         ).pack(side=LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="Сортировать всё", command=self._sort_now).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(toolbar, text="Умная уборка", command=self._smart_cleanup).pack(side=LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="Обновить", command=self._desktop_refresh).pack(side=LEFT, padx=(8, 0))
         self._desktop_cancel_btn = ttk.Button(
             toolbar, text="Отменить сортировку", command=self._desktop_cancel_sort, state="disabled",
@@ -503,11 +512,9 @@ class App(Tk):
         return entry["name"].lower()
 
     def _desktop_apply_filter(self) -> None:
-        search = self._desktop_search_var.get().strip().lower()
+        search = self._desktop_search_var.get()
         type_filter = self._desktop_type_var.get()
-        entries = list(self._desktop_all_entries)
-        if search:
-            entries = [e for e in entries if search in e["name"].lower()]
+        entries = filter_entries_by_name(self._desktop_all_entries, search)
         if type_filter and type_filter != "Все типы":
             entries = [e for e in entries if e.get("category") == type_filter]
         entries.sort(key=self._desktop_sort_key)
@@ -2027,12 +2034,16 @@ class App(Tk):
 
     def _apply_global_search(self) -> None:
         query = self.quick_search_var.get()
-        if hasattr(self, "search_var"):
+        try:
+            idx = self._notebook.index(self._notebook.select())
+        except Exception:
+            idx = 0
+        if idx == 0 and hasattr(self, "search_var"):
             self.search_var.set(query)
-        if hasattr(self, "hist_search_var"):
-            self.hist_search_var.set(query)
-        if hasattr(self, "_desktop_search_var"):
+        elif idx == 1 and hasattr(self, "_desktop_search_var"):
             self._desktop_search_var.set(query)
+        elif idx == 3 and hasattr(self, "hist_search_var"):
+            self.hist_search_var.set(query)
 
     def _smart_cleanup(self) -> None:
         plan = self.sorter.build_smart_cleanup_plan()
