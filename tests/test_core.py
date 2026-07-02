@@ -51,6 +51,7 @@ class TestSettingsMigration(unittest.TestCase):
                 self.assertEqual(s.sort_mode, "flat")
                 self.assertIn("category_rules", s.data)
                 self.assertIn("onboarding_shown", s.data)
+                self.assertIn("large_text", s.data)
                 self.assertEqual(s.data["scheduled_sort_minutes"], 0)
             finally:
                 cfg.SETTINGS_PATH = orig
@@ -178,6 +179,76 @@ class TestSorterWithRules(unittest.TestCase):
             target = root / "Arch" / "Документы" / "note.txt"
             self.assertFalse(target.exists())
             self.assertEqual(index.count(), 0)
+            index.close()
+
+
+class TestSmartCleanup(unittest.TestCase):
+    def test_detects_installers_temp_and_duplicates(self):
+        from organizer.config import Settings
+        from organizer.database import FileIndex
+        from organizer.sorter import Sorter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inbox = root / "Downloads"
+            inbox.mkdir()
+            (inbox / "setup.exe").write_bytes(b"a")
+            (inbox / "trace.log").write_bytes(b"b")
+            (inbox / "img1.jpg").write_bytes(b"dup")
+            (inbox / "img1-copy.jpg").write_bytes(b"dup")
+            # Дубликаты определяются по имени и размеру:
+            (inbox / "img1.jpg").write_bytes(b"same-size")
+            (inbox / "img1.jpg").write_bytes(b"same-size")
+            other = root / "Desktop"
+            other.mkdir()
+            (other / "img1.jpg").write_bytes(b"same-size")
+
+            settings = Settings()
+            settings.data["watched_folders"] = [str(inbox), str(other)]
+            settings.data["archive_location"] = str(root)
+            settings.data["archive_name"] = "Arch"
+            settings.data["min_age_seconds"] = 0
+            index = FileIndex(root / "test.db")
+            try:
+                sorter = Sorter(settings, index)
+                plan = sorter.build_smart_cleanup_plan()
+                reasons = {p["name"]: p["reason"] for p in plan}
+                self.assertIn("setup.exe", reasons)
+                self.assertIn("trace.log", reasons)
+                self.assertTrue(any("дубликат" in r.lower() for r in reasons.values()))
+            finally:
+                index.close()
+
+
+class TestUndoReport(unittest.TestCase):
+    def test_undo_batch_detailed_counts_missing(self):
+        from organizer.config import Settings
+        from organizer.database import FileIndex
+        from organizer.sorter import Sorter
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "a.txt"
+            src.write_text("x", encoding="utf-8")
+            dst = root / "Arch" / "a.txt"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text("x", encoding="utf-8")
+
+            settings = Settings()
+            index = FileIndex(root / "test.db")
+            batch = "b1"
+            index.start_batch(batch=batch, sort_mode="type_only", storage_mode="move", ts=time.time())
+            index.log_move(
+                batch=batch, src=str(src), dst=str(dst), kind="file", ts=time.time(),
+                category="Документы", action="move", name="a.txt",
+            )
+            sorter = Sorter(settings, index)
+            dst.unlink()
+            report = sorter.undo_batch_detailed(batch)
+            self.assertEqual(report.restored, 0)
+            self.assertEqual(report.missing, 1)
+            self.assertEqual(report.failed, 0)
             index.close()
 
 

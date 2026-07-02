@@ -68,6 +68,7 @@ TYPE_COLORS: dict[str, str] = {
 
 BG_REFRESH_DEBOUNCE_MS = 900
 BG_REFRESH_THROTTLE_SEC = 1.5
+TABLE_RENDER_BATCH = 220
 
 
 def human_size(num: int) -> str:
@@ -113,7 +114,7 @@ class App(Tk):
         self.minsize(900, 520)
 
         self.settings = Settings()
-        theme.apply(self, dark=self.settings.dark_mode)
+        theme.apply(self, dark=self.settings.dark_mode, large_text=self.settings.large_text)
 
         try:
             self.iconbitmap(str(icon_path()))
@@ -134,6 +135,8 @@ class App(Tk):
         self._bg_refresh_after = None
         self._bg_pending_events = 0
         self._bg_last_refresh_ts = 0.0
+        self._archive_render_after = None
+        self._history_render_after = None
 
         self._build_header()
         self._build_ui()
@@ -164,6 +167,16 @@ class App(Tk):
             inner, textvariable=self.mode_info_var, bg=theme.HEADER, fg="#93c5fd",
             font=("Segoe UI", 9),
         ).pack(side=LEFT, padx=(16, 0))
+        self.quick_search_var = StringVar()
+        self.quick_search_var.trace_add("write", lambda *_: self._apply_global_search())
+        qentry = ttk.Entry(inner, textvariable=self.quick_search_var, width=28)
+        qentry.pack(side=RIGHT, padx=(10, 0))
+        qentry.bind("<Escape>", lambda _e: self.quick_search_var.set(""))
+        self._quick_search_entry = qentry
+        Label(
+            inner, text="Быстрый поиск (Ctrl+K):", bg=theme.HEADER, fg="#bfdbfe",
+            font=("Segoe UI", 9),
+        ).pack(side=RIGHT)
         if _HAS_TRAY:
             ttk.Button(inner, text="В трей", command=self._minimize_to_tray).pack(side=RIGHT, padx=(8, 0))
 
@@ -211,8 +224,16 @@ class App(Tk):
 
     def _build_ui(self) -> None:
         style = ttk.Style(self)
-        style.configure("Treeview", rowheight=30, font=("Segoe UI", 10))
-        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        row_h = 34 if self.settings.large_text else 30
+        base_size = 11 if self.settings.large_text else 10
+        style.configure("Treeview", rowheight=row_h, font=("Segoe UI", base_size))
+        style.configure("Treeview.Heading", font=("Segoe UI", base_size, "bold"))
+        style.map(
+            "Treeview",
+            highlightcolor=[("focus", theme.ACCENT)],
+            highlightthickness=[("focus", 2)],
+        )
+        self.bind_all("<Control-k>", self._focus_quick_search)
 
         self.status_var = StringVar(value="Готово")
         self._status_label = Label(
@@ -249,6 +270,7 @@ class App(Tk):
         ttk.Button(toolbar, text="Сортировать сейчас", style="Accent.TButton",
                    command=self._sort_now).pack(side=LEFT)
         ttk.Button(toolbar, text="Отменить последнюю", command=self._undo_last).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(toolbar, text="Умная уборка", command=self._smart_cleanup).pack(side=LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="Обновить индекс", command=self._reindex).pack(side=LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="Проверка индекса", command=self._archive_health_check).pack(
             side=LEFT, padx=(8, 0),
@@ -839,10 +861,11 @@ class App(Tk):
         *,
         compress_override: bool | None = None,
         cancel_event: threading.Event | None = None,
+        task_name: str = "Сортировка",
     ) -> bool:
-        if not self._begin_task("Сортировка"):
+        if not self._begin_task(task_name):
             return False
-        self.status_var.set("Сортирую...")
+        self.status_var.set(f"{task_name}...")
         self.update_idletasks()
         prev_enabled = self.settings.data.get("compression_enabled", False)
         if compress_override is not None:
@@ -1225,6 +1248,20 @@ class App(Tk):
             side, text="Восстановить файл", style="Accent.TButton",
             command=self._hist_restore_one,
         ).pack(fill=X, pady=(8, 2))
+        Label(side, text="Точки восстановления", font=("Segoe UI", 9, "bold"),
+              bg=theme.CARD).pack(anchor="w", pady=(10, 2))
+        self.hist_snapshots = ttk.Treeview(
+            side, columns=("when", "count"), show="headings", height=6, selectmode="browse",
+        )
+        self.hist_snapshots.heading("when", text="Когда")
+        self.hist_snapshots.heading("count", text="Файлов")
+        self.hist_snapshots.column("when", width=170, anchor="w")
+        self.hist_snapshots.column("count", width=70, anchor="center")
+        self.hist_snapshots.pack(fill=X, pady=(0, 4))
+        self.hist_snapshots.bind("<<TreeviewSelect>>", self._on_snapshot_selected)
+        ttk.Button(
+            side, text="Восстановить точку", command=self._restore_snapshot_selected,
+        ).pack(fill=X)
 
         self._hist_rows: dict[str, dict] = {}
 
@@ -1232,6 +1269,8 @@ class App(Tk):
         batches = self.index.history_batches()
         labels = ["Все операции"]
         self._batch_id_map: dict[str, str] = {}
+        if hasattr(self, "hist_snapshots"):
+            self.hist_snapshots.delete(*self.hist_snapshots.get_children())
         for b in batches:
             dt = datetime.fromtimestamp(b["ts"])
             sm = sort_mode_label(b["sort_mode"] or "")
@@ -1239,6 +1278,11 @@ class App(Tk):
             label = f"{dt:%d.%m.%Y %H:%M} — {cnt} шт. ({sm})"
             labels.append(label)
             self._batch_id_map[label] = b["batch"]
+            if hasattr(self, "hist_snapshots"):
+                self.hist_snapshots.insert(
+                    "", END, iid=b["batch"],
+                    values=(dt.strftime("%d.%m.%Y %H:%M"), int(cnt)),
+                )
         self.hist_batch_box["values"] = labels
         if self.hist_batch_var.get() not in labels:
             self.hist_batch_var.set("Все операции")
@@ -1251,6 +1295,12 @@ class App(Tk):
             batch = self._batch_id_map[batch_label]
         search = self.hist_search_var.get().strip() or None
         rows = self.index.query_history(batch=batch, search=search, limit=1000)
+        if self._history_render_after:
+            try:
+                self.after_cancel(self._history_render_after)
+            except Exception:
+                pass
+            self._history_render_after = None
         self.hist_tree.delete(*self.hist_tree.get_children())
         self._hist_rows.clear()
         for r in rows:
@@ -1262,18 +1312,59 @@ class App(Tk):
             tags = ("copy",) if action == "copy" else ("move",)
             name = r["name"] if "name" in r.keys() and r["name"] else Path(r["dst"]).name
             cat = r["category"] if "category" in r.keys() else ""
-            self.hist_tree.insert(
-                "", END, iid=iid, tags=tags,
-                values=(
-                    dt.strftime("%d.%m.%Y %H:%M"),
-                    name, action_txt, cat, r["src"], r["dst"],
-                ),
+            self._hist_rows[iid]["_display"] = (
+                dt.strftime("%d.%m.%Y %H:%M"), name, action_txt, cat, r["src"], r["dst"], tags
             )
+        self._render_history_rows_incremental(list(self._hist_rows.keys()), 0)
         if not rows:
             self.hist_detail.set(
                 "История пока пуста.\n\n"
                 "Запустите сортировку, чтобы увидеть операции и затем при необходимости откатить их.",
             )
+            return
+
+    def _render_history_rows_incremental(self, ids: list[str], start: int) -> None:
+        end = min(len(ids), start + TABLE_RENDER_BATCH)
+        for i in range(start, end):
+            row = self._hist_rows[ids[i]]
+            when, name, action_txt, cat, src, dst, tags = row["_display"]
+            self.hist_tree.insert(
+                "", END, iid=ids[i], tags=tags,
+                values=(when, name, action_txt, cat, src, dst),
+            )
+        if end < len(ids):
+            self._history_render_after = self.after(
+                1, lambda: self._render_history_rows_incremental(ids, end),
+            )
+        else:
+            self._history_render_after = None
+
+    def _on_snapshot_selected(self, *_):
+        sel = self.hist_snapshots.selection()
+        if not sel:
+            return
+        batch = sel[0]
+        for label, bid in getattr(self, "_batch_id_map", {}).items():
+            if bid == batch:
+                self.hist_batch_var.set(label)
+                break
+        self._reload_history()
+
+    def _restore_snapshot_selected(self) -> None:
+        sel = self.hist_snapshots.selection()
+        if not sel:
+            messagebox.showinfo("Точка восстановления", "Выберите точку восстановления.")
+            return
+        batch = sel[0]
+        if not messagebox.askyesno("Точка восстановления", "Восстановить выбранную точку?"):
+            return
+        self.status_var.set("Восстанавливаю точку...")
+
+        def work():
+            report = self.sorter.undo_batch_detailed(batch)
+            self.after(0, lambda: self._after_undo_report(report))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _hist_selected(self) -> dict | None:
         sel = self.hist_tree.selection()
@@ -1364,8 +1455,8 @@ class App(Tk):
         self.status_var.set("Отменяю операцию...")
 
         def work():
-            ok, fail = self.sorter.undo_batch(batch)
-            self.after(0, lambda: self._after_undo(ok, fail))
+            report = self.sorter.undo_batch_detailed(batch)
+            self.after(0, lambda: self._after_undo_report(report))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1542,20 +1633,28 @@ class App(Tk):
         key_fn = sort_keys.get(self._archive_sort_col, sort_keys["date"])
         rows = sorted(rows, key=key_fn, reverse=self._archive_sort_rev)
 
+        if self._archive_render_after:
+            try:
+                self.after_cancel(self._archive_render_after)
+            except Exception:
+                pass
+            self._archive_render_after = None
         self.tree.delete(*self.tree.get_children())
         total_size = 0
+        rows_data = []
         for r in rows:
             dt = datetime.fromtimestamp(r["added_ts"])
             is_dir = (r["kind"] if "kind" in r.keys() else "file") == "dir"
             display_name = ("[Папка] " + r["name"]) if is_dir else r["name"]
-            self.tree.insert(
-                "", END, iid=str(r["id"]),
-                values=(
-                    display_name, r["category"], dt.strftime("%d.%m.%Y %H:%M"),
-                    human_size(r["size"] or 0),
-                ),
-            )
+            rows_data.append((
+                str(r["id"]),
+                display_name,
+                r["category"],
+                dt.strftime("%d.%m.%Y %H:%M"),
+                human_size(r["size"] or 0),
+            ))
             total_size += r["size"] or 0
+        self._render_archive_rows_incremental(rows_data, 0)
         self.status_var.set(
             f"Показано: {len(rows)} файлов · {human_size(total_size)} · "
             f"всего в индексе: {self.index.count()}{self._status_suffix()}"
@@ -1563,6 +1662,18 @@ class App(Tk):
         if not rows:
             self._archive_preview.set_metadata("Архив пока пуст.\nЗапустите сортировку, чтобы добавить файлы.")
             self._archive_preview.clear()
+
+    def _render_archive_rows_incremental(self, rows_data: list[tuple], start: int) -> None:
+        end = min(len(rows_data), start + TABLE_RENDER_BATCH)
+        for i in range(start, end):
+            iid, name, category, date, size = rows_data[i]
+            self.tree.insert("", END, iid=iid, values=(name, category, date, size))
+        if end < len(rows_data):
+            self._archive_render_after = self.after(
+                1, lambda: self._render_archive_rows_incremental(rows_data, end),
+            )
+        else:
+            self._archive_render_after = None
 
     def _selected_paths(self) -> list[str]:
         paths = []
@@ -1882,12 +1993,12 @@ class App(Tk):
         self.update_idletasks()
 
         def work():
-            ok, fail = self.sorter.undo_last()
-            self.after(0, lambda: self._after_undo(ok, fail))
+            report = self.sorter.undo_last_detailed()
+            self.after(0, lambda: self._after_undo_report(report))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _after_undo(self, ok: int, fail: int):
+    def _after_undo_report(self, report):
         self._refresh_filters()
         self._reload_table()
         self._reload_history()
@@ -1895,17 +2006,67 @@ class App(Tk):
             self._desktop_refresh()
         if hasattr(self, "_stats_tree"):
             self._reload_stats()
-        if ok == 0 and fail == 0:
+        if report.restored == 0 and report.failed == 0 and report.missing == 0:
             messagebox.showinfo("Отмена", "Нечего отменять.")
         else:
-            msg = f"Возвращено: {ok}"
-            if fail:
-                msg += (
-                    f"\nНе удалось вернуть: {fail}"
-                    f"\n\nНеудачные элементы остаются в журнале — "
-                    f"можно повторить отмену позже."
-                )
+            msg = (
+                f"Восстановлено: {report.restored}\n"
+                f"Уже отсутствовали: {report.missing}\n"
+                f"Ошибок восстановления: {report.failed}"
+            )
+            if report.failed:
+                failed_preview = [f"• {Path(p).name}: {reason}" for p, reason in report.details if reason not in ("Восстановлено", "Файл уже отсутствует в архиве")]
+                if failed_preview:
+                    msg += "\n\nПроблемные файлы:\n" + "\n".join(failed_preview[:10])
             messagebox.showinfo("Отмена выполнена", msg)
+
+    def _focus_quick_search(self, _event=None):
+        self._quick_search_entry.focus_set()
+        self._quick_search_entry.selection_range(0, END)
+        return "break"
+
+    def _apply_global_search(self) -> None:
+        query = self.quick_search_var.get()
+        if hasattr(self, "search_var"):
+            self.search_var.set(query)
+        if hasattr(self, "hist_search_var"):
+            self.hist_search_var.set(query)
+        if hasattr(self, "_desktop_search_var"):
+            self._desktop_search_var.set(query)
+
+    def _smart_cleanup(self) -> None:
+        plan = self.sorter.build_smart_cleanup_plan()
+        if not plan:
+            messagebox.showinfo("Умная уборка", "Кандидаты не найдены.")
+            return
+        total_size = sum(int(i.get("size") or 0) for i in plan)
+        by_reason: dict[str, int] = {}
+        preview_lines: list[str] = []
+        for item in plan:
+            reason = item.get("reason", "Другое")
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+        for reason, cnt in sorted(by_reason.items(), key=lambda x: x[0]):
+            preview_lines.append(f"• {reason}: {cnt}")
+        sample = "\n".join(f"• {i['name']} — {i['reason']}" for i in plan[:12])
+        more = f"\n…и ещё {len(plan) - 12}" if len(plan) > 12 else ""
+        msg = (
+            f"Найдено кандидатов: {len(plan)}\n"
+            f"Общий размер: {human_size(total_size)}\n\n"
+            "Категории:\n" + "\n".join(preview_lines) +
+            "\n\nПревью:\n" + sample + more +
+            "\n\nПереместить в архив как обычную сортировку?"
+        )
+        if not messagebox.askyesno("Умная уборка", msg):
+            return
+        paths = [i["path"] for i in plan if Path(i["path"]).exists()]
+        if not paths:
+            messagebox.showinfo("Умная уборка", "Файлы уже отсутствуют.")
+            return
+        if not self._confirm_sort_operation(paths, title="Умная уборка"):
+            return
+        if not self._confirm_duplicates(paths):
+            return
+        self._run_sort(paths=paths, task_name="Умная уборка")
 
     def _reindex(self):
         if not self._begin_task("Переиндексация"):
@@ -1989,7 +2150,7 @@ class App(Tk):
 
     def _apply_live_theme(self, was_dark: bool) -> None:
         from_palette = "dark" if was_dark else "light"
-        theme.apply(self, dark=self.settings.dark_mode)
+        theme.apply(self, dark=self.settings.dark_mode, large_text=self.settings.large_text)
         theme.recolor_widgets(self, from_palette, theme.current_palette())
         self.hist_tree.tag_configure("move", background=theme.HISTORY_MOVE)
         self.hist_tree.tag_configure("copy", background=theme.HISTORY_COPY)
@@ -2436,6 +2597,11 @@ class App(Tk):
             canvas_frame, text="Тёмная тема",
             variable=dark_var, onvalue="on", offvalue="off",
         ).pack(anchor="w", padx=16, pady=(4, 0))
+        large_text_var = StringVar(value="on" if self.settings.large_text else "off")
+        ttk.Checkbutton(
+            canvas_frame, text="Крупный текст и элементы интерфейса",
+            variable=large_text_var, onvalue="on", offvalue="off",
+        ).pack(anchor="w", padx=16, pady=(4, 0))
 
         tray_var = StringVar(value="on" if self.settings.close_to_tray else "off")
         ttk.Checkbutton(
@@ -2482,6 +2648,7 @@ class App(Tk):
 
         def save():
             was_dark = self.settings.dark_mode
+            was_large = self.settings.large_text
             folders = [
                 line.strip()
                 for line in folders_text.get("1.0", END).splitlines()
@@ -2499,6 +2666,7 @@ class App(Tk):
             self.settings.data["dry_run"] = dry_run_var.get() == "on"
             self.settings.data["notify_on_sort"] = notify_var.get() == "on"
             self.settings.data["dark_mode"] = dark_var.get() == "on"
+            self.settings.data["large_text"] = large_text_var.get() == "on"
             self.settings.data["close_to_tray"] = tray_var.get() == "on"
             try:
                 self.settings.data["scheduled_sort_minutes"] = max(
@@ -2519,7 +2687,7 @@ class App(Tk):
             self.settings.data["watched_folders"] = folders
             self.settings.save()
             self._update_mode_banner()
-            if was_dark != self.settings.dark_mode:
+            if was_dark != self.settings.dark_mode or was_large != self.settings.large_text:
                 self._apply_live_theme(was_dark)
             if hasattr(self, "_desktop_canvas"):
                 self._desktop_refresh()

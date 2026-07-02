@@ -118,6 +118,8 @@ DEFAULT_SETTINGS: dict = {
     "compression_level": "fast",
     # Тестовый режим: показывать результат, ничего не перемещая
     "dry_run": False,
+    # Более крупный текст и элементы интерфейса
+    "large_text": False,
 }
 
 
@@ -173,6 +175,7 @@ class Settings:
             merged["compression_level"] = DEFAULT_SETTINGS["compression_level"]
         merged["compression_enabled"] = bool(merged.get("compression_enabled", False))
         merged["dry_run"] = bool(merged.get("dry_run", False))
+        merged["large_text"] = bool(merged.get("large_text", False))
         self.data = merged
 
     def save(self) -> None:
@@ -289,6 +292,10 @@ class Settings:
     @property
     def dry_run(self) -> bool:
         return bool(self.data.get("dry_run", False))
+
+    @property
+    def large_text(self) -> bool:
+        return bool(self.data.get("large_text", False))
 
     def add_excluded_path(self, path: str) -> None:
         try:

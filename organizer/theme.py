@@ -160,7 +160,7 @@ def recolor_widgets(root, from_palette: str, to_palette: str) -> None:
     visit(root)
 
 
-def apply(root, *, dark: bool = False) -> ttk.Style:
+def apply(root, *, dark: bool = False, large_text: bool = False) -> ttk.Style:
     _activate_palette("dark" if dark else "light")
     style = ttk.Style(root)
     try:
@@ -170,7 +170,10 @@ def apply(root, *, dark: bool = False) -> ttk.Style:
 
     root.configure(bg=BG)
 
-    style.configure(".", background=BG, foreground=TEXT, font=("Segoe UI", 10))
+    base = 11 if large_text else 10
+    small = max(9, base - 1)
+    head = base + 4
+    style.configure(".", background=BG, foreground=TEXT, font=("Segoe UI", base))
     style.configure("TFrame", background=BG)
     style.configure("Card.TFrame", background=CARD)
     style.configure("Sidebar.TFrame", background=SIDEBAR)
@@ -179,12 +182,12 @@ def apply(root, *, dark: bool = False) -> ttk.Style:
     style.configure("TLabel", background=BG, foreground=TEXT)
     style.configure("Card.TLabel", background=CARD, foreground=TEXT)
     style.configure("Sidebar.TLabel", background=SIDEBAR, foreground=TEXT)
-    style.configure("Muted.TLabel", background=BG, foreground=TEXT_MUTED, font=("Segoe UI", 9))
-    style.configure("Header.TLabel", background=HEADER, foreground=HEADER_FG, font=("Segoe UI", 14, "bold"))
-    style.configure("Subheader.TLabel", background=HEADER, foreground="#93c5fd", font=("Segoe UI", 9))
+    style.configure("Muted.TLabel", background=BG, foreground=TEXT_MUTED, font=("Segoe UI", small))
+    style.configure("Header.TLabel", background=HEADER, foreground=HEADER_FG, font=("Segoe UI", head, "bold"))
+    style.configure("Subheader.TLabel", background=HEADER, foreground="#93c5fd", font=("Segoe UI", small))
 
     style.configure("TNotebook", background=BG, borderwidth=0)
-    style.configure("TNotebook.Tab", padding=[14, 8], font=("Segoe UI", 10))
+    style.configure("TNotebook.Tab", padding=[14, 8], font=("Segoe UI", base))
     style.map("TNotebook.Tab", background=[("selected", CARD), ("!selected", BG)])
 
     style.configure(
@@ -192,22 +195,22 @@ def apply(root, *, dark: bool = False) -> ttk.Style:
         background=CARD,
         fieldbackground=CARD,
         foreground=TEXT,
-        rowheight=30,
-        font=("Segoe UI", 10),
+        rowheight=34 if large_text else 30,
+        font=("Segoe UI", base),
         borderwidth=0,
     )
     style.configure(
         "Treeview.Heading",
         background=SIDEBAR,
         foreground=TEXT,
-        font=("Segoe UI", 10, "bold"),
+        font=("Segoe UI", base, "bold"),
         relief="flat",
         padding=6,
     )
     style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#ffffff")])
 
-    style.configure("TButton", padding=[10, 6], font=("Segoe UI", 10))
-    style.configure("Accent.TButton", background=ACCENT, foreground="#ffffff", font=("Segoe UI", 10, "bold"))
+    style.configure("TButton", padding=[10, 6], font=("Segoe UI", base))
+    style.configure("Accent.TButton", background=ACCENT, foreground="#ffffff", font=("Segoe UI", base, "bold"))
     style.map("Accent.TButton", background=[("active", ACCENT_HOVER), ("pressed", ACCENT_HOVER)])
 
     style.configure("Success.TButton", background=SUCCESS, foreground="#ffffff")

@@ -16,6 +16,14 @@ from .database import FileIndex
 from .layouts import dest_directory, infer_index_fields
 
 APP_ROOT = app_install_root()
+_SMART_INSTALLER_EXTS = {
+    ".exe", ".msi", ".msix", ".appx", ".appxbundle", ".pkg", ".dmg", ".deb", ".rpm",
+}
+_SMART_TEMP_EXTS = {".tmp", ".temp", ".log", ".bak", ".old", ".cache", ".crdownload", ".part"}
+_SMART_MEDIA_EXTS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".tif", ".tiff",
+    ".mp4", ".mov", ".mkv", ".avi", ".wmv", ".mp3", ".wav", ".flac", ".m4a",
+}
 
 
 @dataclass
@@ -27,6 +35,14 @@ class SortResult:
 
     def add_error(self, path: str, reason: str) -> None:
         self.errors.append((path, reason))
+
+
+@dataclass
+class UndoBatchReport:
+    restored: int = 0
+    missing: int = 0
+    failed: int = 0
+    details: list[tuple[str, str]] = field(default_factory=list)
 
 
 class Sorter:
@@ -561,8 +577,72 @@ class Sorter:
                             pass
         return result
 
-    def undo_batch(self, batch: str) -> tuple[int, int]:
-        ok = fail = 0
+    @staticmethod
+    def _looks_temp_name(name: str) -> bool:
+        low = name.lower()
+        return (
+            low.startswith("~$")
+            or low.startswith("tmp")
+            or low.endswith(".tmp")
+            or low.endswith(".temp")
+            or low.endswith(".log")
+        )
+
+    def build_smart_cleanup_plan(self, *, limit: int = 700) -> list[dict]:
+        """Подобрать безопасные кандидаты для «Умной уборки»."""
+        entries = self.list_watched_entries()
+        duplicates: dict[tuple[str, int], list[dict]] = {}
+        for e in entries:
+            if e.get("is_dir"):
+                continue
+            if not e.get("sortable"):
+                continue
+            ext = Path(e["path"]).suffix.lower()
+            if ext in _SMART_MEDIA_EXTS:
+                key = (e.get("name", "").lower(), int(e.get("size") or 0))
+                duplicates.setdefault(key, []).append(e)
+
+        duplicate_paths: set[str] = set()
+        for items in duplicates.values():
+            if len(items) > 1:
+                items = sorted(items, key=lambda x: x.get("mtime", 0), reverse=True)
+                for dup in items[1:]:
+                    duplicate_paths.add(dup["path"])
+
+        out: list[dict] = []
+        seen: set[str] = set()
+        for e in entries:
+            if len(out) >= limit:
+                break
+            path = e["path"]
+            if path in seen:
+                continue
+            seen.add(path)
+            if e.get("is_dir") or not e.get("sortable"):
+                continue
+            p = Path(path)
+            ext = p.suffix.lower()
+            reason = ""
+            if ext in _SMART_INSTALLER_EXTS:
+                reason = "Установщик/инсталлятор в загрузках"
+            elif ext in _SMART_TEMP_EXTS or self._looks_temp_name(p.name):
+                reason = "Временный или служебный файл"
+            elif path in duplicate_paths:
+                reason = "Похоже на дубликат медиа"
+            if not reason:
+                continue
+            out.append({
+                "path": path,
+                "name": e.get("name", p.name),
+                "reason": reason,
+                "folder": e.get("folder", ""),
+                "category": e.get("category", ""),
+                "size": int(e.get("size") or 0),
+            })
+        return out
+
+    def undo_batch_detailed(self, batch: str) -> UndoBatchReport:
+        report = UndoBatchReport()
         removed_ids: list[int] = []
         for mv in self.index.moves_in_batch(batch):
             dst = Path(mv["dst"])
@@ -572,6 +652,8 @@ class Sorter:
             if not dst.exists():
                 self.index.remove_by_path(str(dst))
                 removed_ids.append(move_id)
+                report.missing += 1
+                report.details.append((str(dst), "Файл уже отсутствует в архиве"))
                 continue
             try:
                 if action == "copy":
@@ -585,21 +667,33 @@ class Sorter:
                     shutil.move(str(dst), str(target))
                 self.index.remove_by_path(str(dst))
                 removed_ids.append(move_id)
-                ok += 1
-            except (OSError, shutil.Error):
-                fail += 1
-        if fail == 0:
+                report.restored += 1
+                report.details.append((str(dst), "Восстановлено"))
+            except (OSError, shutil.Error) as e:
+                report.failed += 1
+                report.details.append((str(dst), str(e)))
+        if report.failed == 0:
             self.index.delete_batch(batch)
         else:
             self.index.delete_moves(removed_ids)
             self.index.set_batch_item_count(batch, self.index.moves_count(batch))
-        return ok, fail
+        return report
+
+    def undo_batch(self, batch: str) -> tuple[int, int]:
+        report = self.undo_batch_detailed(batch)
+        return report.restored, report.failed
 
     def undo_last(self) -> tuple[int, int]:
         batch = self.index.last_batch()
         if not batch:
             return (0, 0)
         return self.undo_batch(batch)
+
+    def undo_last_detailed(self) -> UndoBatchReport:
+        batch = self.index.last_batch()
+        if not batch:
+            return UndoBatchReport()
+        return self.undo_batch_detailed(batch)
 
     def undo_move(self, move_id: int) -> tuple[bool, str]:
         """Вернуть один файл из журнала на исходное место."""
