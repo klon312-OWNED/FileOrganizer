@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Frame, Label, Text, Toplevel, ttk
+from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Frame, Label, Text, Toplevel, Canvas, ttk
 
 from . import theme
 from .preview import RichPreview, code_highlight_spans, get_rich_preview
@@ -88,6 +88,18 @@ class PreviewPanel:
 
         self._btn_frame = Frame(root, bg=theme.CARD)
         self._btn_frame.pack(fill=X)
+        ttk.Button(
+            self._btn_frame, text="Копировать текст", command=self._copy_doc_text,
+        ).pack(fill=X, pady=(2, 0))
+
+    def _copy_doc_text(self) -> None:
+        text = self._doc_text.get("1.0", END).strip()
+        if not text:
+            return
+        top = self.frame.winfo_toplevel()
+        top.clipboard_clear()
+        top.clipboard_append(text)
+        self.set_metadata("Текст скопирован в буфер обмена.")
 
     def _setup_text_tags(self) -> None:
         t = self._doc_text
@@ -257,8 +269,30 @@ class PreviewPanel:
             return
         win = Toplevel(self.frame.winfo_toplevel())
         win.title(self._current_path.name)
+        win.geometry("860x640")
         win.configure(bg=theme.IMAGE_PREVIEW_BG)
+        win.transient(self.frame.winfo_toplevel())
+
+        outer = Frame(win, bg=theme.IMAGE_PREVIEW_BG)
+        outer.pack(fill=BOTH, expand=True)
+
+        canvas = Canvas(outer, bg=theme.IMAGE_PREVIEW_BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=RIGHT, fill=Y)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+
         photo = ImageTk.PhotoImage(img)
-        lbl = Label(win, image=photo, bg=theme.IMAGE_PREVIEW_BG)
-        lbl.image = photo  # noqa: SLF001 — удержать ссылку
-        lbl.pack(padx=8, pady=8)
+        canvas.create_image(0, 0, anchor="nw", image=photo)
+        canvas.image = photo  # noqa: SLF001
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_wheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        canvas.bind("<MouseWheel>", _on_wheel)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        Label(
+            win, text="Esc — закрыть · колёсико — прокрутка",
+            bg=theme.IMAGE_PREVIEW_BG, fg=theme.TEXT_MUTED, font=("Segoe UI", 9),
+        ).pack(pady=(0, 6))

@@ -641,6 +641,34 @@ class Sorter:
             })
         return out
 
+    def count_watched_protected(self) -> int:
+        """Число элементов в отслеживаемых папках, недоступных для сортировки."""
+        count = 0
+        dest = Path(self.settings.destination).resolve()
+        seen: set[str] = set()
+        for folder in self.settings.watched_folders:
+            try:
+                fpath = Path(folder).resolve()
+            except OSError:
+                continue
+            if fpath == dest or dest in fpath.parents:
+                continue
+            try:
+                children = list(fpath.iterdir())
+            except OSError:
+                continue
+            for entry in children:
+                try:
+                    key = str(entry.resolve())
+                except OSError:
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                if self._is_protected(entry) or self._is_excluded(entry):
+                    count += 1
+        return count
+
     def undo_batch_detailed(self, batch: str) -> UndoBatchReport:
         report = UndoBatchReport()
         removed_ids: list[int] = []

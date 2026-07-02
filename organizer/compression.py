@@ -130,6 +130,49 @@ def _source_bytes(source: Path) -> int:
     return total
 
 
+def source_bytes(path: Path) -> int:
+    """Размер файла или суммарный размер папки."""
+    return _source_bytes(path)
+
+
+def zip_space_saved(original_bytes: int, zip_bytes: int) -> int:
+    """Сколько байт сэкономлено (0 если архив больше оригинала)."""
+    return max(0, int(original_bytes) - int(zip_bytes))
+
+
+def format_zip_result(
+    *,
+    ok: int,
+    fail: int,
+    total: int,
+    original_bytes: int,
+    zip_bytes: int,
+) -> str:
+    """Краткий отчёт о сжатии для диалога."""
+    saved = zip_space_saved(original_bytes, zip_bytes)
+    lines = [
+        f"Создано архивов: {ok} из {total}",
+        f"Исходный размер: {_human_size(original_bytes)}",
+        f"Размер ZIP: {_human_size(zip_bytes)}",
+    ]
+    if saved > 0:
+        pct = (saved / original_bytes * 100) if original_bytes else 0
+        lines.append(f"Сэкономлено: {_human_size(saved)} ({pct:.0f}%)")
+    elif original_bytes and zip_bytes >= original_bytes:
+        lines.append("Сжатие не уменьшило размер (уже сжатые данные).")
+    if fail:
+        lines.append(f"Ошибок: {fail}")
+    return "\n".join(lines)
+
+
+def _human_size(num: int) -> str:
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if num < 1024:
+            return f"{num:.0f} {unit}" if unit == "Б" else f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} ПБ"
+
+
 def estimate_zip_size(sources: list[Path], *, level: str = "fast") -> int:
     """Оценка размера ZIP до упаковки (эвристика по сумме файлов)."""
     total = sum(_source_bytes(Path(s)) for s in sources)

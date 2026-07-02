@@ -21,8 +21,9 @@ from .config import OTHER_CATEGORY, Settings
 from .database import FileIndex
 from .compression import (
     compression_level_label, compression_mode_label, estimate_zip_size,
-    remove_source, unzip_item, zip_item,
+    format_zip_result, remove_source, source_bytes, unzip_item, zip_item,
 )
+from .cleanup_summary import format_cleanup_dialog, summarize_cleanup_plan
 from .layouts import DATE_SOURCES, MONTHS_RU, SORT_MODES, STORAGE_MODES, sort_mode_label, sort_mode_preview, storage_mode_label
 from .preview_panel import PreviewPanel
 from .scanner import Scanner, fixed_drives
@@ -32,6 +33,7 @@ from .icon import icon_path, make_icon_image
 from .notify import show_toast
 from .thumbs import get_thumbnail
 from .watcher import FolderWatcher
+from .win_drop import bind_file_drop
 
 try:
     import pystray
@@ -69,6 +71,7 @@ TYPE_COLORS: dict[str, str] = {
 BG_REFRESH_DEBOUNCE_MS = 900
 BG_REFRESH_THROTTLE_SEC = 1.5
 TABLE_RENDER_BATCH = 220
+ARCHIVE_PAGE_SIZE = 500
 
 
 def filter_entries_by_name(entries: list[dict], query: str) -> list[dict]:
@@ -145,6 +148,8 @@ class App(Tk):
         self._bg_last_refresh_ts = 0.0
         self._archive_render_after = None
         self._history_render_after = None
+        self._archive_page = 0
+        self._archive_rows_cache: list[tuple] = []
 
         self._build_header()
         self._build_ui()
@@ -348,7 +353,10 @@ class App(Tk):
             "date": "Дата загрузки",
             "size": "Размер",
         }
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
+        tree_wrap = Frame(table_frame, bg=theme.CARD)
+        tree_wrap.pack(side="top", fill=BOTH, expand=True)
+
+        self.tree = ttk.Treeview(tree_wrap, columns=columns, show="headings", selectmode="extended")
         for col in columns:
             self.tree.heading(
                 col,
@@ -360,7 +368,7 @@ class App(Tk):
         self.tree.column("date", width=150, anchor="center")
         self.tree.column("size", width=90, anchor="e")
 
-        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side=RIGHT, fill=Y)
         self.tree.pack(side=LEFT, fill=BOTH, expand=True)
@@ -368,6 +376,15 @@ class App(Tk):
         self.tree.bind("<Double-1>", self._open_selected)
         self.tree.bind("<Button-3>", self._show_context_menu)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        pager = Frame(table_frame, bg=theme.CARD)
+        pager.pack(side="bottom", fill=X, padx=4, pady=(4, 0))
+        self._archive_page_var = StringVar(value="")
+        Label(pager, textvariable=self._archive_page_var, bg=theme.CARD, fg=theme.TEXT_MUTED).pack(
+            side=LEFT,
+        )
+        ttk.Button(pager, text="◀ Назад", command=self._archive_prev_page).pack(side=RIGHT, padx=(4, 0))
+        ttk.Button(pager, text="Вперёд ▶", command=self._archive_next_page).pack(side=RIGHT)
 
         self._archive_preview = PreviewPanel(body, width=380)
         self._archive_preview.add_button("Открыть файл", self._open_selected)
@@ -482,6 +499,12 @@ class App(Tk):
         root.bind("<Delete>", self._desktop_key_delete)
         root.bind("<Return>", self._desktop_key_open)
 
+        if bind_file_drop(self._desktop_canvas, self._desktop_on_file_drop):
+            Label(
+                toolbar, text="Перетащите файлы сюда", bg=theme.BG,
+                fg=theme.TEXT_MUTED, font=("Segoe UI", 9),
+            ).pack(side=RIGHT, padx=(8, 0))
+
         self._desktop_ctx = Menu(self, tearoff=0)
         self._desktop_ctx_path: str | None = None
 
@@ -502,6 +525,32 @@ class App(Tk):
         self._desktop_selected.clear()
         self._desktop_all_entries = self.sorter.list_watched_entries()
         self._desktop_apply_filter()
+
+    def _desktop_on_file_drop(self, paths: list[str]) -> None:
+        """Добавить перетащенные файлы в выбор на вкладке «Рабочий стол»."""
+        resolved: list[str] = []
+        for raw in paths:
+            try:
+                resolved.append(str(Path(raw).resolve()))
+            except OSError:
+                resolved.append(raw)
+        matched = 0
+        for p in resolved:
+            if p in self._desktop_tiles:
+                self._desktop_set_selected(p, True)
+                matched += 1
+        if matched < len(resolved):
+            self._desktop_refresh()
+            for p in resolved:
+                if p in self._desktop_tiles:
+                    self._desktop_set_selected(p, True)
+                    matched += 1
+        if matched:
+            self.status_var.set(f"Выбрано перетаскиванием: {matched}{self._status_suffix()}")
+        else:
+            self.status_var.set(
+                f"Файлы не в отслеживаемых папках ({len(resolved)}){self._status_suffix()}",
+            )
 
     def _desktop_sort_key(self, entry: dict):
         mode = self._desktop_sort_var.get()
@@ -631,7 +680,15 @@ class App(Tk):
         chk.pack(side=LEFT)
         chk.bind("<Button-1>", lambda e: "break")
         if excluded:
-            Label(top, text="⊘", bg=outer["bg"], fg=theme.DESKTOP_MUTED, font=("Segoe UI", 9)).pack(side=RIGHT)
+            ex_lbl = Label(
+                top, text="⊘", bg=outer["bg"], fg="#c62828",
+                font=("Segoe UI", 10, "bold"),
+            )
+            ex_lbl.pack(side=RIGHT)
+            ex_lbl.bind(
+                "<Enter>",
+                lambda _e, p=path: self.status_var.set(f"Исключено из сортировки: {p}"),
+            )
         elif not sortable:
             Label(top, text="⏳", bg=outer["bg"], fg=theme.DESKTOP_MUTED, font=("Segoe UI", 9)).pack(side=RIGHT)
 
@@ -1266,6 +1323,7 @@ class App(Tk):
         self.hist_snapshots.column("count", width=70, anchor="center")
         self.hist_snapshots.pack(fill=X, pady=(0, 4))
         self.hist_snapshots.bind("<<TreeviewSelect>>", self._on_snapshot_selected)
+        self.hist_snapshots.bind("<Double-1>", lambda _e: self._restore_snapshot_selected())
         ttk.Button(
             side, text="Восстановить точку", command=self._restore_snapshot_selected,
         ).pack(fill=X)
@@ -1614,7 +1672,44 @@ class App(Tk):
         self.year_var.set("Все годы")
         self.month_var.set("Все месяцы")
         self.search_var.set("")
+        self._archive_page = 0
         self._reload_table()
+
+    def _archive_total_pages(self) -> int:
+        total = len(self._archive_rows_cache)
+        if total == 0:
+            return 1
+        return (total + ARCHIVE_PAGE_SIZE - 1) // ARCHIVE_PAGE_SIZE
+
+    def _archive_prev_page(self) -> None:
+        if self._archive_page > 0:
+            self._archive_page -= 1
+            self._archive_render_page()
+
+    def _archive_next_page(self) -> None:
+        if self._archive_page < self._archive_total_pages() - 1:
+            self._archive_page += 1
+            self._archive_render_page()
+
+    def _archive_render_page(self) -> None:
+        if self._archive_render_after:
+            try:
+                self.after_cancel(self._archive_render_after)
+            except Exception:
+                pass
+            self._archive_render_after = None
+        self.tree.delete(*self.tree.get_children())
+        start = self._archive_page * ARCHIVE_PAGE_SIZE
+        page_rows = self._archive_rows_cache[start:start + ARCHIVE_PAGE_SIZE]
+        self._render_archive_rows_incremental(page_rows, 0)
+        pages = self._archive_total_pages()
+        if pages > 1:
+            self._archive_page_var.set(
+                f"Страница {self._archive_page + 1} из {pages} "
+                f"({len(self._archive_rows_cache)} файлов)",
+            )
+        else:
+            self._archive_page_var.set("")
 
     def _reload_table(self) -> None:
         category = self.category_var.get()
@@ -1646,7 +1741,6 @@ class App(Tk):
             except Exception:
                 pass
             self._archive_render_after = None
-        self.tree.delete(*self.tree.get_children())
         total_size = 0
         rows_data = []
         for r in rows:
@@ -1661,7 +1755,11 @@ class App(Tk):
                 human_size(r["size"] or 0),
             ))
             total_size += r["size"] or 0
-        self._render_archive_rows_incremental(rows_data, 0)
+        self._archive_rows_cache = rows_data
+        pages = self._archive_total_pages()
+        if self._archive_page >= pages:
+            self._archive_page = max(0, pages - 1)
+        self._archive_render_page()
         self.status_var.set(
             f"Показано: {len(rows)} файлов · {human_size(total_size)} · "
             f"всего в индексе: {self.index.count()}{self._status_suffix()}"
@@ -1733,17 +1831,51 @@ class App(Tk):
             messagebox.showwarning("Сжатие", "Выберите файлы или папки в архиве.")
             return
         level = self.settings.compression_level
-        if not messagebox.askyesno(
-            "Сжать в ZIP",
-            f"Упаковать {len(paths)} элемент(ов) в ZIP?\n"
-            f"Уровень: {compression_level_label(level)}.\n\n"
-            "Исходные файлы будут удалены после упаковки.",
-        ):
+        delete_default = self.settings.delete_originals_after_zip
+        confirm = Toplevel(self)
+        confirm.title("Сжать в ZIP")
+        confirm.geometry("420x200")
+        confirm.transient(self)
+        confirm.grab_set()
+        Label(
+            confirm,
+            text=(
+                f"Упаковать {len(paths)} элемент(ов) в ZIP?\n"
+                f"Уровень: {compression_level_label(level)}."
+            ),
+            justify="left", anchor="w",
+        ).pack(fill=X, padx=16, pady=(16, 8))
+        delete_var = BooleanVar(value=delete_default)
+        ttk.Checkbutton(
+            confirm,
+            text="Удалить исходные файлы после успешного сжатия",
+            variable=delete_var,
+        ).pack(anchor="w", padx=16)
+        choice = {"ok": False}
+
+        def accept():
+            choice["ok"] = True
+            confirm.destroy()
+
+        def cancel():
+            confirm.destroy()
+
+        btns = Frame(confirm)
+        btns.pack(fill=X, padx=16, pady=12)
+        ttk.Button(btns, text="Отмена", command=cancel).pack(side=RIGHT)
+        ttk.Button(btns, text="Сжать", style="Accent.TButton", command=accept).pack(side=RIGHT, padx=(0, 8))
+        confirm.protocol("WM_DELETE_WINDOW", cancel)
+        self.wait_window(confirm)
+        if not choice["ok"]:
             self._end_task()
             return
+        delete_after = delete_var.get()
+
         def work():
             ok = fail = 0
             failed_items: list[str] = []
+            original_bytes = 0
+            zip_bytes = 0
             for i, raw in enumerate(paths, start=1):
                 name = Path(raw).name
                 self.after(
@@ -1754,29 +1886,50 @@ class App(Tk):
                 )
                 p = Path(raw)
                 try:
+                    orig_size = source_bytes(p)
                     zip_path = zip_item(p, level=level)
-                    remove_source(p)
-                    self.index.remove_by_path(str(p))
+                    zsize = zip_path.stat().st_size
+                    original_bytes += orig_size
+                    zip_bytes += zsize
+                    if delete_after:
+                        remove_source(p)
+                        self.index.remove_by_path(str(p))
                     ts = zip_path.stat().st_mtime
                     dt = datetime.fromtimestamp(ts)
                     self.index.add_file(
                         name=zip_path.name, path=str(zip_path), source_path=str(p),
                         category=self.settings.category_for_extension(".zip"),
-                        extension=".zip", size=zip_path.stat().st_size,
+                        extension=".zip", size=zsize,
                         added_ts=ts, year=dt.year, month=dt.month, kind="file",
                     )
                     ok += 1
                 except Exception:
                     fail += 1
                     failed_items.append(p.name)
-            self.after(0, lambda: self._after_archive_compress(ok, fail, len(paths), failed_items))
+            self.after(
+                0,
+                lambda: self._after_archive_compress(
+                    ok, fail, len(paths), failed_items, original_bytes, zip_bytes,
+                ),
+            )
             self.after(0, self._end_task)
         threading.Thread(target=work, daemon=True).start()
 
-    def _after_archive_compress(self, ok: int, fail: int, total: int, failed_items: list[str]) -> None:
+    def _after_archive_compress(
+        self,
+        ok: int,
+        fail: int,
+        total: int,
+        failed_items: list[str],
+        original_bytes: int = 0,
+        zip_bytes: int = 0,
+    ) -> None:
         self._reload_table()
         self._refresh_filters()
-        msg = self._format_operation_summary(action="Создано архивов", total=total, ok=ok, fail=fail)
+        msg = format_zip_result(
+            ok=ok, fail=fail, total=total,
+            original_bytes=original_bytes, zip_bytes=zip_bytes,
+        )
         if failed_items:
             preview = "\n".join(f"• {name}" for name in failed_items[:8])
             more = f"\n…и ещё {len(failed_items) - 8}" if len(failed_items) > 8 else ""
@@ -2050,22 +2203,14 @@ class App(Tk):
         if not plan:
             messagebox.showinfo("Умная уборка", "Кандидаты не найдены.")
             return
-        total_size = sum(int(i.get("size") or 0) for i in plan)
-        by_reason: dict[str, int] = {}
-        preview_lines: list[str] = []
-        for item in plan:
-            reason = item.get("reason", "Другое")
-            by_reason[reason] = by_reason.get(reason, 0) + 1
-        for reason, cnt in sorted(by_reason.items(), key=lambda x: x[0]):
-            preview_lines.append(f"• {reason}: {cnt}")
-        sample = "\n".join(f"• {i['name']} — {i['reason']}" for i in plan[:12])
-        more = f"\n…и ещё {len(plan) - 12}" if len(plan) > 12 else ""
-        msg = (
-            f"Найдено кандидатов: {len(plan)}\n"
-            f"Общий размер: {human_size(total_size)}\n\n"
-            "Категории:\n" + "\n".join(preview_lines) +
-            "\n\nПревью:\n" + sample + more +
-            "\n\nПереместить в архив как обычную сортировку?"
+        summary = summarize_cleanup_plan(plan)
+        protected = self.sorter.count_watched_protected()
+        excluded = self.settings.excluded_paths
+        msg = format_cleanup_dialog(
+            summary,
+            protected_count=protected,
+            excluded_paths=excluded,
+            sample=plan,
         )
         if not messagebox.askyesno("Умная уборка", msg):
             return
@@ -2546,6 +2691,12 @@ class App(Tk):
             canvas_frame, text="Тестовый режим (dry run, без изменений файлов)",
             variable=dry_run_var, onvalue="on", offvalue="off",
         ).pack(anchor="w", padx=28, pady=(4, 0))
+        delete_zip_var = StringVar(value="on" if self.settings.delete_originals_after_zip else "off")
+        ttk.Checkbutton(
+            canvas_frame,
+            text="Удалять исходники после ручного сжатия в ZIP (вкладка «Архив»)",
+            variable=delete_zip_var, onvalue="on", offvalue="off",
+        ).pack(anchor="w", padx=28, pady=(2, 0))
 
         Label(canvas_frame, text="Дата для папок",
               font=("Segoe UI", 11, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(14, 4))
@@ -2675,6 +2826,7 @@ class App(Tk):
             self.settings.data["compression_mode"] = compress_mode_var.get()
             self.settings.data["compression_level"] = compress_level_var.get()
             self.settings.data["dry_run"] = dry_run_var.get() == "on"
+            self.settings.data["delete_originals_after_zip"] = delete_zip_var.get() == "on"
             self.settings.data["notify_on_sort"] = notify_var.get() == "on"
             self.settings.data["dark_mode"] = dark_var.get() == "on"
             self.settings.data["large_text"] = large_text_var.get() == "on"

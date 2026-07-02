@@ -120,6 +120,8 @@ DEFAULT_SETTINGS: dict = {
     "dry_run": False,
     # Более крупный текст и элементы интерфейса
     "large_text": False,
+    # Удалять исходники после ручного сжатия в ZIP на вкладке «Архив»
+    "delete_originals_after_zip": True,
 }
 
 
@@ -176,6 +178,9 @@ class Settings:
         merged["compression_enabled"] = bool(merged.get("compression_enabled", False))
         merged["dry_run"] = bool(merged.get("dry_run", False))
         merged["large_text"] = bool(merged.get("large_text", False))
+        merged["delete_originals_after_zip"] = bool(
+            merged.get("delete_originals_after_zip", True),
+        )
         self.data = merged
 
     def save(self) -> None:
@@ -296,6 +301,10 @@ class Settings:
     @property
     def large_text(self) -> bool:
         return bool(self.data.get("large_text", False))
+
+    @property
+    def delete_originals_after_zip(self) -> bool:
+        return bool(self.data.get("delete_originals_after_zip", True))
 
     def add_excluded_path(self, path: str) -> None:
         try:

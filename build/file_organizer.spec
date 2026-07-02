@@ -34,6 +34,9 @@ hidden = [
     "organizer.watcher",
     "organizer.notify",
     "organizer.icon",
+    "organizer.cleanup_summary",
+    "organizer.win_drop",
+    "windnd",
     "fitz",
 ]
 
