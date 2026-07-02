@@ -8,6 +8,7 @@ from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Frame, Label, Text, Toplevel, 
 from . import theme
 from .preview import RichPreview, code_highlight_spans, get_rich_preview
 from .thumbs import IMAGE_EXTS, PDF_EXTS, VIDEO_EXTS, fit_preview_image, get_thumbnail
+from .video_player import VideoPlayer
 
 try:
     from PIL import ImageTk
@@ -54,11 +55,15 @@ class PreviewPanel:
         self._img_label.pack(fill=BOTH, expand=True)
         self._img_label.bind("<Double-1>", self._on_image_double_click)
 
+        self._video_player = VideoPlayer(self._img_box, max_size=(360, 320))
+        self._video_mode = False
+
         zoom_row = Frame(img_outer, bg=theme.CARD)
         zoom_row.pack(fill=X, pady=(2, 0))
         self._zoom_var = ttk.Scale(zoom_row, from_=0.5, to=2.0, orient="horizontal", command=self._on_zoom)
         self._zoom_var.set(1.0)
         self._zoom_var.pack(fill=X)
+        self._zoom_row = zoom_row
 
         doc_wrap = Frame(root, bg=theme.DOC_PAGE_BORDER, padx=1, pady=1)
         doc_wrap.pack(fill=BOTH, expand=True, pady=(4, 6))
@@ -115,6 +120,7 @@ class PreviewPanel:
         ttk.Button(self._btn_frame, text=text, command=command).pack(fill=X, pady=(2, 0))
 
     def clear(self) -> None:
+        self._stop_video()
         self._photo = None
         self._current_path = None
         self._img_label.configure(image="", text="(выберите файл)")
@@ -141,17 +147,25 @@ class PreviewPanel:
             return
 
         showed_image = False
-        if _HAS_PIL and ext in PREVIEW_EXTS:
+        showed_video = False
+        video_fallback = False
+
+        if ext in VIDEO_EXTS and VideoPlayer.is_available():
+            if self._try_show_video(path):
+                showed_video = True
+            else:
+                video_fallback = True
+
+        if not showed_video and _HAS_PIL and ext in PREVIEW_EXTS:
             try:
                 img = fit_preview_image(get_thumbnail(path, max_size=(900, 900)), (360, 320))
                 if img is not None:
-                    self._photo = ImageTk.PhotoImage(img)
-                    self._img_label.configure(image=self._photo, text="")
+                    self._show_image_preview(img)
                     showed_image = True
             except Exception:
                 showed_image = False
 
-        if not showed_image:
+        if not showed_image and not showed_video:
             if ext in IMAGE_EXTS:
                 self._show_image_placeholder("Не удалось загрузить\nизображение")
             elif ext in VIDEO_EXTS:
@@ -172,6 +186,16 @@ class PreviewPanel:
                 self._fill_doc_text("Не удалось отобразить предпросмотр этого файла.")
         elif ext in PDF_EXTS:
             self._fill_doc_text("PDF — первая страница показана выше.\nНажмите «Открыть» для полного просмотра.")
+        elif ext in VIDEO_EXTS and showed_video:
+            self._fill_doc_text(
+                "Видео — воспроизведение выше.\n"
+                "▶/⏸ — play/pause, ползунок — перемотка.",
+            )
+        elif ext in VIDEO_EXTS and video_fallback:
+            self._fill_doc_text(
+                "Видео — кодек не поддерживается встроенным плеером.\n"
+                "Показан кадр выше. Нажмите «Открыть», чтобы воспроизвести в системном плеере.",
+            )
         elif ext in VIDEO_EXTS:
             self._fill_doc_text("Видео — кадр показан выше.\nНажмите «Открыть», чтобы воспроизвести.")
         elif ext in IMAGE_EXTS and showed_image:
@@ -184,7 +208,32 @@ class PreviewPanel:
                 "Совет: откройте файл внешней программой или конвертируйте его в .txt/.pdf/.docx/.xlsx.",
             )
 
+    def _stop_video(self) -> None:
+        self._video_player.stop()
+        if self._video_mode:
+            self._video_player.pack_forget()
+            self._img_label.pack(fill=BOTH, expand=True)
+            self._video_mode = False
+            self._zoom_row.pack(fill=X, pady=(2, 0))
+
+    def _try_show_video(self, path: Path) -> bool:
+        self._stop_video()
+        if not self._video_player.load(path):
+            return False
+        self._img_label.pack_forget()
+        self._video_player.pack(fill=BOTH, expand=True)
+        self._zoom_row.pack_forget()
+        self._video_mode = True
+        self._photo = None
+        return True
+
+    def _show_image_preview(self, img) -> None:
+        self._stop_video()
+        self._photo = ImageTk.PhotoImage(img)
+        self._img_label.configure(image=self._photo, text="")
+
     def _show_image_placeholder(self, text: str) -> None:
+        self._stop_video()
         self._photo = None
         self._img_label.configure(image="", text=text or "(нет изображения)")
 
@@ -240,7 +289,7 @@ class PreviewPanel:
         self._doc_text.configure(state="disabled")
 
     def _on_zoom(self, value: str) -> None:
-        if not self._current_path or not _HAS_PIL:
+        if self._video_mode or not self._current_path or not _HAS_PIL:
             return
         try:
             self._zoom = float(value)
@@ -259,7 +308,7 @@ class PreviewPanel:
             self._img_label.configure(image=self._photo)
 
     def _on_image_double_click(self, _event=None) -> None:
-        if not self._current_path or not _HAS_PIL:
+        if self._video_mode or not self._current_path or not _HAS_PIL:
             return
         ext = self._current_path.suffix.lower()
         if ext not in PREVIEW_EXTS:
