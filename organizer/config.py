@@ -71,6 +71,8 @@ SKIP_EXTENSIONS = [".crdownload", ".part", ".tmp", ".partial", ".download", ".!u
 _VALID_SORT_MODES = frozenset({"type_date", "type_only", "date_only", "extension", "flat"})
 _VALID_STORAGE_MODES = frozenset({"move", "copy"})
 _VALID_DATE_SOURCES = frozenset({"download", "modified", "created"})
+_VALID_COMPRESSION_MODES = frozenset({"none", "zip", "zip_per_item"})
+_VALID_COMPRESSION_LEVELS = frozenset({"store", "fast", "best"})
 
 DEFAULT_SETTINGS: dict = {
     # Папки, за которыми следим и которые сортируем
@@ -110,6 +112,10 @@ DEFAULT_SETTINGS: dict = {
     "onboarding_shown": False,
     # Категории по типам
     "categories": DEFAULT_CATEGORIES,
+    # Сжатие при сортировке в архив
+    "compression_enabled": False,
+    "compression_mode": "none",
+    "compression_level": "fast",
 }
 
 
@@ -159,6 +165,11 @@ class Settings:
         except (TypeError, ValueError):
             merged["scheduled_sort_minutes"] = 0
         merged["onboarding_shown"] = bool(merged.get("onboarding_shown", False))
+        if merged.get("compression_mode") not in _VALID_COMPRESSION_MODES:
+            merged["compression_mode"] = DEFAULT_SETTINGS["compression_mode"]
+        if merged.get("compression_level") not in _VALID_COMPRESSION_LEVELS:
+            merged["compression_level"] = DEFAULT_SETTINGS["compression_level"]
+        merged["compression_enabled"] = bool(merged.get("compression_enabled", False))
         self.data = merged
 
     def save(self) -> None:
@@ -257,6 +268,20 @@ class Settings:
     @property
     def onboarding_shown(self) -> bool:
         return bool(self.data.get("onboarding_shown", False))
+
+    @property
+    def compression_enabled(self) -> bool:
+        return bool(self.data.get("compression_enabled", False))
+
+    @property
+    def compression_mode(self) -> str:
+        mode = self.data.get("compression_mode", "none")
+        return mode if mode in _VALID_COMPRESSION_MODES else "none"
+
+    @property
+    def compression_level(self) -> str:
+        level = self.data.get("compression_level", "fast")
+        return level if level in _VALID_COMPRESSION_LEVELS else "fast"
 
     def add_excluded_path(self, path: str) -> None:
         try:

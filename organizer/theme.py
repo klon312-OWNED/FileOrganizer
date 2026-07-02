@@ -19,6 +19,10 @@ _PALETTES = {
         "SIDEBAR": "#eef2ff",
         "PREVIEW_BG": "#0f172a",
         "PREVIEW_FG": "#cbd5e1",
+        "IMAGE_PREVIEW_BG": "#f5f5f5",
+        "DOC_PAGE_BG": "#ffffff",
+        "DOC_PAGE_FG": "#1a1a1a",
+        "DOC_PAGE_BORDER": "#e2e8f0",
         "ROW_ALT": "#f8fafc",
         "HISTORY_MOVE": "#dbeafe",
         "HISTORY_COPY": "#d1fae5",
@@ -43,6 +47,10 @@ _PALETTES = {
         "SIDEBAR": "#1e293b",
         "PREVIEW_BG": "#020617",
         "PREVIEW_FG": "#cbd5e1",
+        "IMAGE_PREVIEW_BG": "#f5f5f5",
+        "DOC_PAGE_BG": "#ffffff",
+        "DOC_PAGE_FG": "#1a1a1a",
+        "DOC_PAGE_BORDER": "#cbd5e1",
         "ROW_ALT": "#1e293b",
         "HISTORY_MOVE": "#1e3a5f",
         "HISTORY_COPY": "#134e4a",
@@ -71,6 +79,10 @@ BORDER = _PALETTES["light"]["BORDER"]
 SIDEBAR = _PALETTES["light"]["SIDEBAR"]
 PREVIEW_BG = _PALETTES["light"]["PREVIEW_BG"]
 PREVIEW_FG = _PALETTES["light"]["PREVIEW_FG"]
+IMAGE_PREVIEW_BG = _PALETTES["light"]["IMAGE_PREVIEW_BG"]
+DOC_PAGE_BG = _PALETTES["light"]["DOC_PAGE_BG"]
+DOC_PAGE_FG = _PALETTES["light"]["DOC_PAGE_FG"]
+DOC_PAGE_BORDER = _PALETTES["light"]["DOC_PAGE_BORDER"]
 ROW_ALT = _PALETTES["light"]["ROW_ALT"]
 HISTORY_MOVE = _PALETTES["light"]["HISTORY_MOVE"]
 HISTORY_COPY = _PALETTES["light"]["HISTORY_COPY"]
@@ -85,6 +97,7 @@ DESKTOP_MUTED = _PALETTES["light"]["DESKTOP_MUTED"]
 def _activate_palette(name: str) -> None:
     global _current, BG, CARD, HEADER, HEADER_FG, ACCENT, ACCENT_HOVER
     global SUCCESS, TEXT, TEXT_MUTED, BORDER, SIDEBAR, PREVIEW_BG, PREVIEW_FG
+    global IMAGE_PREVIEW_BG, DOC_PAGE_BG, DOC_PAGE_FG, DOC_PAGE_BORDER
     global ROW_ALT, HISTORY_MOVE, HISTORY_COPY, DESKTOP_TILE, DESKTOP_TILE_SEL
     global DESKTOP_TILE_BORDER, DESKTOP_TILE_SEL_BORDER, DESKTOP_ICON_BG, DESKTOP_MUTED
     _current = name
@@ -102,6 +115,10 @@ def _activate_palette(name: str) -> None:
     SIDEBAR = p["SIDEBAR"]
     PREVIEW_BG = p["PREVIEW_BG"]
     PREVIEW_FG = p["PREVIEW_FG"]
+    IMAGE_PREVIEW_BG = p["IMAGE_PREVIEW_BG"]
+    DOC_PAGE_BG = p["DOC_PAGE_BG"]
+    DOC_PAGE_FG = p["DOC_PAGE_FG"]
+    DOC_PAGE_BORDER = p["DOC_PAGE_BORDER"]
     ROW_ALT = p["ROW_ALT"]
     HISTORY_MOVE = p["HISTORY_MOVE"]
     HISTORY_COPY = p["HISTORY_COPY"]

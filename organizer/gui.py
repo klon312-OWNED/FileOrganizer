@@ -18,14 +18,15 @@ from tkinter import Menu, ttk
 from .classify import classify
 from .config import OTHER_CATEGORY, Settings
 from .database import FileIndex
+from .compression import compression_level_label, compression_mode_label, remove_source, zip_item
 from .layouts import DATE_SOURCES, MONTHS_RU, SORT_MODES, STORAGE_MODES, sort_mode_label, sort_mode_preview, storage_mode_label
-from .preview import get_text_preview
+from .preview_panel import PreviewPanel
 from .scanner import Scanner, fixed_drives
 from .sorter import Sorter, SortResult
 from . import theme
 from .icon import icon_path, make_icon_image
 from .notify import show_toast
-from .thumbs import IMAGE_EXTS, VIDEO_EXTS, get_thumbnail
+from .thumbs import get_thumbnail
 from .watcher import FolderWatcher
 
 try:
@@ -46,9 +47,7 @@ try:
 except ImportError:
     _HAS_TRASH = False
 
-# что считаем медиа для предпросмотра (фото + видео)
-PREVIEW_EXTS = IMAGE_EXTS | VIDEO_EXTS
-
+# что считаем медиа для предпросмотра (фото + видео) — см. preview_panel.PREVIEW_EXTS
 MONTH_NAMES = {0: "Все месяцы", **{k: v.split("-")[1] for k, v in MONTHS_RU.items()}}
 
 # Эмодзи и цвета для типов файлов на вкладке «Рабочий стол»
@@ -210,6 +209,10 @@ class App(Tk):
             side=LEFT, padx=(8, 0),
         )
 
+        ttk.Button(toolbar, text="Сжать в ZIP", command=self._archive_compress_selected).pack(
+            side=LEFT, padx=(8, 0),
+        )
+
         self.bg_var = StringVar(value="Фон: выкл")
         self.bg_btn = ttk.Button(toolbar, textvariable=self.bg_var, command=self._toggle_watcher)
         self.bg_btn.pack(side=LEFT, padx=(8, 0))
@@ -281,25 +284,9 @@ class App(Tk):
         self.tree.bind("<Button-3>", self._show_context_menu)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
-        # Панель предпросмотра справа
-        preview = Frame(body, width=300, bg=theme.CARD, padx=10, pady=10,
-                        highlightbackground=theme.BORDER, highlightthickness=1)
-        preview.pack(side=RIGHT, fill=Y, padx=(8, 0))
-        preview.pack_propagate(False)
-        Label(preview, text="Предпросмотр", font=("Segoe UI", 10, "bold"),
-              bg=theme.CARD).pack(anchor="w")
-        img_box = Frame(preview, height=280, bg=theme.PREVIEW_BG)
-        img_box.pack(fill=X, pady=(6, 8))
-        img_box.pack_propagate(False)
-        self.preview_img_label = Label(img_box, text="(выберите файл)", anchor="center",
-                                       bg=theme.PREVIEW_BG, fg=theme.PREVIEW_FG)
-        self.preview_img_label.pack(fill=BOTH, expand=True)
-        self.preview_info = StringVar(value="")
-        Label(preview, textvariable=self.preview_info, justify="left", anchor="nw",
-              wraplength=280, bg=theme.CARD, fg=theme.TEXT).pack(fill=BOTH, expand=True, anchor="nw")
-        ttk.Button(preview, text="Открыть файл", command=self._open_selected).pack(fill=X, pady=(4, 2))
-        ttk.Button(preview, text="Показать в папке", command=self._reveal_selected).pack(fill=X)
-        self._preview_photo = None  # ссылка, чтобы картинку не съел сборщик мусора
+        self._archive_preview = PreviewPanel(body, width=380)
+        self._archive_preview.add_button("Открыть файл", self._open_selected)
+        self._archive_preview.add_button("Показать в папке", self._reveal_selected)
 
         self.ctx = Menu(self, tearoff=0)
 
@@ -330,6 +317,13 @@ class App(Tk):
             toolbar, text="Сортировать выбранное", style="Accent.TButton",
             command=self._desktop_sort_selected,
         ).pack(side=LEFT, padx=(16, 0))
+        self._desktop_compress_var = BooleanVar(
+            value=self.settings.compression_enabled and self.settings.compression_mode != "none",
+        )
+        ttk.Checkbutton(
+            toolbar, text="Сжимать в архив",
+            variable=self._desktop_compress_var,
+        ).pack(side=LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="Сортировать всё", command=self._sort_now).pack(side=LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="Обновить", command=self._desktop_refresh).pack(side=LEFT, padx=(8, 0))
 
@@ -685,13 +679,23 @@ class App(Tk):
             return
         skipped = len(self._desktop_selected) - len(paths)
         msg = f"Сортировать выбранное ({len(paths)} шт.)?"
+        msg += self._compression_notice(len(paths), enabled=self._desktop_compress_var.get())
         if skipped:
             msg += f"\n\n{skipped} выбранных элементов пропущено (ещё не готовы)."
         if not messagebox.askyesno("Сортировать выбранное", msg):
             return
         if not self._confirm_duplicates(paths):
             return
-        self._run_sort(paths)
+        self._run_sort(paths, compress_override=self._desktop_compress_var.get())
+
+    def _compression_notice(self, count: int, *, enabled: bool | None = None) -> str:
+        on = self.settings.compression_enabled if enabled is None else enabled
+        if not on or self.settings.compression_mode == "none" or count <= 0:
+            return ""
+        return (
+            f"\n\nСжатие: {compression_mode_label(self.settings.compression_mode)}, "
+            f"уровень — {compression_level_label(self.settings.compression_level)}."
+        )
 
     def _confirm_duplicates(self, paths: list[str]) -> bool:
         dupes = self.sorter.find_duplicates(paths)
@@ -708,15 +712,24 @@ class App(Tk):
             f"{preview}{more}\n\nПродолжить сортировку?",
         )
 
-    def _run_sort(self, paths: list[str] | None = None) -> None:
+    def _run_sort(self, paths: list[str] | None = None, *, compress_override: bool | None = None) -> None:
         self.status_var.set("Сортирую...")
         self.update_idletasks()
+        prev_enabled = self.settings.data.get("compression_enabled", False)
+        if compress_override is not None:
+            self.settings.data["compression_enabled"] = compress_override and (
+                self.settings.compression_mode != "none"
+            )
 
         def work():
-            if paths is not None:
-                result = self.sorter.sort_paths(paths)
-            else:
-                result = self.sorter.sort_all()
+            try:
+                if paths is not None:
+                    result = self.sorter.sort_paths(paths)
+                else:
+                    result = self.sorter.sort_all()
+            finally:
+                if compress_override is not None:
+                    self.settings.data["compression_enabled"] = prev_enabled
             self.after(0, lambda: self._after_sort(result))
 
         threading.Thread(target=work, daemon=True).start()
@@ -1297,41 +1310,21 @@ class App(Tk):
         self.pc_tree.bind("<Double-1>", self._pc_open)
         self.pc_tree.bind("<<TreeviewSelect>>", self._pc_on_select)
 
-        # правая панель: предпросмотр + действия
-        side = Frame(body, width=320)
-        side.pack(side=RIGHT, fill=Y, padx=(8, 0))
-        side.pack_propagate(False)
-        Label(side, text="Предпросмотр", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        pc_img_box = Frame(side, height=300, bg="#2b2b2b", relief="groove", bd=1)
-        pc_img_box.pack(fill=X, pady=(4, 6))
-        pc_img_box.pack_propagate(False)
-        self.pc_img_label = Label(pc_img_box, text="(выберите файл)", anchor="center",
-                                  bg="#2b2b2b", fg="#dddddd")
-        self.pc_img_label.pack(fill=BOTH, expand=True)
-        text_frame = Frame(side)
-        text_frame.pack(fill=BOTH, expand=True)
-        self.pc_text = Text(text_frame, wrap="word", height=8, font=("Consolas", 9))
-        tvsb = ttk.Scrollbar(text_frame, orient="vertical", command=self.pc_text.yview)
-        self.pc_text.configure(yscrollcommand=tvsb.set, state="disabled")
-        tvsb.pack(side=RIGHT, fill=Y)
-        self.pc_text.pack(side=LEFT, fill=BOTH, expand=True)
-
-        actions = Frame(side)
-        actions.pack(fill=X, pady=(8, 0))
-        ttk.Button(actions, text="Открыть", command=self._pc_open).pack(fill=X, pady=1)
-        ttk.Button(actions, text="Открыть папку с файлом", command=self._pc_reveal).pack(fill=X, pady=1)
-        ttk.Button(actions, text="Копировать в...", command=self._pc_copy).pack(fill=X, pady=1)
-        ttk.Button(actions, text="Переместить в...", command=self._pc_move).pack(fill=X, pady=1)
-        ttk.Button(actions, text="Удалить выбранные", command=self._pc_delete).pack(fill=X, pady=1)
+        self._pc_preview = PreviewPanel(body, width=360, show_meta=False)
+        self._pc_preview.add_button("Открыть", self._pc_open)
+        self._pc_preview.add_button("Открыть папку с файлом", self._pc_reveal)
+        self._pc_preview.add_button("Копировать в...", self._pc_copy)
+        self._pc_preview.add_button("Переместить в...", self._pc_move)
+        self._pc_preview.add_button("Удалить выбранные", self._pc_delete)
         Label(
-            side, justify="left", wraplength=300, fg="#555",
+            self._pc_preview.frame, justify="left", wraplength=320, fg=theme.TEXT_MUTED,
+            bg=theme.CARD,
             text=("Подсказка: красным подсвечены файлы, которые, скорее всего, "
                   "можно удалить (личное/мусор, не учёба/работа).\n"
                   "Несколько файлов: Ctrl+клик или Shift+клик, либо кнопка "
                   "«Выделить кандидатов»."),
         ).pack(fill=X, pady=(8, 0))
 
-        self._pc_photo = None
         self._pc_results: list[dict] = []
         self._pc_scanner = Scanner()
         self._pc_pending: list[dict] = []
@@ -1430,20 +1423,46 @@ class App(Tk):
             f"Размер: {human_size(row['size'] or 0)}\n\n"
             f"Путь:\n{row['path']}"
         )
-        self.preview_info.set(info)
-        self._show_preview(path, kind)
+        self._archive_preview.set_metadata(info)
+        self._archive_preview.show(path, kind=kind)
 
-    def _show_preview(self, path: Path, kind: str):
-        self._preview_photo = None
-        ext = path.suffix.lower()
-        if (_HAS_PIL and kind == "file" and ext in PREVIEW_EXTS and path.exists()):
-            img = get_thumbnail(path, max_size=(300, 290))
-            if img is not None:
-                self._preview_photo = ImageTk.PhotoImage(img)
-                self.preview_img_label.configure(image=self._preview_photo, text="")
-                return
-        label = "Папка" if kind == "dir" else "Нет предпросмотра"
-        self.preview_img_label.configure(image="", text=label)
+    def _archive_compress_selected(self) -> None:
+        paths = [p for p in self._selected_paths() if Path(p).exists()]
+        if not paths:
+            messagebox.showwarning("Сжатие", "Выберите файлы или папки в архиве.")
+            return
+        level = self.settings.compression_level
+        if not messagebox.askyesno(
+            "Сжать в ZIP",
+            f"Упаковать {len(paths)} элемент(ов) в ZIP?\n"
+            f"Уровень: {compression_level_label(level)}.\n\n"
+            "Исходные файлы будут удалены после упаковки.",
+        ):
+            return
+        ok = fail = 0
+        for raw in paths:
+            p = Path(raw)
+            try:
+                zip_path = zip_item(p, level=level)
+                remove_source(p)
+                self.index.remove_by_path(str(p))
+                ts = zip_path.stat().st_mtime
+                dt = datetime.fromtimestamp(ts)
+                self.index.add_file(
+                    name=zip_path.name, path=str(zip_path), source_path=str(p),
+                    category=self.settings.category_for_extension(".zip"),
+                    extension=".zip", size=zip_path.stat().st_size,
+                    added_ts=ts, year=dt.year, month=dt.month, kind="file",
+                )
+                ok += 1
+            except OSError:
+                fail += 1
+        self._reload_table()
+        self._refresh_filters()
+        msg = f"Создано архивов: {ok}"
+        if fail:
+            msg += f"\nОшибок: {fail}"
+        messagebox.showinfo("Сжатие", msg)
 
     # ---------- действия ----------
 
@@ -1489,9 +1508,11 @@ class App(Tk):
         open_lbl = "Открыть" if n == 1 else f"Открыть ({n})"
         folder_lbl = "Показать в папке" if n == 1 else f"Показать в папке ({n})"
         copy_lbl = "Копировать пути" if n == 1 else f"Копировать пути ({n})"
+        zip_lbl = "Сжать в ZIP" if n == 1 else f"Сжать в ZIP ({n})"
         self.ctx.add_command(label=open_lbl, command=self._open_selected)
         self.ctx.add_command(label=folder_lbl, command=self._reveal_selected)
         self.ctx.add_separator()
+        self.ctx.add_command(label=zip_lbl, command=self._archive_compress_selected)
         self.ctx.add_command(label=copy_lbl, command=self._copy_selected_paths)
 
     def _show_context_menu(self, event):
@@ -1850,36 +1871,7 @@ class App(Tk):
         item = self._pc_selected()
         if not item:
             return
-        path = Path(item["path"])
-        ext = path.suffix.lower()
-        # фото / видео-кадр
-        self._pc_photo = None
-        is_media = ext in PREVIEW_EXTS
-        if _HAS_PIL and is_media and path.exists():
-            img = get_thumbnail(path, max_size=(300, 290))
-            if img is not None:
-                self._pc_photo = ImageTk.PhotoImage(img)
-                self.pc_img_label.configure(image=self._pc_photo, text="")
-            else:
-                self.pc_img_label.configure(
-                    image="", text="Не удалось показать\n(откройте файл)")
-        else:
-            self.pc_img_label.configure(image="", text="(нет изображения)")
-        # текст / Word / Excel
-        text = get_text_preview(path)
-        self.pc_text.configure(state="normal")
-        self.pc_text.delete("1.0", END)
-        if text:
-            self.pc_text.insert("1.0", text)
-        elif ext in VIDEO_EXTS:
-            self.pc_text.insert("1.0", "Видео — кадр показан выше. "
-                                       "Нажмите «Открыть», чтобы воспроизвести.")
-        elif ext in IMAGE_EXTS:
-            self.pc_text.insert("1.0", "Изображение — см. предпросмотр выше.")
-        else:
-            self.pc_text.insert("1.0", "Предпросмотр для этого типа недоступен.\n"
-                                       "Нажмите «Открыть», чтобы посмотреть файл.")
-        self.pc_text.configure(state="disabled")
+        self._pc_preview.show(Path(item["path"]), kind="file")
 
     def _pc_open(self, *_):
         item = self._pc_selected()
@@ -1964,7 +1956,7 @@ class App(Tk):
     def _open_settings(self):
         win = Toplevel(self)
         win.title("Настройки сортировки")
-        win.geometry("720x820")
+        win.geometry("720x900")
         win.configure(bg=theme.BG)
         win.transient(self)
         win.grab_set()
@@ -2003,6 +1995,32 @@ class App(Tk):
                 canvas_frame, text=label, variable=storage_var, value=key,
                 bg=theme.BG, anchor="w", padx=20,
             ).pack(fill=X)
+
+        Label(canvas_frame, text="Сжатие в архив",
+              font=("Segoe UI", 11, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(14, 4))
+        compress_var = StringVar(value="on" if self.settings.compression_enabled else "off")
+        ttk.Checkbutton(
+            canvas_frame, text="Сжимать при сортировке",
+            variable=compress_var, onvalue="on", offvalue="off",
+        ).pack(anchor="w", padx=16)
+        compress_mode_var = StringVar(value=self.settings.compression_mode)
+        for key in ("none", "zip", "zip_per_item"):
+            Radiobutton(
+                canvas_frame,
+                text=compression_mode_label(key),
+                variable=compress_mode_var, value=key,
+                bg=theme.BG, anchor="w", padx=28,
+            ).pack(fill=X)
+        compress_level_var = StringVar(value=self.settings.compression_level)
+        level_frame = Frame(canvas_frame, bg=theme.BG)
+        level_frame.pack(fill=X, padx=28, pady=(2, 0))
+        Label(level_frame, text="Уровень:", bg=theme.BG).pack(side=LEFT)
+        for key in ("store", "fast", "best"):
+            Radiobutton(
+                level_frame, text=compression_level_label(key),
+                variable=compress_level_var, value=key,
+                bg=theme.BG, anchor="w",
+            ).pack(side=LEFT, padx=(8, 0))
 
         Label(canvas_frame, text="Дата для папок",
               font=("Segoe UI", 11, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(14, 4))
@@ -2122,6 +2140,9 @@ class App(Tk):
             self.settings.data["archive_location"] = loc_var.get().strip()
             self.settings.data["archive_name"] = name_var.get().strip() or "Архив"
             self.settings.data["sort_folders"] = sort_folders_var.get() == "on"
+            self.settings.data["compression_enabled"] = compress_var.get() == "on"
+            self.settings.data["compression_mode"] = compress_mode_var.get()
+            self.settings.data["compression_level"] = compress_level_var.get()
             self.settings.data["notify_on_sort"] = notify_var.get() == "on"
             self.settings.data["dark_mode"] = dark_var.get() == "on"
             self.settings.data["close_to_tray"] = tray_var.get() == "on"

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from .compression import remove_source, zip_group, zip_item
 from .config import APP_DIR, FOLDER_CATEGORY, SKIP_EXTENSIONS, Settings, app_install_root
 from .database import FileIndex
 from .layouts import dest_directory, infer_index_fields
@@ -35,6 +36,80 @@ class Sorter:
         self.index = index
         self.current_batch: str | None = None
         self._batch_count = 0
+        self._batch_zip_queue: list[Path] = []
+
+    def _should_compress(self) -> bool:
+        return (
+            self.settings.compression_enabled
+            and self.settings.compression_mode != "none"
+        )
+
+    def _compress_after_move(self, target: Path) -> Path:
+        """Сжать перемещённый элемент, если включено в настройках."""
+        if not self._should_compress():
+            return target
+        mode = self.settings.compression_mode
+        level = self.settings.compression_level
+        if mode == "zip_per_item":
+            try:
+                zip_path = zip_item(target, level=level)
+                remove_source(target)
+                self.index.remove_by_path(str(target))
+                return zip_path
+            except OSError:
+                return target
+        if mode == "zip":
+            self._batch_zip_queue.append(target)
+        return target
+
+    def _finish_batch_zip(self) -> None:
+        if not self._batch_zip_queue or self.settings.compression_mode != "zip":
+            self._batch_zip_queue.clear()
+            return
+        level = self.settings.compression_level
+        by_parent: dict[Path, list[Path]] = {}
+        for target in self._batch_zip_queue:
+            by_parent.setdefault(target.parent, []).append(target)
+        self._batch_zip_queue.clear()
+        batch = self.current_batch or "archive"
+        for parent, items in by_parent.items():
+            if not items:
+                continue
+            try:
+                zip_name = parent / f"{batch}.zip"
+                zip_path = zip_group(items, zip_name, level=level)
+            except OSError:
+                continue
+            for item in items:
+                try:
+                    remove_source(item)
+                    self.index.remove_by_path(str(item))
+                except OSError:
+                    pass
+            try:
+                size = zip_path.stat().st_size
+            except OSError:
+                size = 0
+            ts = time.time()
+            self.index.add_file(
+                name=zip_path.name, path=str(zip_path), source_path="",
+                category=self.settings.category_for_extension(".zip"),
+                extension=".zip", size=size, added_ts=ts,
+                year=datetime.fromtimestamp(ts).year,
+                month=datetime.fromtimestamp(ts).month,
+                kind="file",
+            )
+
+    def compression_summary(self, count: int) -> str:
+        if not self._should_compress() or count <= 0:
+            return ""
+        mode = self.settings.compression_mode
+        level = self.settings.compression_level
+        from .compression import compression_level_label, compression_mode_label
+        return (
+            f"\n\nСжатие: {compression_mode_label(mode)}, "
+            f"уровень — {compression_level_label(level)}."
+        )
 
     def _record_move(
         self, src: str, dst: str, kind: str, ts: float,
@@ -219,13 +294,26 @@ class Sorter:
                 result.add_error(str(path), err or "не удалось переместить")
             return None
 
+        final = self._compress_after_move(target)
+        if final != target:
+            target = final
+
         src_str = str(path)
+        final_ext = target.suffix.lower()
+        final_category = (
+            self.settings.category_for_extension(final_ext)
+            if final_ext else category
+        )
         self.index.add_file(
             name=target.name, path=str(target), source_path=src_str,
-            category=category, extension=ext, size=target.stat().st_size,
+            category=final_category, extension=final_ext or ext,
+            size=target.stat().st_size,
             added_ts=ts, year=year, month=month, kind="file",
         )
-        self._record_move(src_str, str(target), "file", ts, category=category, name=target.name)
+        self._record_move(
+            src_str, str(target), "file", ts,
+            category=final_category, name=target.name,
+        )
         return target
 
     def sort_directory(self, dir_path: str | Path, result: SortResult | None = None) -> Path | None:
@@ -250,14 +338,21 @@ class Sorter:
                 result.add_error(str(path), err or "не удалось переместить")
             return None
 
+        final = self._compress_after_move(target)
+        if final != target:
+            target = final
+            size = target.stat().st_size if target.is_file() else self._folder_size(target)
+
         src_str = str(path)
+        kind = "dir" if target.is_dir() else "file"
+        ext = "" if target.is_dir() else target.suffix.lower()
         self.index.add_file(
             name=target.name, path=str(target), source_path=src_str,
-            category=FOLDER_CATEGORY, extension="", size=size,
-            added_ts=ts, year=year, month=month, kind="dir",
+            category=FOLDER_CATEGORY, extension=ext, size=size,
+            added_ts=ts, year=year, month=month, kind=kind,
         )
         self._record_move(
-            src_str, str(target), "dir", ts,
+            src_str, str(target), kind, ts,
             category=FOLDER_CATEGORY, name=target.name,
         )
         return target
@@ -360,6 +455,7 @@ class Sorter:
         batch = f"{prefix}-{datetime.now():%Y%m%d-%H%M%S}-{time.time():.0f}"
         self.current_batch = batch
         self._batch_count = 0
+        self._batch_zip_queue = []
         self.index.start_batch(
             batch=batch,
             sort_mode=self.settings.sort_mode,
@@ -369,6 +465,7 @@ class Sorter:
         try:
             yield
         finally:
+            self._finish_batch_zip()
             if self._batch_count > 0:
                 self.index.finish_batch(batch, self._batch_count)
             else:

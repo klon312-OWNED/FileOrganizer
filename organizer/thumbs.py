@@ -43,7 +43,7 @@ def is_previewable_media(ext: str) -> bool:
 def _image_thumb(path: Path, max_size):
     img = Image.open(path)
     img = img.convert("RGB")
-    img.thumbnail(max_size)
+    img.thumbnail(max_size, Image.Resampling.LANCZOS)
     return img
 
 
@@ -67,7 +67,7 @@ def _video_thumb(path: Path, max_size):
             return None
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(frame)
-        img.thumbnail(max_size)
+        img.thumbnail(max_size, Image.Resampling.LANCZOS)
         _draw_play_icon(img)
         return img
     finally:
@@ -104,3 +104,19 @@ def get_thumbnail(path: str | Path, max_size=(360, 300)):
     except Exception:
         return None
     return None
+
+
+def fit_preview_image(img, box_size: tuple[int, int], *, bg: str = "#f5f5f5"):
+    """Вписать изображение в рамку (contain) на светлом фоне, без обрезки."""
+    if not _HAS_PIL or img is None:
+        return None
+    from PIL import Image
+
+    max_w, max_h = box_size
+    src = img.copy()
+    src.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (max_w, max_h), bg)
+    x = (max_w - src.width) // 2
+    y = (max_h - src.height) // 2
+    canvas.paste(src, (x, y))
+    return canvas
