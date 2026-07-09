@@ -157,6 +157,43 @@ class TestLLMFallback(unittest.TestCase):
                 assistant = create_assistant(Settings())
             self.assertIsInstance(assistant, RulesAssistant)
 
+    def test_llm_history_passed_to_chat(self):
+        from organizer.ai_assistant import LLMAssistant
+        from organizer.config import Settings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(
+                json.dumps({"ai_provider": "openai", "ai_api_key": "k"}),
+                encoding="utf-8",
+            )
+            with mock.patch("organizer.config.SETTINGS_PATH", settings_path):
+                settings = Settings()
+            assistant = LLMAssistant(settings)
+            captured: list = []
+
+            def fake_chat(system, user, history=None):
+                captured.append(history)
+                return json.dumps({
+                    "action": "search",
+                    "categories": ["Документы"],
+                    "extensions": [".pdf"],
+                    "month": 5,
+                    "year": None,
+                    "min_size": None,
+                    "max_size": None,
+                    "name_contains": "",
+                    "source": "all",
+                    "delete_candidates": False,
+                })
+
+            hist = [{"role": "user", "content": "ищи документы"}, {"role": "assistant", "content": "ок"}]
+            with mock.patch.object(assistant, "_chat", side_effect=fake_chat):
+                intent = assistant.parse_user_query("те же за май", history=hist)
+            self.assertEqual(captured[0], hist)
+            self.assertIn(".pdf", intent.extensions)
+            self.assertEqual(intent.month, 5)
+
 
 class TestAISettings(unittest.TestCase):
     def test_ai_settings_loaded(self):
@@ -177,6 +214,51 @@ class TestAISettings(unittest.TestCase):
             self.assertEqual(s.ai_provider, "ollama")
             self.assertEqual(s.ai_ollama_model, "mistral")
             self.assertEqual(s.ai_api_key, "secret")
+
+
+class TestRulesFollowUpAndSuggestions(unittest.TestCase):
+    def test_follow_up_merges_previous_query(self):
+        from organizer.ai_assistant import RulesAssistant
+
+        hist = [{"role": "user", "content": "найди все pdf"}, {"role": "assistant", "content": "ок"}]
+        intent = RulesAssistant().parse_user_query("за май", history=hist)
+        self.assertIn(".pdf", intent.extensions)
+        self.assertEqual(intent.month, 5)
+
+    def test_large_and_screenshot_suggestions(self):
+        from organizer.ai_assistant import RulesAssistant
+        from organizer.config import Settings
+
+        index = mock.MagicMock()
+        index.count.return_value = 0
+        index.total_size.return_value = 0
+        index.stats_by_category.return_value = []
+        entries = [
+            {
+                "path": "/dl/big.iso",
+                "name": "big.iso",
+                "sortable": True,
+                "excluded": False,
+                "folder": "/Downloads",
+                "size": 600 * 1024 * 1024,
+                "mtime": 1,
+                "category": "Другое",
+            },
+            {
+                "path": "/dl/Screenshot 1.png",
+                "name": "Screenshot 1.png",
+                "sortable": True,
+                "excluded": False,
+                "folder": "/Desktop",
+                "size": 200_000,
+                "mtime": 1,
+                "category": "Картинки",
+            },
+        ]
+        suggestions = RulesAssistant().generate_suggestions(Settings(), index, entries)
+        ids = {s.id for s in suggestions}
+        self.assertIn("large_files", ids)
+        self.assertIn("screenshots", ids)
 
 
 if __name__ == "__main__":

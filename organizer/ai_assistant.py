@@ -50,6 +50,7 @@ _SIZE_PATTERNS = [
 
 _LARGE_WORDS = ("больш", "крупн", "тяжёл", "тяжел", "large", "big", "huge")
 _SMALL_WORDS = ("маленьк", "мелк", "small", "tiny")
+_STALE_DAYS = 180
 
 
 @dataclass
@@ -100,8 +101,23 @@ def human_size(num: int) -> str:
 class RulesAssistant:
     """Локальный помощник без сети — ключевые слова и эвристики."""
 
-    def parse_user_query(self, text: str) -> SearchIntent:
+    def parse_user_query(
+        self,
+        text: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> SearchIntent:
         q = text.strip()
+        # Короткие уточнения («только pdf», «за 2024») — подмешиваем прошлый запрос
+        if history and len(q.split()) <= 5:
+            prev_user = next(
+                (m["content"] for m in reversed(history) if m.get("role") == "user"),
+                "",
+            )
+            low_q = q.lower()
+            if prev_user and not any(
+                w in low_q for w in ("найд", "покаж", "что ", "как ", "удал", "совет", "подсказ")
+            ):
+                q = f"{prev_user} {q}"
         low = q.lower()
         intent = SearchIntent(raw_query=q)
 
@@ -167,9 +183,27 @@ class RulesAssistant:
             stop = {
                 "найди", "найти", "покажи", "показать", "все", "всех", "за", "из",
                 "большие", "большой", "маленькие", "файлы", "файл", "в", "на",
-                "май", "июнь", "июль", "архиве", "рабочем", "столе",
+                "май", "июнь", "июль", "архиве", "рабочем", "столе", "можно",
+                "какие", "который", "которые", "пожалуйста", "мне", "есть",
+                "больше", "меньше", "года", "году", "месяц", "месяца",
             }
-            tokens = [t for t in re.split(r"\s+", low) if t and t not in stop and len(t) > 2]
+            # Не брать в name токены, уже распознанные как категории/размеры/годы
+            skip_parts = set()
+            for keys in _CATEGORY_KEYWORDS.values():
+                skip_parts.update(keys)
+            skip_parts.update(_LARGE_WORDS)
+            skip_parts.update(_SMALL_WORDS)
+            tokens = []
+            for t in re.split(r"\s+", low):
+                if not t or t in stop or len(t) <= 2:
+                    continue
+                if any(t.startswith(p) or p in t for p in skip_parts if len(p) >= 3):
+                    continue
+                if re.fullmatch(r"20\d{2}", t):
+                    continue
+                if re.fullmatch(r"\d+(?:[.,]\d+)?(?:гб|мб|кб|gb|mb|kb)?", t):
+                    continue
+                tokens.append(t)
             if tokens and not intent.categories and not intent.extensions:
                 intent.name_contains = " ".join(tokens[:4])
 
@@ -361,15 +395,17 @@ class RulesAssistant:
             dup_names.setdefault(base, []).append(e)
         dups = [g for g in dup_names.values() if len(g) > 1]
         if dups:
+            sample = dups[0][0]["name"]
+            stem = Path(sample).stem
             suggestions.append(Suggestion(
                 id="review_duplicates",
                 title=f"Похожие дубликаты: {len(dups)} групп",
                 description=(
-                    "Есть файлы с похожими именами (копии). "
+                    f"Есть файлы с похожими именами (напр. «{sample}»). "
                     "Проверьте перед сортировкой или удалением."
                 ),
                 action="search",
-                payload={"query": "похоже на дубликат"},
+                payload={"query": f"найди «{stem}»"},
                 priority=40,
             ))
 
@@ -383,6 +419,77 @@ class RulesAssistant:
                 priority=20,
             ))
 
+        # Крупные файлы на рабочем столе / в загрузках
+        large = [
+            e for e in sortable
+            if int(e.get("size", 0)) >= 500 * 1024 * 1024
+        ]
+        if large:
+            lsz = sum(int(e.get("size", 0)) for e in large)
+            suggestions.append(Suggestion(
+                id="large_files",
+                title=f"Крупные файлы: {len(large)} (≥500 МБ)",
+                description=(
+                    f"Суммарно {human_size(lsz)}. Имеет смысл отсортировать "
+                    "или сжать, чтобы освободить место в отслеживаемых папках."
+                ),
+                action="sort_paths",
+                payload={"paths": [e["path"] for e in large[:30]]},
+                priority=75,
+            ))
+
+        # Старые файлы в отслеживаемых
+        now = time.time()
+        old_files = [
+            e for e in sortable
+            if e.get("mtime") and (now - float(e["mtime"])) > _STALE_DAYS * 86400
+        ]
+        if len(old_files) >= 5:
+            suggestions.append(Suggestion(
+                id="old_files",
+                title=f"Старые файлы: {len(old_files)} (> {_STALE_DAYS} дн.)",
+                description=(
+                    "Давно не менялись. Можно разложить по дате в архиве "
+                    "или проверить на удаление."
+                ),
+                action="sort_paths",
+                payload={"paths": [e["path"] for e in old_files[:40]]},
+                priority=55,
+            ))
+
+        # Скриншоты / снимки экрана
+        screens = [
+            e for e in sortable
+            if re.search(r"screenshot|снимок\s*экрана|screen\s*shot", e.get("name", ""), re.I)
+        ]
+        if screens:
+            suggestions.append(Suggestion(
+                id="screenshots",
+                title=f"Скриншоты: {len(screens)}",
+                description=(
+                    "Найдены снимки экрана. Обычно их удобно сложить в «Картинки» "
+                    "или удалить ненужные."
+                ),
+                action="sort_paths",
+                payload={"paths": [e["path"] for e in screens[:40]]},
+                priority=60,
+            ))
+
+        # Много файлов без категории / «Другое»
+        other = [e for e in sortable if e.get("category") in (OTHER_CATEGORY, "", None)]
+        if len(other) >= 8:
+            suggestions.append(Suggestion(
+                id="uncategorized",
+                title=f"Без категории: {len(other)}",
+                description=(
+                    "Много файлов попадут в «Другое». Добавьте правила расширений "
+                    "в настройках или отсортируйте вручную."
+                ),
+                action="sort_paths",
+                payload={"paths": [e["path"] for e in other[:40]]},
+                priority=35,
+            ))
+
         if not suggestions:
             suggestions.append(Suggestion(
                 id="all_good",
@@ -394,7 +501,7 @@ class RulesAssistant:
             ))
 
         suggestions.sort(key=lambda s: s.priority, reverse=True)
-        return suggestions
+        return suggestions[:8]
 
     def _matches_intent_row(self, intent: SearchIntent, row) -> bool:
         if intent.categories and row["category"] not in intent.categories:
@@ -451,16 +558,20 @@ class LLMAssistant:
         p = self.settings.ai_provider
         return p if p in ("rules", "openai", "ollama") else "rules"
 
-    def parse_user_query(self, text: str) -> SearchIntent:
+    def parse_user_query(
+        self,
+        text: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> SearchIntent:
         if self.provider == "rules":
-            return self.rules.parse_user_query(text)
+            return self.rules.parse_user_query(text, history=history)
         try:
-            parsed = self._llm_parse(text)
+            parsed = self._llm_parse(text, history=history)
             if parsed:
                 return parsed
         except Exception:
             pass
-        return self.rules.parse_user_query(text)
+        return self.rules.parse_user_query(text, history=history)
 
     def generate_suggestions(
         self,
@@ -506,16 +617,20 @@ class LLMAssistant:
             "desktop_by_category": _count_by(watched_entries, "category"),
         }
 
-    def _llm_parse(self, text: str) -> SearchIntent | None:
+    def _llm_parse(
+        self,
+        text: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> SearchIntent | None:
         system = (
             "Ты парсер запросов файлового менеджера. Верни ТОЛЬКО JSON без markdown: "
             '{"action":"search|suggest","categories":[],"extensions":[],"month":null,'
             '"year":null,"min_size":null,"max_size":null,"name_contains":"","source":"all|archive|desktop",'
             '"delete_candidates":false}. '
             "categories — из: Картинки, Видео, Музыка, Документы, Архивы, Программы, Код, Папки. "
-            "sizes в байтах."
+            "sizes в байтах. Учитывай краткий контекст предыдущих сообщений, если он есть."
         )
-        raw = self._chat(system, text)
+        raw = self._chat(system, text, history=history)
         if not raw:
             return None
         data = _extract_json(raw)
@@ -569,22 +684,44 @@ class LLMAssistant:
             ))
         return [s for s in out if s.title]
 
-    def _chat(self, system: str, user: str) -> str | None:
+    def _chat(
+        self,
+        system: str,
+        user: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> str | None:
+        messages = self._build_messages(system, user, history)
         if self.provider == "ollama":
-            return self._ollama_chat(system, user)
-        return self._openai_chat(system, user)
+            return self._ollama_chat(messages)
+        return self._openai_chat(messages)
 
-    def _openai_chat(self, system: str, user: str) -> str | None:
+    @staticmethod
+    def _build_messages(
+        system: str,
+        user: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+        if history:
+            # Текущий запрос уже в `user` — не дублируем последнюю user-реплику
+            prior = history[:-1] if history and history[-1].get("role") == "user" else history
+            for item in prior[-8:]:
+                role = item.get("role")
+                content = (item.get("content") or "").strip()
+                content = re.sub(r"^(Вы|Помощник|Система|Ошибка):\s*", "", content)
+                if role in ("user", "assistant") and content:
+                    messages.append({"role": role, "content": content[:800]})
+        messages.append({"role": "user", "content": user})
+        return messages
+
+    def _openai_chat(self, messages: list[dict[str, str]]) -> str | None:
         key = self.settings.ai_api_key.strip()
         if not key:
             return None
         url = self.settings.ai_base_url.rstrip("/") + "/chat/completions"
         body = json.dumps({
             "model": self.settings.ai_model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": messages,
             "temperature": 0.2,
         }).encode("utf-8")
         req = urllib.request.Request(
@@ -601,14 +738,11 @@ class LLMAssistant:
             return None
         return choices[0].get("message", {}).get("content")
 
-    def _ollama_chat(self, system: str, user: str) -> str | None:
+    def _ollama_chat(self, messages: list[dict[str, str]]) -> str | None:
         url = self.settings.ai_ollama_url.rstrip("/") + "/api/chat"
         body = json.dumps({
             "model": self.settings.ai_ollama_model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": messages,
             "stream": False,
         }).encode("utf-8")
         req = urllib.request.Request(
@@ -653,8 +787,12 @@ def create_assistant(settings: Settings) -> RulesAssistant | LLMAssistant:
     return RulesAssistant()
 
 
-def parse_user_query(text: str, settings: Settings) -> SearchIntent:
-    return create_assistant(settings).parse_user_query(text)
+def parse_user_query(
+    text: str,
+    settings: Settings,
+    history: list[dict[str, str]] | None = None,
+) -> SearchIntent:
+    return create_assistant(settings).parse_user_query(text, history=history)
 
 
 def generate_suggestions(

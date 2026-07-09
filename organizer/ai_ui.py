@@ -351,6 +351,20 @@ class AIAssistantPanel(Frame):
             ).pack(fill=X, pady=(2, 4))
             btns = Frame(card, bg=theme.SIDEBAR)
             btns.pack(fill=X)
+            paths = list((sug.payload or {}).get("paths") or [])
+            if paths:
+                ttk.Button(
+                    btns, text="Сорт.", width=6,
+                    command=lambda p=paths: self._confirm_sort(p),
+                ).pack(side=LEFT, padx=(0, 2))
+                ttk.Button(
+                    btns, text="Откр.", width=6,
+                    command=lambda p=paths[0]: self._on_open(p),
+                ).pack(side=LEFT, padx=(0, 2))
+                ttk.Button(
+                    btns, text="Искл.", width=6,
+                    command=lambda p=paths: self._confirm_exclude(p),
+                ).pack(side=LEFT, padx=(0, 2))
             ttk.Button(
                 btns, text="Применить",
                 command=lambda s=sug: self._apply_suggestion(s),
@@ -378,18 +392,12 @@ class AIAssistantPanel(Frame):
             ).pack(side=LEFT, fill=X, expand=True)
             ttk.Button(row, text="Откр.", width=5, command=lambda p=res.path: self._on_open(p)).pack(side=RIGHT, padx=1)
             ttk.Button(row, text="Сорт.", width=5, command=lambda p=res.path: self._confirm_sort([p])).pack(side=RIGHT, padx=1)
-            ttk.Button(row, text="⊘", width=3, command=lambda p=res.path: self._confirm_exclude([p])).pack(side=RIGHT)
+            ttk.Button(row, text="Искл.", width=5, command=lambda p=res.path: self._confirm_exclude([p])).pack(side=RIGHT)
 
     def _confirm_sort(self, paths: list[str]) -> None:
-        n = len(paths)
-        names = ", ".join(Path(p).name for p in paths[:3])
-        extra = f" и ещё {n - 3}" if n > 3 else ""
-        if not messagebox.askyesno(
-            "Сортировка",
-            f"Отсортировать {n} элемент(ов)?\n{names}{extra}",
-        ):
-            return
-        self._on_sort(paths)
+        # Подтверждение сортировки — в gui._desktop_sort_paths
+        if paths:
+            self._on_sort(paths)
 
     def _confirm_exclude(self, paths: list[str]) -> None:
         if not messagebox.askyesno(
