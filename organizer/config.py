@@ -73,6 +73,7 @@ _VALID_STORAGE_MODES = frozenset({"move", "copy"})
 _VALID_DATE_SOURCES = frozenset({"download", "modified", "created"})
 _VALID_COMPRESSION_MODES = frozenset({"none", "zip", "zip_per_item"})
 _VALID_COMPRESSION_LEVELS = frozenset({"store", "fast", "best"})
+_VALID_AI_PROVIDERS = frozenset({"rules", "openai", "ollama"})
 
 DEFAULT_SETTINGS: dict = {
     # Папки, за которыми следим и которые сортируем
@@ -126,6 +127,13 @@ DEFAULT_SETTINGS: dict = {
     "window_geometry": "",
     # Последний уровень масштаба предпросмотра (0.5–2.0)
     "preview_zoom": 1.0,
+    # ИИ-помощник: rules (локально) | openai | ollama
+    "ai_provider": "rules",
+    "ai_api_key": "",
+    "ai_base_url": "https://api.openai.com/v1",
+    "ai_model": "gpt-4o-mini",
+    "ai_ollama_url": "http://localhost:11434",
+    "ai_ollama_model": "llama3.2",
 }
 
 
@@ -191,6 +199,17 @@ class Settings:
             merged["preview_zoom"] = 1.0
         geo = merged.get("window_geometry")
         merged["window_geometry"] = str(geo) if geo else ""
+        if merged.get("ai_provider") not in _VALID_AI_PROVIDERS:
+            merged["ai_provider"] = DEFAULT_SETTINGS["ai_provider"]
+        merged["ai_api_key"] = str(merged.get("ai_api_key") or "")
+        merged["ai_base_url"] = str(merged.get("ai_base_url") or DEFAULT_SETTINGS["ai_base_url"])
+        merged["ai_model"] = str(merged.get("ai_model") or DEFAULT_SETTINGS["ai_model"])
+        merged["ai_ollama_url"] = str(
+            merged.get("ai_ollama_url") or DEFAULT_SETTINGS["ai_ollama_url"],
+        )
+        merged["ai_ollama_model"] = str(
+            merged.get("ai_ollama_model") or DEFAULT_SETTINGS["ai_ollama_model"],
+        )
         self.data = merged
 
     def save(self) -> None:
@@ -265,7 +284,7 @@ class Settings:
     @property
     def last_tab(self) -> int:
         try:
-            return max(0, min(4, int(self.data.get("last_tab", 0))))
+            return max(0, min(5, int(self.data.get("last_tab", 0))))
         except (TypeError, ValueError):
             return 0
 
@@ -326,6 +345,33 @@ class Settings:
             return max(0.5, min(2.0, float(self.data.get("preview_zoom", 1.0))))
         except (TypeError, ValueError):
             return 1.0
+
+    @property
+    def ai_provider(self) -> str:
+        p = self.data.get("ai_provider", "rules")
+        return p if p in _VALID_AI_PROVIDERS else "rules"
+
+    @property
+    def ai_api_key(self) -> str:
+        return str(self.data.get("ai_api_key") or "")
+
+    @property
+    def ai_base_url(self) -> str:
+        return str(self.data.get("ai_base_url") or DEFAULT_SETTINGS["ai_base_url"])
+
+    @property
+    def ai_model(self) -> str:
+        return str(self.data.get("ai_model") or DEFAULT_SETTINGS["ai_model"])
+
+    @property
+    def ai_ollama_url(self) -> str:
+        return str(self.data.get("ai_ollama_url") or DEFAULT_SETTINGS["ai_ollama_url"])
+
+    @property
+    def ai_ollama_model(self) -> str:
+        return str(
+            self.data.get("ai_ollama_model") or DEFAULT_SETTINGS["ai_ollama_model"],
+        )
 
     def add_excluded_path(self, path: str) -> None:
         try:

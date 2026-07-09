@@ -34,6 +34,7 @@ from .notify import SortNotifyBatcher, show_toast
 from .thumbs import get_thumbnail
 from .watcher import FolderWatcher
 from .win_drop import bind_file_drop
+from .ai_ui import AIAssistantPanel
 
 try:
     import pystray
@@ -272,11 +273,13 @@ class App(Tk):
         tab_stats = Frame(nb, bg=theme.BG)
         tab_history = Frame(nb, bg=theme.BG)
         tab_pc = Frame(nb, bg=theme.BG)
+        tab_ai = Frame(nb, bg=theme.BG)
         nb.add(tab_archive, text="  Архив  ")
         nb.add(tab_desktop, text="  Рабочий стол  ")
         nb.add(tab_stats, text="  Статистика  ")
         nb.add(tab_history, text="  История  ")
         nb.add(tab_pc, text="  Поиск по ПК  ")
+        nb.add(tab_ai, text="  ИИ-помощник  ")
         nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         self._build_archive_tab(tab_archive)
@@ -284,6 +287,7 @@ class App(Tk):
         self._build_stats_tab(tab_stats)
         self._build_history_tab(tab_history)
         self._build_pc_tab(tab_pc)
+        self._build_ai_tab(tab_ai)
 
     def _build_archive_tab(self, root) -> None:
         toolbar = Frame(root, padx=4, pady=8, bg=theme.BG)
@@ -1767,6 +1771,122 @@ class App(Tk):
         self._pc_pending: list[dict] = []
         self._pc_scan_thread = None
 
+    # ---------- вкладка «ИИ-помощник» ----------
+
+    def _build_ai_tab(self, root) -> None:
+        self._ai_panel = AIAssistantPanel(
+            root,
+            get_settings=lambda: self.settings,
+            get_index=lambda: self.index,
+            get_watched_entries=lambda: self.sorter.list_watched_entries(),
+            on_open_path=open_path,
+            on_sort_paths=self._desktop_sort_paths,
+            on_exclude_paths=lambda paths: self._desktop_set_excluded(paths, True),
+            on_smart_cleanup=self._smart_cleanup,
+            on_set_sort_mode=self._ai_apply_sort_mode,
+            on_enable_compression=self._ai_enable_compression,
+            on_show_desktop=self._ai_show_desktop_tab,
+            on_open_settings=self._open_ai_settings,
+        )
+        self._ai_panel.pack(fill=BOTH, expand=True)
+
+    def _ai_apply_sort_mode(self, mode: str) -> None:
+        if mode not in SORT_MODES:
+            return
+        self.settings.data["sort_mode"] = mode
+        self.settings.save()
+        self._update_mode_banner()
+        messagebox.showinfo(
+            "ИИ-помощник",
+            f"Режим сортировки изменён на: {sort_mode_label(mode)}",
+        )
+
+    def _ai_enable_compression(self) -> None:
+        self.settings.data["compression_enabled"] = True
+        if self.settings.compression_mode == "none":
+            self.settings.data["compression_mode"] = "zip"
+        self.settings.save()
+        self._update_mode_banner()
+        messagebox.showinfo("ИИ-помощник", "Сжатие при сортировке включено.")
+
+    def _ai_show_desktop_tab(self) -> None:
+        self._notebook.select(1)
+
+    def _open_ai_settings(self) -> None:
+        from tkinter import Radiobutton
+
+        win = Toplevel(self)
+        win.title("Настройки ИИ-помощника")
+        win.geometry("520x420")
+        win.configure(bg=theme.BG)
+        win.transient(self)
+        win.grab_set()
+
+        Label(
+            win,
+            text="Провайдер ИИ",
+            font=("Segoe UI", 11, "bold"),
+            bg=theme.BG,
+        ).pack(anchor="w", padx=16, pady=(14, 4))
+
+        provider_var = StringVar(value=self.settings.ai_provider)
+        for key, label in (
+            ("rules", "Локальные правила (по умолчанию, без сети)"),
+            ("openai", "OpenAI-совместимый API"),
+            ("ollama", "Ollama (локальный LLM)"),
+        ):
+            Radiobutton(
+                win, text=label, variable=provider_var, value=key,
+                bg=theme.BG, anchor="w", padx=20,
+            ).pack(fill=X)
+
+        warn = Label(
+            win,
+            text="⚠ API-ключ хранится в ~/.file_organizer/settings.json в открытом виде. Не делитесь этим файлом.",
+            fg="#b45309", bg=theme.BG, wraplength=460, justify="left", padx=16, pady=8,
+        )
+        warn.pack(fill=X)
+
+        api_frame = Frame(win, bg=theme.BG)
+        api_frame.pack(fill=X, padx=16, pady=4)
+        Label(api_frame, text="API-ключ:", bg=theme.BG).pack(anchor="w")
+        key_var = StringVar(value=self.settings.ai_api_key)
+        ttk.Entry(api_frame, textvariable=key_var, show="*").pack(fill=X, pady=(2, 6))
+        Label(api_frame, text="Base URL:", bg=theme.BG).pack(anchor="w")
+        url_var = StringVar(value=self.settings.ai_base_url)
+        ttk.Entry(api_frame, textvariable=url_var).pack(fill=X, pady=(2, 6))
+        Label(api_frame, text="Модель:", bg=theme.BG).pack(anchor="w")
+        model_var = StringVar(value=self.settings.ai_model)
+        ttk.Entry(api_frame, textvariable=model_var).pack(fill=X, pady=(2, 6))
+
+        ollama_frame = Frame(win, bg=theme.BG)
+        ollama_frame.pack(fill=X, padx=16, pady=4)
+        Label(ollama_frame, text="Ollama URL:", bg=theme.BG).pack(anchor="w")
+        ollama_url_var = StringVar(value=self.settings.ai_ollama_url)
+        ttk.Entry(ollama_frame, textvariable=ollama_url_var).pack(fill=X, pady=(2, 6))
+        Label(ollama_frame, text="Ollama модель:", bg=theme.BG).pack(anchor="w")
+        ollama_model_var = StringVar(value=self.settings.ai_ollama_model)
+        ttk.Entry(ollama_frame, textvariable=ollama_model_var).pack(fill=X, pady=(2, 6))
+
+        btns = Frame(win, bg=theme.BG)
+        btns.pack(fill=X, padx=16, pady=12)
+
+        def save():
+            self.settings.data["ai_provider"] = provider_var.get()
+            self.settings.data["ai_api_key"] = key_var.get().strip()
+            self.settings.data["ai_base_url"] = url_var.get().strip() or "https://api.openai.com/v1"
+            self.settings.data["ai_model"] = model_var.get().strip() or "gpt-4o-mini"
+            self.settings.data["ai_ollama_url"] = ollama_url_var.get().strip() or "http://localhost:11434"
+            self.settings.data["ai_ollama_model"] = ollama_model_var.get().strip() or "llama3.2"
+            self.settings.save()
+            if hasattr(self, "_ai_panel"):
+                self._ai_panel.refresh()
+            messagebox.showinfo("Сохранено", "Настройки ИИ-помощника сохранены.")
+            win.destroy()
+
+        ttk.Button(btns, text="Сохранить", style="Accent.TButton", command=save).pack(side=RIGHT)
+        ttk.Button(btns, text="Отмена", command=win.destroy).pack(side=RIGHT, padx=(0, 8))
+
     # ---------- данные / фильтры ----------
 
     def _refresh_filters(self) -> None:
@@ -2990,6 +3110,8 @@ class App(Tk):
             self.settings.save()
             if idx == 2 and hasattr(self, "_stats_tree"):
                 self._reload_stats()
+            if idx == 5 and hasattr(self, "_ai_panel"):
+                self._ai_panel.refresh()
         except Exception:
             pass
 
