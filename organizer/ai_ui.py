@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Frame, Label, StringVar, Text, messagebox
 from tkinter import ttk
-from pathlib import Path
 from typing import Callable
 
 from . import theme
@@ -16,9 +16,10 @@ from .ai_assistant import (
     create_assistant,
     generate_suggestions,
     human_size,
-    parse_user_query,
     search_files,
 )
+
+_MAX_HISTORY = 12  # пар user/assistant в сессии
 
 
 class AIAssistantPanel(Frame):
@@ -53,6 +54,7 @@ class AIAssistantPanel(Frame):
         self._on_desktop = on_show_desktop
         self._on_settings = on_open_settings
         self._busy = False
+        self._history: list[dict[str, str]] = []
         self._build()
 
     def _build(self) -> None:
@@ -68,6 +70,7 @@ class AIAssistantPanel(Frame):
             fg=theme.TEXT_MUTED, font=("Segoe UI", 9),
         ).pack(side=LEFT, padx=(12, 0))
         ttk.Button(top, text="Обновить советы", command=self._load_suggestions).pack(side=RIGHT)
+        ttk.Button(top, text="Очистить чат", command=self._clear_chat).pack(side=RIGHT, padx=(0, 8))
         ttk.Button(top, text="Настройки ИИ", command=self._on_settings).pack(side=RIGHT, padx=(0, 8))
 
         disclaimer = Label(
@@ -119,24 +122,34 @@ class AIAssistantPanel(Frame):
             right, bg=theme.CARD, highlightbackground=theme.BORDER, highlightthickness=1,
         )
         sug_wrap.pack(side="top", fill=BOTH, expand=True, pady=(4, 6))
-        self._suggestions_frame = Frame(sug_wrap, bg=theme.CARD)
-        self._suggestions_frame.pack(fill=BOTH, expand=True, padx=4, pady=4)
-        sug_vsb = ttk.Scrollbar(sug_wrap, command=self._scroll_suggestions)
+        sug_vsb = ttk.Scrollbar(sug_wrap)
         sug_vsb.pack(side=RIGHT, fill=Y)
-        self._sug_canvas = ttk.Canvas(sug_wrap, highlightthickness=0)
+        self._sug_canvas = ttk.Canvas(sug_wrap, highlightthickness=0, bg=theme.CARD)
         self._sug_canvas.pack(side=LEFT, fill=BOTH, expand=True)
-        self._sug_inner = Frame(self._sug_canvas)
+        sug_vsb.configure(command=self._sug_canvas.yview)
+        self._sug_canvas.configure(yscrollcommand=sug_vsb.set)
+        self._sug_inner = Frame(self._sug_canvas, bg=theme.CARD)
         self._sug_window = self._sug_canvas.create_window((0, 0), window=self._sug_inner, anchor="nw")
         self._sug_inner.bind("<Configure>", self._on_sug_configure)
         self._sug_canvas.bind("<Configure>", self._on_sug_canvas_configure)
+        self._sug_canvas.bind("<Enter>", lambda _e: self._bind_sug_wheel(True))
+        self._sug_canvas.bind("<Leave>", lambda _e: self._bind_sug_wheel(False))
 
         Label(right, text="Результаты поиска", font=("Segoe UI", 10, "bold"), bg=theme.BG).pack(anchor="w")
         res_wrap = Frame(right, bg=theme.CARD, highlightbackground=theme.BORDER, highlightthickness=1)
         res_wrap.pack(side="top", fill=BOTH, expand=True, pady=(4, 0))
-        self._results_frame = Frame(res_wrap, bg=theme.CARD)
-        self._results_frame.pack(fill=BOTH, expand=True, padx=4, pady=4)
         res_vsb = ttk.Scrollbar(res_wrap)
         res_vsb.pack(side=RIGHT, fill=Y)
+        self._res_canvas = ttk.Canvas(res_wrap, highlightthickness=0, bg=theme.CARD)
+        self._res_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        res_vsb.configure(command=self._res_canvas.yview)
+        self._res_canvas.configure(yscrollcommand=res_vsb.set)
+        self._results_frame = Frame(self._res_canvas, bg=theme.CARD)
+        self._res_window = self._res_canvas.create_window((0, 0), window=self._results_frame, anchor="nw")
+        self._results_frame.bind("<Configure>", self._on_res_configure)
+        self._res_canvas.bind("<Configure>", self._on_res_canvas_configure)
+        self._res_canvas.bind("<Enter>", lambda _e: self._bind_res_wheel(True))
+        self._res_canvas.bind("<Leave>", lambda _e: self._bind_res_wheel(False))
 
         self._status_var = StringVar(value="Готов")
         Label(self, textvariable=self._status_var, bg=theme.SIDEBAR, fg=theme.TEXT_MUTED, anchor="w", padx=8, pady=4).pack(
@@ -144,7 +157,12 @@ class AIAssistantPanel(Frame):
         )
 
         self._update_provider_label()
-        self._append_chat("Система", "Привет! Спросите, например: «найди все pdf за май» или «что сортировать сейчас?»")
+        self._append_chat(
+            "Система",
+            "Привет! Спросите, например: «найди все pdf за май» или «что сортировать сейчас?» "
+            "История диалога сохраняется до закрытия окна.",
+            to_history=False,
+        )
         self.after(200, self._load_suggestions)
 
     def _on_sug_configure(self, _event=None) -> None:
@@ -153,26 +171,66 @@ class AIAssistantPanel(Frame):
     def _on_sug_canvas_configure(self, event) -> None:
         self._sug_canvas.itemconfig(self._sug_window, width=event.width)
 
-    def _scroll_suggestions(self, *args) -> None:
-        self._sug_canvas.yview(*args)
+    def _on_res_configure(self, _event=None) -> None:
+        self._res_canvas.configure(scrollregion=self._res_canvas.bbox("all"))
+
+    def _on_res_canvas_configure(self, event) -> None:
+        self._res_canvas.itemconfig(self._res_window, width=event.width)
+
+    def _bind_sug_wheel(self, on: bool) -> None:
+        if on:
+            self._sug_canvas.bind_all("<MouseWheel>", self._on_sug_wheel)
+        else:
+            self._sug_canvas.unbind_all("<MouseWheel>")
+
+    def _bind_res_wheel(self, on: bool) -> None:
+        if on:
+            self._res_canvas.bind_all("<MouseWheel>", self._on_res_wheel)
+        else:
+            self._res_canvas.unbind_all("<MouseWheel>")
+
+    def _on_sug_wheel(self, event) -> None:
+        self._sug_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_res_wheel(self, event) -> None:
+        self._res_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def refresh(self) -> None:
         self._update_provider_label()
 
     def _update_provider_label(self) -> None:
         s = self._get_settings()
+        hist = f" · история: {len(self._history) // 2}" if self._history else ""
         labels = {
             "rules": "режим: локальные правила (без сети)",
             "openai": f"режим: API ({s.ai_model})",
             "ollama": f"режим: Ollama ({s.ai_ollama_model})",
         }
-        self._provider_var.set(labels.get(s.ai_provider, labels["rules"]))
+        self._provider_var.set(labels.get(s.ai_provider, labels["rules"]) + hist)
 
-    def _append_chat(self, who: str, text: str) -> None:
+    def _append_chat(self, who: str, text: str, *, to_history: bool = True) -> None:
         self._chat.configure(state="normal")
         self._chat.insert(END, f"\n{who}: {text}\n")
         self._chat.see(END)
         self._chat.configure(state="disabled")
+        if to_history and who in ("Вы", "Помощник"):
+            role = "user" if who == "Вы" else "assistant"
+            self._history.append({"role": role, "content": text})
+            if len(self._history) > _MAX_HISTORY * 2:
+                self._history = self._history[-_MAX_HISTORY * 2 :]
+            self._update_provider_label()
+
+    def _clear_chat(self) -> None:
+        self._history.clear()
+        self._chat.configure(state="normal")
+        self._chat.delete("1.0", END)
+        self._chat.configure(state="disabled")
+        self._append_chat(
+            "Система",
+            "История очищена. Задайте новый вопрос.",
+            to_history=False,
+        )
+        self._update_provider_label()
 
     def _set_busy(self, busy: bool, msg: str = "") -> None:
         self._busy = busy
@@ -200,13 +258,16 @@ class AIAssistantPanel(Frame):
         self._input.delete("1.0", END)
         self._append_chat("Вы", text)
         self._set_busy(True, "Думаю…")
-        threading.Thread(target=self._process_query, args=(text,), daemon=True).start()
+        history_snapshot = list(self._history[:-1])  # без только что добавленного user
+        threading.Thread(
+            target=self._process_query, args=(text, history_snapshot), daemon=True,
+        ).start()
 
-    def _process_query(self, text: str) -> None:
+    def _process_query(self, text: str, history: list[dict[str, str]]) -> None:
         try:
             settings = self._get_settings()
             assistant = create_assistant(settings)
-            intent = assistant.parse_user_query(text)
+            intent = assistant.parse_user_query(text, history=history)
             if intent.action == "suggest":
                 suggestions = assistant.generate_suggestions(
                     settings, self._get_index(), self._get_watched(),
@@ -223,7 +284,7 @@ class AIAssistantPanel(Frame):
                 self.after(0, lambda: self._show_results(results))
             self.after(0, lambda: self._append_chat("Помощник", msg))
         except Exception as exc:
-            self.after(0, lambda: self._append_chat("Ошибка", str(exc)))
+            self.after(0, lambda: self._append_chat("Ошибка", str(exc), to_history=False))
         finally:
             self.after(0, lambda: self._set_busy(False, "Готов"))
 
@@ -233,8 +294,17 @@ class AIAssistantPanel(Frame):
             parts.append(f"категории: {', '.join(intent.categories)}")
         if intent.month:
             parts.append(f"месяц: {intent.month}")
+        if intent.year:
+            parts.append(f"год: {intent.year}")
         if intent.min_size:
             parts.append(f"от {human_size(intent.min_size)}")
+        if intent.max_size:
+            parts.append(f"до {human_size(intent.max_size)}")
+        if intent.name_contains:
+            parts.append(f"имя содержит «{intent.name_contains}»")
+        if results:
+            top = ", ".join(r.name for r in results[:3])
+            parts.append(f"например: {top}")
         return ". ".join(parts) + "."
 
     def _load_suggestions(self) -> None:
@@ -263,12 +333,17 @@ class AIAssistantPanel(Frame):
 
     def _show_suggestions(self, suggestions: list[Suggestion]) -> None:
         self._clear_frame(self._sug_inner)
+        if not suggestions:
+            Label(
+                self._sug_inner, text="Нет советов", bg=theme.CARD, fg=theme.TEXT_MUTED,
+            ).pack(pady=8)
+            return
         for sug in suggestions:
             card = Frame(
                 self._sug_inner, bg=theme.SIDEBAR, padx=8, pady=6,
                 highlightbackground=theme.BORDER, highlightthickness=1,
             )
-            card.pack(fill=X, pady=4)
+            card.pack(fill=X, pady=4, padx=4)
             Label(card, text=sug.title, font=("Segoe UI", 9, "bold"), bg=theme.SIDEBAR, anchor="w").pack(fill=X)
             Label(
                 card, text=sug.description, font=("Segoe UI", 8),
@@ -291,7 +366,7 @@ class AIAssistantPanel(Frame):
             return
         for res in results[:40]:
             row = Frame(self._results_frame, bg=theme.CARD)
-            row.pack(fill=X, pady=2)
+            row.pack(fill=X, pady=2, padx=2)
             meta = f"{res.name} · {human_size(res.size)}"
             if res.category:
                 meta += f" · {res.category}"
@@ -302,8 +377,27 @@ class AIAssistantPanel(Frame):
                 anchor="w", wraplength=300, justify="left",
             ).pack(side=LEFT, fill=X, expand=True)
             ttk.Button(row, text="Откр.", width=5, command=lambda p=res.path: self._on_open(p)).pack(side=RIGHT, padx=1)
-            ttk.Button(row, text="Сорт.", width=5, command=lambda p=res.path: self._on_sort([p])).pack(side=RIGHT, padx=1)
-            ttk.Button(row, text="⊘", width=3, command=lambda p=res.path: self._on_exclude([p])).pack(side=RIGHT)
+            ttk.Button(row, text="Сорт.", width=5, command=lambda p=res.path: self._confirm_sort([p])).pack(side=RIGHT, padx=1)
+            ttk.Button(row, text="⊘", width=3, command=lambda p=res.path: self._confirm_exclude([p])).pack(side=RIGHT)
+
+    def _confirm_sort(self, paths: list[str]) -> None:
+        n = len(paths)
+        names = ", ".join(Path(p).name for p in paths[:3])
+        extra = f" и ещё {n - 3}" if n > 3 else ""
+        if not messagebox.askyesno(
+            "Сортировка",
+            f"Отсортировать {n} элемент(ов)?\n{names}{extra}",
+        ):
+            return
+        self._on_sort(paths)
+
+    def _confirm_exclude(self, paths: list[str]) -> None:
+        if not messagebox.askyesno(
+            "Исключить",
+            f"Исключить из сортировки {len(paths)} элемент(ов)?",
+        ):
+            return
+        self._on_exclude(paths)
 
     def _apply_suggestion(self, sug: Suggestion) -> None:
         action = sug.action
@@ -311,13 +405,20 @@ class AIAssistantPanel(Frame):
         if action == "sort_paths":
             paths = payload.get("paths") or []
             if paths:
-                self._on_sort(paths)
+                self._confirm_sort(paths)
         elif action == "set_sort_mode":
             mode = payload.get("sort_mode")
-            if mode:
+            if mode and messagebox.askyesno(
+                "Режим сортировки",
+                f"Изменить режим сортировки?\n\n{sug.description}",
+            ):
                 self._on_sort_mode(mode)
         elif action == "enable_compression":
-            self._on_compress()
+            if messagebox.askyesno(
+                "Сжатие",
+                f"Включить сжатие при сортировке?\n\n{sug.description}",
+            ):
+                self._on_compress()
         elif action == "smart_cleanup":
             self._on_cleanup()
         elif action == "show_desktop":
