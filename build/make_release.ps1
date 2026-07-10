@@ -29,9 +29,11 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 )
 
 $zipLen = (Get-Item $SetupZip).Length
-if ($zipLen -lt 1MB) {
-    throw "Setup ZIP too small ($zipLen bytes) — packaging failed: $SetupZip"
+$minBytes = 1MB
+if ($zipLen -lt $minBytes) {
+    throw ("Setup ZIP too small ({0} bytes) - packaging failed: {1}" -f $zipLen, $SetupZip)
 }
 
+$mb = [math]::Round($zipLen / 1MB, 1)
 Write-Host ""
-Write-Host "Setup ZIP: $SetupZip ($([math]::Round($zipLen / 1MB, 1)) MB)"
+Write-Host ("Setup ZIP: {0} ({1} MB)" -f $SetupZip, $mb)

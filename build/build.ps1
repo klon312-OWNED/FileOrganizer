@@ -38,11 +38,13 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
     $true
 )
 $zipLen = (Get-Item $ZipPath).Length
-if ($zipLen -lt 1MB) {
-    throw "Portable ZIP too small ($zipLen bytes) — packaging failed: $ZipPath"
+$minBytes = 1MB
+if ($zipLen -lt $minBytes) {
+    throw ("Portable ZIP too small ({0} bytes) - packaging failed: {1}" -f $zipLen, $ZipPath)
 }
 
+$mb = [math]::Round($zipLen / 1MB, 1)
 Write-Host ""
 Write-Host "Done:"
 Write-Host "  $DistDir"
-Write-Host "  $ZipPath ($([math]::Round($zipLen / 1MB, 1)) MB)"
+Write-Host ("  {0} ({1} MB)" -f $ZipPath, $mb)
