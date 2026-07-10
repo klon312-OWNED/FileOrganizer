@@ -23,7 +23,6 @@ from .ai_assistant import (
     generate_suggestions,
     human_size,
     search_files,
-    storage_stats_summary,
 )
 
 _MAX_HISTORY = 12  # пар user/assistant в сессии
