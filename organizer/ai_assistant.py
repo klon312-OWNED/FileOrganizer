@@ -72,6 +72,7 @@ class SearchIntent:
     older_than_days: int | None = None
     duplicates_only: bool = False
     installers_only: bool = False
+    empty_only: bool = False
 
 
 @dataclass
@@ -103,6 +104,7 @@ QUICK_QUERIES = (
     "файлы за неделю",
     "установщики",
     "дубликаты",
+    "пустые файлы",
     "что сортировать сейчас?",
     "какие файлы можно удалить?",
 )
@@ -125,6 +127,8 @@ def format_intent_summary(intent: SearchIntent) -> str:
         parts.append("похожие дубликаты")
     if intent.installers_only:
         parts.append("установщики")
+    if intent.empty_only:
+        parts.append("пустые (0 байт)")
     if intent.categories:
         parts.append(", ".join(intent.categories))
     if intent.extensions:
@@ -203,6 +207,11 @@ class RulesAssistant:
             if "Программы" not in intent.categories:
                 intent.categories.append("Программы")
 
+        if any(w in low for w in ("пуст", "empty", "нулев", "0 байт", "0 байтов", "zero-byte")):
+            intent.empty_only = True
+            intent.action = "search"
+            intent.max_size = 0
+
         for cat, keys in _CATEGORY_KEYWORDS.items():
             if any(k in low for k in keys):
                 if cat not in intent.categories:
@@ -237,6 +246,8 @@ class RulesAssistant:
             intent.newer_than_days = 7
         elif any(w in low for w in ("за месяц", "за 30 дн")):
             intent.newer_than_days = 30
+        elif any(w in low for w in ("за год", "за 365", "за двенадцать мес")):
+            intent.newer_than_days = 365
         else:
             m_new = re.search(r"за\s+(\d+)\s*(дн|день|дня|дней)", low)
             if m_new:
@@ -382,6 +393,9 @@ class RulesAssistant:
 
         if intent.duplicates_only:
             results = self._filter_duplicate_results(results)
+
+        if intent.empty_only:
+            results = [r for r in results if int(r.size or 0) == 0]
 
         results.sort(key=lambda r: r.size, reverse=True)
         return results[:200]
@@ -648,6 +662,21 @@ class RulesAssistant:
                 priority=60,
             ))
 
+        # Пустые (0 байт) файлы
+        empty = [e for e in sortable if int(e.get("size", 0) or 0) == 0]
+        if empty:
+            suggestions.append(Suggestion(
+                id="empty_files",
+                title=f"Пустые файлы: {len(empty)}",
+                description=(
+                    "Файлы размером 0 байт — часто обрывки загрузок. "
+                    "Проверьте и удалите через умную уборку или исключение."
+                ),
+                action="search",
+                payload={"query": "пустые файлы", "paths": [e["path"] for e in empty[:40]]},
+                priority=58,
+            ))
+
         # Много файлов без категории / «Другое»
         other = [e for e in sortable if e.get("category") in (OTHER_CATEGORY, "", None)]
         if len(other) >= 8:
@@ -837,7 +866,7 @@ class LLMAssistant:
             '{"action":"search|suggest","categories":[],"extensions":[],"month":null,'
             '"year":null,"min_size":null,"max_size":null,"name_contains":"","source":"all|archive|desktop",'
             '"delete_candidates":false,"newer_than_days":null,"older_than_days":null,'
-            '"duplicates_only":false,"installers_only":false}. '
+            '"duplicates_only":false,"installers_only":false,"empty_only":false}. '
             "categories — из: Картинки, Видео, Музыка, Документы, Архивы, Программы, Код, Папки. "
             "sizes в байтах. Учитывай краткий контекст предыдущих сообщений, если он есть."
         )
@@ -863,6 +892,7 @@ class LLMAssistant:
             older_than_days=data.get("older_than_days"),
             duplicates_only=bool(data.get("duplicates_only")),
             installers_only=bool(data.get("installers_only")),
+            empty_only=bool(data.get("empty_only")),
         )
 
     def _llm_suggestions(

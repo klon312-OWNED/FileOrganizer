@@ -62,6 +62,20 @@ class TestWindowSettings(unittest.TestCase):
             self.assertEqual(s.preview_zoom, 2.0)
             self.assertEqual(s.window_geometry, "800x600+10+20")
 
+    def test_window_zoomed_persisted(self):
+        from organizer.config import Settings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(
+                json.dumps({"window_zoomed": True, "window_geometry": "1000x700+0+0"}),
+                encoding="utf-8",
+            )
+            with mock.patch("organizer.config.SETTINGS_PATH", settings_path):
+                s = Settings()
+            self.assertTrue(s.window_zoomed)
+            self.assertEqual(s.window_geometry, "1000x700+0+0")
+
 
 class TestVideoProbe(unittest.TestCase):
     def test_probe_missing_file(self):

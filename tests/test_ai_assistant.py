@@ -230,10 +230,15 @@ class TestRulesFollowUpAndSuggestions(unittest.TestCase):
 
         week = RulesAssistant().parse_user_query("файлы за неделю")
         self.assertEqual(week.newer_than_days, 7)
+        year = RulesAssistant().parse_user_query("файлы за год")
+        self.assertEqual(year.newer_than_days, 365)
         inst = RulesAssistant().parse_user_query("покажи установщики")
         self.assertTrue(inst.installers_only)
         dups = RulesAssistant().parse_user_query("найди дубликаты")
         self.assertTrue(dups.duplicates_only)
+        empty = RulesAssistant().parse_user_query("пустые файлы")
+        self.assertTrue(empty.empty_only)
+        self.assertEqual(empty.max_size, 0)
 
     def test_format_intent_and_savings(self):
         from organizer.ai_assistant import SearchIntent, estimate_savings, format_intent_summary
@@ -307,6 +312,43 @@ class TestRulesFollowUpAndSuggestions(unittest.TestCase):
         ids = {s.id for s in suggestions}
         self.assertIn("recent_downloads", ids)
         self.assertIn("folder_clutter", ids)
+
+    def test_empty_files_suggestion_and_search(self):
+        from organizer.ai_assistant import RulesAssistant, SearchIntent
+        from organizer.config import Settings
+
+        index = mock.MagicMock()
+        index.query.return_value = []
+        index.count.return_value = 0
+        index.total_size.return_value = 0
+        index.stats_by_category.return_value = []
+        entries = [
+            {
+                "path": "/dl/empty.txt",
+                "name": "empty.txt",
+                "sortable": True,
+                "excluded": False,
+                "folder": "/Downloads",
+                "size": 0,
+                "mtime": 1,
+                "category": "Документы",
+            },
+            {
+                "path": "/dl/full.txt",
+                "name": "full.txt",
+                "sortable": True,
+                "excluded": False,
+                "folder": "/Downloads",
+                "size": 100,
+                "mtime": 1,
+                "category": "Документы",
+            },
+        ]
+        suggestions = RulesAssistant().generate_suggestions(Settings(), index, entries)
+        self.assertIn("empty_files", {s.id for s in suggestions})
+        intent = SearchIntent(empty_only=True, max_size=0)
+        results = RulesAssistant().search(intent, index=index, watched_entries=entries)
+        self.assertEqual([r.name for r in results], ["empty.txt"])
 
 
 class TestLLMConnection(unittest.TestCase):

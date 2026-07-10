@@ -135,6 +135,11 @@ class App(Tk):
                 self.geometry(saved_geo)
             except Exception:
                 pass
+        if self.settings.window_zoomed:
+            try:
+                self.after(50, lambda: self.state("zoomed"))
+            except Exception:
+                pass
         self.bind("<Configure>", self._on_window_configure)
 
         try:
@@ -1674,9 +1679,19 @@ class App(Tk):
         try:
             if self.state() == "iconic":
                 return
-            geo = self.geometry()
-            if geo and geo != self.settings.window_geometry:
-                self.settings.data["window_geometry"] = geo
+            zoomed = self.state() == "zoomed"
+            changed = False
+            if zoomed != self.settings.window_zoomed:
+                self.settings.data["window_zoomed"] = zoomed
+                changed = True
+            # При развёрнутом окне geometry() даёт экранный размер — не затираем
+            # нормальный размер, сохранённый до maximize.
+            if not zoomed:
+                geo = self.geometry()
+                if geo and geo != self.settings.window_geometry:
+                    self.settings.data["window_geometry"] = geo
+                    changed = True
+            if changed:
                 self.settings.save()
         except Exception:
             pass

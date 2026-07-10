@@ -58,6 +58,7 @@ class AIAssistantPanel(Frame):
         self._busy = False
         self._history: list[dict[str, str]] = []
         self._last_results: list[SearchResult] = []
+        self._active_wheel: str | None = None
         self._build()
 
     def _build(self) -> None:
@@ -73,6 +74,7 @@ class AIAssistantPanel(Frame):
             fg=theme.TEXT_MUTED, font=("Segoe UI", 9),
         ).pack(side=LEFT, padx=(12, 0))
         ttk.Button(top, text="Обновить советы", command=self._load_suggestions).pack(side=RIGHT)
+        ttk.Button(top, text="Копировать чат", command=self._copy_chat).pack(side=RIGHT, padx=(0, 8))
         ttk.Button(top, text="Очистить чат", command=self._clear_chat).pack(side=RIGHT, padx=(0, 8))
         ttk.Button(top, text="Настройки ИИ", command=self._on_settings).pack(side=RIGHT, padx=(0, 8))
 
@@ -109,7 +111,7 @@ class AIAssistantPanel(Frame):
         Label(chips, text="Быстро:", bg=theme.BG, fg=theme.TEXT_MUTED, font=("Segoe UI", 8)).pack(
             side=LEFT, padx=(0, 4),
         )
-        for q in QUICK_QUERIES[:6]:
+        for q in QUICK_QUERIES[:7]:
             short = q if len(q) <= 22 else q[:20] + "…"
             ttk.Button(
                 chips, text=short, width=max(10, len(short) + 1),
@@ -164,6 +166,10 @@ class AIAssistantPanel(Frame):
         ttk.Button(
             self._batch_frame, text="Искл. все", width=9,
             command=self._exclude_all_results,
+        ).pack(side=LEFT, padx=2)
+        ttk.Button(
+            self._batch_frame, text="Копир.", width=7,
+            command=self._copy_result_paths,
         ).pack(side=LEFT)
 
         res_wrap = Frame(right, bg=theme.CARD, highlightbackground=theme.BORDER, highlightthickness=1)
@@ -209,15 +215,26 @@ class AIAssistantPanel(Frame):
 
     def _bind_sug_wheel(self, on: bool) -> None:
         if on:
-            self._sug_canvas.bind_all("<MouseWheel>", self._on_sug_wheel)
-        else:
-            self._sug_canvas.unbind_all("<MouseWheel>")
+            self._active_wheel = "sug"
+            self.bind_all("<MouseWheel>", self._on_active_wheel)
+        elif self._active_wheel == "sug":
+            self.unbind_all("<MouseWheel>")
+            self._active_wheel = None
 
     def _bind_res_wheel(self, on: bool) -> None:
         if on:
-            self._res_canvas.bind_all("<MouseWheel>", self._on_res_wheel)
-        else:
-            self._res_canvas.unbind_all("<MouseWheel>")
+            self._active_wheel = "res"
+            self.bind_all("<MouseWheel>", self._on_active_wheel)
+        elif self._active_wheel == "res":
+            self.unbind_all("<MouseWheel>")
+            self._active_wheel = None
+
+    def _on_active_wheel(self, event) -> None:
+        delta = int(-1 * (event.delta / 120))
+        if self._active_wheel == "sug":
+            self._sug_canvas.yview_scroll(delta, "units")
+        elif self._active_wheel == "res":
+            self._res_canvas.yview_scroll(delta, "units")
 
     def _on_sug_wheel(self, event) -> None:
         self._sug_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -261,6 +278,23 @@ class AIAssistantPanel(Frame):
             to_history=False,
         )
         self._update_provider_label()
+
+    def _copy_chat(self) -> None:
+        text = self._chat.get("1.0", END).strip()
+        if not text:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self._status_var.set("Чат скопирован в буфер")
+
+    def _copy_result_paths(self) -> None:
+        paths = [r.path for r in self._last_results if r.path]
+        if not paths:
+            messagebox.showinfo("ИИ-помощник", "Нет результатов для копирования.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(paths))
+        self._status_var.set(f"Скопировано путей: {len(paths)}")
 
     def _set_busy(self, busy: bool, msg: str = "") -> None:
         self._busy = busy

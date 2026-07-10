@@ -125,6 +125,8 @@ DEFAULT_SETTINGS: dict = {
     "delete_originals_after_zip": True,
     # Геометрия главного окна (WxH+X+Y), пусто — по умолчанию
     "window_geometry": "",
+    # Было ли окно развёрнуто (zoomed) при закрытии
+    "window_zoomed": False,
     # Последний уровень масштаба предпросмотра (0.5–2.0)
     "preview_zoom": 1.0,
     # ИИ-помощник: rules (локально) | openai | ollama
@@ -199,6 +201,7 @@ class Settings:
             merged["preview_zoom"] = 1.0
         geo = merged.get("window_geometry")
         merged["window_geometry"] = str(geo) if geo else ""
+        merged["window_zoomed"] = bool(merged.get("window_zoomed", False))
         if merged.get("ai_provider") not in _VALID_AI_PROVIDERS:
             merged["ai_provider"] = DEFAULT_SETTINGS["ai_provider"]
         merged["ai_api_key"] = str(merged.get("ai_api_key") or "")
@@ -338,6 +341,10 @@ class Settings:
     @property
     def window_geometry(self) -> str:
         return str(self.data.get("window_geometry") or "")
+
+    @property
+    def window_zoomed(self) -> bool:
+        return bool(self.data.get("window_zoomed", False))
 
     @property
     def preview_zoom(self) -> float:
