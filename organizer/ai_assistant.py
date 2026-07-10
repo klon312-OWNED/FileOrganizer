@@ -53,6 +53,13 @@ _SMALL_WORDS = ("маленьк", "мелк", "small", "tiny")
 _STALE_DAYS = 180
 
 
+_TEMP_EXTS = {".tmp", ".temp", ".crdownload", ".part", ".partial", ".download", ".!ut", ".bc!"}
+_TEMP_NAME_RE = re.compile(
+    r"\.(tmp|temp|crdownload|part|partial|download)$|~\$|\.!ut$|\.bc!$",
+    re.I,
+)
+
+
 @dataclass
 class SearchIntent:
     """Разобранный запрос пользователя."""
@@ -73,6 +80,22 @@ class SearchIntent:
     duplicates_only: bool = False
     installers_only: bool = False
     empty_only: bool = False
+    temp_only: bool = False
+    limit: int | None = None
+    sort_by: str = "size"  # size | date | name
+    folder_contains: str = ""
+
+
+@dataclass
+class StorageStats:
+    """Сводка по занятому месту (только метаданные)."""
+
+    archive_files: int = 0
+    archive_size: int = 0
+    desktop_sortable: int = 0
+    desktop_size: int = 0
+    archive_by_category: list[tuple[str, int, int]] = field(default_factory=list)
+    desktop_by_category: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -83,6 +106,7 @@ class SearchResult:
     size: int = 0
     source: str = ""
     reason: str = ""
+    mtime: float = 0.0
 
 
 @dataclass
@@ -105,6 +129,9 @@ QUICK_QUERIES = (
     "установщики",
     "дубликаты",
     "пустые файлы",
+    "временные файлы",
+    "топ 10 самых больших",
+    "сколько места?",
     "что сортировать сейчас?",
     "какие файлы можно удалить?",
 )
@@ -129,6 +156,8 @@ def format_intent_summary(intent: SearchIntent) -> str:
         parts.append("установщики")
     if intent.empty_only:
         parts.append("пустые (0 байт)")
+    if intent.temp_only:
+        parts.append("временные/недокачанные")
     if intent.categories:
         parts.append(", ".join(intent.categories))
     if intent.extensions:
@@ -147,9 +176,72 @@ def format_intent_summary(intent: SearchIntent) -> str:
         parts.append(f"до {human_size(intent.max_size)}")
     if intent.name_contains:
         parts.append(f"«{intent.name_contains}»")
+    if intent.limit:
+        parts.append(f"топ {intent.limit}")
+    if intent.sort_by and intent.sort_by != "size":
+        parts.append(f"сорт. по {intent.sort_by}")
     if intent.source != "all":
         parts.append("архив" if intent.source == "archive" else "отслеживаемые")
+    if intent.folder_contains:
+        parts.append(f"папка: {intent.folder_contains}")
     return ", ".join(parts) if parts else "без фильтров"
+
+
+def is_temp_name(name: str) -> bool:
+    """Временный / недокачанный файл по имени или расширению."""
+    n = (name or "").strip()
+    if not n:
+        return False
+    if Path(n).suffix.lower() in _TEMP_EXTS:
+        return True
+    return bool(_TEMP_NAME_RE.search(n))
+
+
+def compute_storage_stats(
+    index: FileIndex,
+    watched_entries: list[dict],
+) -> StorageStats:
+    """Сводка по архиву и отслеживаемым папкам."""
+    sortable = [e for e in watched_entries if e.get("sortable")]
+    desk_by_cat: dict[str, int] = {}
+    desk_size = 0
+    for e in sortable:
+        cat = str(e.get("category") or "Другое")
+        desk_by_cat[cat] = desk_by_cat.get(cat, 0) + 1
+        desk_size += int(e.get("size", 0) or 0)
+    arch_rows = index.stats_by_category()
+    arch_by_cat = [
+        (str(r["category"]), int(r["cnt"]), int(r["total_size"] or 0))
+        for r in arch_rows
+    ]
+    return StorageStats(
+        archive_files=index.count(),
+        archive_size=index.total_size(),
+        desktop_sortable=len(sortable),
+        desktop_size=desk_size,
+        archive_by_category=arch_by_cat,
+        desktop_by_category=desk_by_cat,
+    )
+
+
+def format_storage_stats(stats: StorageStats) -> str:
+    """Текстовая сводка для чата."""
+    lines = [
+        f"Архив: {stats.archive_files} файлов, {human_size(stats.archive_size)}.",
+        f"Отслеживаемые папки: {stats.desktop_sortable} элементов, "
+        f"{human_size(stats.desktop_size)}.",
+    ]
+    if stats.archive_by_category:
+        top = stats.archive_by_category[:5]
+        parts = [f"«{c}» {n} ({human_size(sz)})" for c, n, sz in top]
+        lines.append("В архиве по категориям: " + "; ".join(parts) + ".")
+    if stats.desktop_by_category:
+        top_d = sorted(
+            stats.desktop_by_category.items(), key=lambda x: x[1], reverse=True,
+        )[:5]
+        parts = [f"«{c}» {n}" for c, n in top_d]
+        lines.append("На рабочих папках: " + "; ".join(parts) + ".")
+    return " ".join(lines)
 
 
 def estimate_savings(paths_or_entries: list[Any], *, ratio: float = 0.35) -> int:
@@ -194,6 +286,12 @@ class RulesAssistant:
         if any(w in low for w in ("подсказ", "совет", "рекоменд", "что сортир", "что удал")):
             intent.action = "suggest"
 
+        if any(w in low for w in (
+            "статистик", "сколько мест", "сколько файлов", "занимает",
+            "размер архив", "место в архив", "сколько в архив",
+        )):
+            intent.action = "stats"
+
         if any(w in low for w in ("удал", "мусор", "лишн", "очист", "уборк")):
             intent.delete_candidates = True
 
@@ -211,6 +309,29 @@ class RulesAssistant:
             intent.empty_only = True
             intent.action = "search"
             intent.max_size = 0
+
+        if any(w in low for w in (
+            "временн", "недокач", "crdownload", "temp файл", "tmp файл",
+            ".tmp", ".part", "partial",
+        )):
+            intent.temp_only = True
+            intent.action = "search"
+
+        m_top = re.search(r"топ\s*(\d{1,3})", low)
+        if m_top:
+            intent.limit = max(1, min(100, int(m_top.group(1))))
+            intent.action = "search"
+        elif any(w in low for w in ("самые больш", "самый больш", "largest")):
+            intent.limit = intent.limit or 10
+            intent.sort_by = "size"
+            intent.action = "search"
+        if any(w in low for w in ("самые нов", "самый нов", "недавн", "newest", "по дате")):
+            intent.sort_by = "date"
+            intent.action = "search"
+            intent.limit = intent.limit or 20
+        elif any(w in low for w in ("по имени", "алфавит")):
+            intent.sort_by = "name"
+            intent.action = "search"
 
         for cat, keys in _CATEGORY_KEYWORDS.items():
             if any(k in low for k in keys):
@@ -285,7 +406,16 @@ class RulesAssistant:
         elif any(w in low for w in ("рабоч", "desktop", "загруз", "download", "отслеж")):
             intent.source = "desktop"
 
-        if any(w in low for w in ("найд", "покаж", "ищ", "search", "find", "где ")):
+        if "telegram" in low:
+            intent.folder_contains = "telegram"
+        elif any(w in low for w in ("загрузк", "download")):
+            intent.folder_contains = "download"
+        elif "desktop" in low or ("рабоч" in low and "стол" in low):
+            intent.folder_contains = "desktop"
+
+        if intent.action != "stats" and any(
+            w in low for w in ("найд", "покаж", "ищ", "search", "find", "где ")
+        ):
             intent.action = "search"
 
         quoted = re.findall(r"[«\"']([^»\"']+)[»\"']", q)
@@ -334,12 +464,21 @@ class RulesAssistant:
             for row in index.query():
                 if not self._matches_intent_row(intent, row):
                     continue
+                mtime = 0.0
+                try:
+                    y = int(row["year"] or 0)
+                    m = int(row["month"] or 1)
+                    if y:
+                        mtime = datetime(y, max(1, min(12, m or 1)), 15).timestamp()
+                except (ValueError, TypeError, OSError):
+                    pass
                 results.append(SearchResult(
                     path=row["path"],
                     name=row["name"],
                     category=row["category"],
                     size=int(row["size"] or 0),
                     source="archive",
+                    mtime=mtime,
                 ))
 
         if intent.source in ("all", "desktop"):
@@ -366,6 +505,7 @@ class RulesAssistant:
                     size=int(entry.get("size", 0)),
                     source="desktop",
                     reason=reason,
+                    mtime=float(entry.get("mtime", 0) or 0),
                 ))
 
         if intent.delete_candidates and intent.source != "desktop":
@@ -389,6 +529,7 @@ class RulesAssistant:
                     size=int(entry.get("size", 0)),
                     source="desktop",
                     reason=why,
+                    mtime=float(entry.get("mtime", 0) or 0),
                 ))
 
         if intent.duplicates_only:
@@ -397,20 +538,44 @@ class RulesAssistant:
         if intent.empty_only:
             results = [r for r in results if int(r.size or 0) == 0]
 
-        results.sort(key=lambda r: r.size, reverse=True)
-        return results[:200]
+        if intent.temp_only:
+            results = [r for r in results if is_temp_name(r.name)]
+
+        if intent.sort_by == "name":
+            results.sort(key=lambda r: (r.name or "").lower())
+        elif intent.sort_by == "date":
+            results.sort(key=lambda r: float(r.mtime or 0), reverse=True)
+        else:
+            results.sort(key=lambda r: r.size, reverse=True)
+
+        limit = intent.limit if intent.limit else 200
+        return results[: max(1, min(200, limit))]
 
     @staticmethod
     def _filter_duplicate_results(results: list[SearchResult]) -> list[SearchResult]:
-        """Оставить только файлы с признаками дубликата в имени или одинаковым stem."""
+        """Файлы с похожими именами или одинаковым stem+размером."""
         by_stem: dict[str, list[SearchResult]] = {}
+        by_size_stem: dict[tuple[str, int], list[SearchResult]] = {}
         for r in results:
             stem = re.sub(r"\(\d+\)", "", Path(r.name).stem.lower()).strip()
             by_stem.setdefault(stem, []).append(r)
+            if int(r.size or 0) > 0:
+                by_size_stem.setdefault((stem, int(r.size)), []).append(r)
+        seen: set[str] = set()
         out: list[SearchResult] = []
+
+        def add_group(group: list[SearchResult]) -> None:
+            for r in group:
+                if r.path not in seen:
+                    seen.add(r.path)
+                    out.append(r)
+
         for group in by_stem.values():
             if len(group) > 1 or any(_DUP_NAME_RE.search(r.name) for r in group):
-                out.extend(group)
+                add_group(group)
+        for group in by_size_stem.values():
+            if len(group) > 1:
+                add_group(group)
         return out
 
     def generate_suggestions(
@@ -677,6 +842,21 @@ class RulesAssistant:
                 priority=58,
             ))
 
+        temps = [e for e in sortable if is_temp_name(e.get("name", ""))]
+        if temps:
+            suggestions.append(Suggestion(
+                id="temp_files",
+                title=f"Временные/недокачанные: {len(temps)}",
+                description=(
+                    f".tmp / .crdownload / .part и похожие "
+                    f"({human_size(sum(int(e.get('size', 0) or 0) for e in temps))}). "
+                    "Обычно можно удалить после проверки."
+                ),
+                action="search",
+                payload={"query": "временные файлы", "paths": [e["path"] for e in temps[:40]]},
+                priority=62,
+            ))
+
         # Много файлов без категории / «Другое»
         other = [e for e in sortable if e.get("category") in (OTHER_CATEGORY, "", None)]
         if len(other) >= 8:
@@ -702,10 +882,33 @@ class RulesAssistant:
                 priority=0,
             ))
 
+        arch_size = index.total_size()
+        arch_count = index.count()
+        desk_size = sum(int(e.get("size", 0)) for e in sortable)
+        if arch_count >= 50 and arch_size > max(desk_size * 2, 500 * 1024 * 1024):
+            suggestions.append(Suggestion(
+                id="archive_review",
+                title=f"Архив: {human_size(arch_size)}",
+                description=(
+                    f"В архиве {arch_count} файлов — заметно больше, чем на рабочих папках "
+                    f"({human_size(desk_size)}). Спросите «сколько места в архиве?» "
+                    "или проверьте старые категории."
+                ),
+                action="search",
+                payload={"query": "сколько места в архиве?"},
+                priority=42,
+            ))
+
         suggestions.sort(key=lambda s: s.priority, reverse=True)
         return suggestions[:10]
 
     def _matches_intent_row(self, intent: SearchIntent, row) -> bool:
+        if intent.folder_contains:
+            hay = f"{row['path']}".lower()
+            if intent.folder_contains not in hay:
+                return False
+        if intent.temp_only and not is_temp_name(row["name"] or ""):
+            return False
         if intent.installers_only:
             ext = (row["extension"] or "").lower()
             if ext not in _INSTALLER_EXTS:
@@ -744,6 +947,12 @@ class RulesAssistant:
 
     def _matches_intent_entry(self, intent: SearchIntent, entry: dict) -> bool:
         name = entry.get("name", "")
+        if intent.folder_contains:
+            hay = f"{entry.get('folder', '')} {entry.get('path', '')}".lower()
+            if intent.folder_contains not in hay:
+                return False
+        if intent.temp_only and not is_temp_name(name):
+            return False
         if intent.installers_only:
             if Path(name).suffix.lower() not in _INSTALLER_EXTS:
                 return False
@@ -767,6 +976,14 @@ class RulesAssistant:
             return False
         if intent.name_contains and intent.name_contains not in name.lower():
             return False
+        if intent.folder_contains:
+            folder = (entry.get("folder") or "").lower()
+            needle = intent.folder_contains.lower()
+            if needle == "download":
+                if "download" not in folder and "загруз" not in folder:
+                    return False
+            elif needle not in folder:
+                return False
         if not self._matches_age(intent, float(mtime) if mtime else None):
             return False
         return True
@@ -863,10 +1080,11 @@ class LLMAssistant:
     ) -> SearchIntent | None:
         system = (
             "Ты парсер запросов файлового менеджера. Верни ТОЛЬКО JSON без markdown: "
-            '{"action":"search|suggest","categories":[],"extensions":[],"month":null,'
+            '{"action":"search|suggest|stats","categories":[],"extensions":[],"month":null,'
             '"year":null,"min_size":null,"max_size":null,"name_contains":"","source":"all|archive|desktop",'
             '"delete_candidates":false,"newer_than_days":null,"older_than_days":null,'
-            '"duplicates_only":false,"installers_only":false,"empty_only":false}. '
+            '"duplicates_only":false,"installers_only":false,"empty_only":false,'
+            '"folder_contains":""}. '
             "categories — из: Картинки, Видео, Музыка, Документы, Архивы, Программы, Код, Папки. "
             "sizes в байтах. Учитывай краткий контекст предыдущих сообщений, если он есть."
         )
@@ -893,6 +1111,7 @@ class LLMAssistant:
             duplicates_only=bool(data.get("duplicates_only")),
             installers_only=bool(data.get("installers_only")),
             empty_only=bool(data.get("empty_only")),
+            folder_contains=str(data.get("folder_contains") or ""),
         )
 
     def _llm_suggestions(
@@ -1074,3 +1293,10 @@ def search_files(
     watched_entries: list[dict],
 ) -> list[SearchResult]:
     return RulesAssistant().search(intent, index=index, watched_entries=watched_entries)
+
+
+def storage_stats_summary(
+    index: FileIndex,
+    watched_entries: list[dict],
+) -> str:
+    return format_storage_stats(compute_storage_stats(index, watched_entries))

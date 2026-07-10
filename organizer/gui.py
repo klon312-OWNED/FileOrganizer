@@ -1795,6 +1795,7 @@ class App(Tk):
             get_index=lambda: self.index,
             get_watched_entries=lambda: self.sorter.list_watched_entries(),
             on_open_path=open_path,
+            on_reveal_path=reveal_in_explorer,
             on_sort_paths=self._desktop_sort_paths,
             on_exclude_paths=lambda paths: self._desktop_set_excluded(paths, True),
             on_smart_cleanup=self._smart_cleanup,

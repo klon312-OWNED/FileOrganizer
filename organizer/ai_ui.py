@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import threading
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Frame, Label, StringVar, Text, messagebox
+from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Frame, Label, StringVar, Text, filedialog, messagebox
 from tkinter import ttk
 from typing import Callable
 
@@ -16,9 +18,12 @@ from .ai_assistant import (
     Suggestion,
     create_assistant,
     format_intent_summary,
+    format_storage_stats,
+    compute_storage_stats,
     generate_suggestions,
     human_size,
     search_files,
+    storage_stats_summary,
 )
 
 _MAX_HISTORY = 12  # пар user/assistant в сессии
@@ -35,6 +40,7 @@ class AIAssistantPanel(Frame):
         get_index,
         get_watched_entries,
         on_open_path: Callable[[str], None],
+        on_reveal_path: Callable[[str], None],
         on_sort_paths: Callable[[list[str]], None],
         on_exclude_paths: Callable[[list[str]], None],
         on_smart_cleanup: Callable[[], None],
@@ -48,6 +54,7 @@ class AIAssistantPanel(Frame):
         self._get_index = get_index
         self._get_watched = get_watched_entries
         self._on_open = on_open_path
+        self._on_reveal = on_reveal_path
         self._on_sort = on_sort_paths
         self._on_exclude = on_exclude_paths
         self._on_cleanup = on_smart_cleanup
@@ -111,7 +118,7 @@ class AIAssistantPanel(Frame):
         Label(chips, text="Быстро:", bg=theme.BG, fg=theme.TEXT_MUTED, font=("Segoe UI", 8)).pack(
             side=LEFT, padx=(0, 4),
         )
-        for q in QUICK_QUERIES[:7]:
+        for q in QUICK_QUERIES[:8]:
             short = q if len(q) <= 22 else q[:20] + "…"
             ttk.Button(
                 chips, text=short, width=max(10, len(short) + 1),
@@ -171,6 +178,10 @@ class AIAssistantPanel(Frame):
             self._batch_frame, text="Копир.", width=7,
             command=self._copy_result_paths,
         ).pack(side=LEFT)
+        ttk.Button(
+            self._batch_frame, text="CSV", width=5,
+            command=self._export_results_csv,
+        ).pack(side=LEFT, padx=(2, 0))
 
         res_wrap = Frame(right, bg=theme.CARD, highlightbackground=theme.BORDER, highlightthickness=1)
         res_wrap.pack(side="top", fill=BOTH, expand=True, pady=(4, 0))
@@ -296,6 +307,26 @@ class AIAssistantPanel(Frame):
         self.clipboard_append("\n".join(paths))
         self._status_var.set(f"Скопировано путей: {len(paths)}")
 
+    def _export_results_csv(self) -> None:
+        if not self._last_results:
+            messagebox.showinfo("ИИ-помощник", "Нет результатов для экспорта.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Экспорт результатов",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")],
+            initialfile="ai_search_results.csv",
+        )
+        if not path:
+            return
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["path", "name", "category", "size", "source", "reason"])
+        for r in self._last_results:
+            writer.writerow([r.path, r.name, r.category, r.size, r.source, r.reason])
+        Path(path).write_text(buf.getvalue(), encoding="utf-8-sig")
+        self._status_var.set(f"Экспортировано: {len(self._last_results)} строк")
+
     def _set_busy(self, busy: bool, msg: str = "") -> None:
         self._busy = busy
         state = "disabled" if busy else "normal"
@@ -335,7 +366,11 @@ class AIAssistantPanel(Frame):
             settings = self._get_settings()
             assistant = create_assistant(settings)
             intent = assistant.parse_user_query(text, history=history)
-            if intent.action == "suggest":
+            if intent.action == "stats":
+                stats = compute_storage_stats(self._get_index(), self._get_watched())
+                msg = format_storage_stats(stats)
+                self.after(0, lambda: self._show_results([]))
+            elif intent.action == "suggest":
                 suggestions = assistant.generate_suggestions(
                     settings, self._get_index(), self._get_watched(),
                 )
@@ -365,6 +400,15 @@ class AIAssistantPanel(Frame):
             f"фильтр: {format_intent_summary(intent)}",
         ]
         if results:
+            by_cat: dict[str, int] = {}
+            for r in results:
+                cat = r.category or "—"
+                by_cat[cat] = by_cat.get(cat, 0) + 1
+            top_cats = sorted(by_cat.items(), key=lambda x: x[1], reverse=True)[:3]
+            if top_cats:
+                parts.append(
+                    "категории: " + ", ".join(f"{c}×{n}" for c, n in top_cats)
+                )
             top = ", ".join(r.name for r in results[:3])
             parts.append(f"например: {top}")
             desktop_n = sum(1 for r in results if r.source == "desktop")
@@ -427,6 +471,10 @@ class AIAssistantPanel(Frame):
                     command=lambda p=paths[0]: self._on_open(p),
                 ).pack(side=LEFT, padx=(0, 2))
                 ttk.Button(
+                    btns, text="Папк.", width=6,
+                    command=lambda p=paths[0]: self._on_reveal(p),
+                ).pack(side=LEFT, padx=(0, 2))
+                ttk.Button(
                     btns, text="Искл.", width=6,
                     command=lambda p=paths: self._confirm_exclude(p),
                 ).pack(side=LEFT, padx=(0, 2))
@@ -456,6 +504,7 @@ class AIAssistantPanel(Frame):
                 row, text=meta, font=("Segoe UI", 8), bg=theme.CARD,
                 anchor="w", wraplength=300, justify="left",
             ).pack(side=LEFT, fill=X, expand=True)
+            ttk.Button(row, text="Папк.", width=5, command=lambda p=res.path: self._on_reveal(p)).pack(side=RIGHT, padx=1)
             ttk.Button(row, text="Откр.", width=5, command=lambda p=res.path: self._on_open(p)).pack(side=RIGHT, padx=1)
             ttk.Button(row, text="Сорт.", width=5, command=lambda p=res.path: self._confirm_sort([p])).pack(side=RIGHT, padx=1)
             ttk.Button(row, text="Искл.", width=5, command=lambda p=res.path: self._confirm_exclude([p])).pack(side=RIGHT)

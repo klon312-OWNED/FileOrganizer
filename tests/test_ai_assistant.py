@@ -389,5 +389,93 @@ class TestLLMConnection(unittest.TestCase):
             self.assertIn("down", msg)
 
 
+
+class TestStatsTempTop(unittest.TestCase):
+    def test_temp_top_and_stats(self):
+        from organizer.ai_assistant import RulesAssistant, is_temp_name
+
+        self.assertTrue(is_temp_name("video.mp4.crdownload"))
+        self.assertTrue(is_temp_name("x.tmp"))
+        self.assertFalse(is_temp_name("photo.jpg"))
+
+        temp = RulesAssistant().parse_user_query("временные файлы")
+        self.assertTrue(temp.temp_only)
+        self.assertEqual(temp.action, "search")
+
+        top = RulesAssistant().parse_user_query("топ 10 самых больших")
+        self.assertEqual(top.limit, 10)
+        self.assertEqual(top.sort_by, "size")
+
+        newest = RulesAssistant().parse_user_query("самые новые файлы")
+        self.assertEqual(newest.sort_by, "date")
+
+        stats = RulesAssistant().parse_user_query("сколько места?")
+        self.assertEqual(stats.action, "stats")
+
+        folder = RulesAssistant().parse_user_query("pdf в загрузках")
+        self.assertEqual(folder.folder_contains, "download")
+
+    def test_temp_search_and_suggestion(self):
+        from organizer.ai_assistant import RulesAssistant, SearchIntent
+        from organizer.config import Settings
+
+        index = mock.MagicMock()
+        index.query.return_value = []
+        index.count.return_value = 0
+        index.total_size.return_value = 0
+        index.stats_by_category.return_value = []
+        entries = [
+            {
+                "path": "/dl/a.crdownload",
+                "name": "a.crdownload",
+                "sortable": True,
+                "excluded": False,
+                "folder": "/Downloads",
+                "size": 5000,
+                "mtime": 1,
+                "category": "Другое",
+            },
+            {
+                "path": "/dl/b.pdf",
+                "name": "b.pdf",
+                "sortable": True,
+                "excluded": False,
+                "folder": "/Downloads",
+                "size": 100,
+                "mtime": 2,
+                "category": "Документы",
+            },
+        ]
+        intent = SearchIntent(temp_only=True)
+        results = RulesAssistant().search(intent, index=index, watched_entries=entries)
+        self.assertEqual([r.name for r in results], ["a.crdownload"])
+
+        sug = RulesAssistant().generate_suggestions(Settings(), index, entries)
+        self.assertIn("temp_files", {s.id for s in sug})
+
+    def test_storage_stats_format(self):
+        from organizer.ai_assistant import compute_storage_stats, format_storage_stats
+
+        index = mock.MagicMock()
+        index.count.return_value = 3
+        index.total_size.return_value = 3000
+        index.stats_by_category.return_value = [
+            {"category": "Видео", "cnt": 2, "total_size": 2000},
+        ]
+        entries = [
+            {
+                "path": "/a",
+                "name": "a",
+                "sortable": True,
+                "category": "Документы",
+                "size": 100,
+            },
+        ]
+        text = format_storage_stats(compute_storage_stats(index, entries))
+        self.assertIn("Архив", text)
+        self.assertIn("Видео", text)
+
+
+
 if __name__ == "__main__":
     unittest.main()
