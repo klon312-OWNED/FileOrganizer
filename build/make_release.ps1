@@ -19,7 +19,19 @@ Copy-Item (Join-Path $Root "installer") $Stage -Recurse
 
 $SetupZip = Join-Path $Root "dist\FileOrganizer-Setup-$Version-win64.zip"
 if (Test-Path $SetupZip) { Remove-Item $SetupZip -Force }
-Compress-Archive -Path $Stage -DestinationPath $SetupZip -Force
+# Compress-Archive can silently produce a 0-byte zip on large trees; use .NET instead.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::CreateFromDirectory(
+    $Stage,
+    $SetupZip,
+    [System.IO.Compression.CompressionLevel]::Optimal,
+    $true
+)
+
+$zipLen = (Get-Item $SetupZip).Length
+if ($zipLen -lt 1MB) {
+    throw "Setup ZIP too small ($zipLen bytes) — packaging failed: $SetupZip"
+}
 
 Write-Host ""
-Write-Host "Setup ZIP: $SetupZip"
+Write-Host "Setup ZIP: $SetupZip ($([math]::Round($zipLen / 1MB, 1)) MB)"

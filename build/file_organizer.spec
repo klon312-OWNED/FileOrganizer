@@ -36,6 +36,9 @@ hidden = [
     "organizer.icon",
     "organizer.cleanup_summary",
     "organizer.win_drop",
+    "organizer.ai_assistant",
+    "organizer.ai_ui",
+    "organizer.video_player",
     "windnd",
     "fitz",
 ]

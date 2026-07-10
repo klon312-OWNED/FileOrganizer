@@ -30,9 +30,19 @@ $ZipName = "FileOrganizer-$Version-win64.zip"
 $ZipPath = Join-Path $Root "dist\$ZipName"
 
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
-Compress-Archive -Path $DistDir -DestinationPath $ZipPath -Force
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::CreateFromDirectory(
+    $DistDir,
+    $ZipPath,
+    [System.IO.Compression.CompressionLevel]::Optimal,
+    $true
+)
+$zipLen = (Get-Item $ZipPath).Length
+if ($zipLen -lt 1MB) {
+    throw "Portable ZIP too small ($zipLen bytes) — packaging failed: $ZipPath"
+}
 
 Write-Host ""
 Write-Host "Done:"
 Write-Host "  $DistDir"
-Write-Host "  $ZipPath"
+Write-Host "  $ZipPath ($([math]::Round($zipLen / 1MB, 1)) MB)"
