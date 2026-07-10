@@ -225,6 +225,25 @@ class TestRulesFollowUpAndSuggestions(unittest.TestCase):
         self.assertIn(".pdf", intent.extensions)
         self.assertEqual(intent.month, 5)
 
+    def test_relative_week_and_installers(self):
+        from organizer.ai_assistant import RulesAssistant
+
+        week = RulesAssistant().parse_user_query("файлы за неделю")
+        self.assertEqual(week.newer_than_days, 7)
+        inst = RulesAssistant().parse_user_query("покажи установщики")
+        self.assertTrue(inst.installers_only)
+        dups = RulesAssistant().parse_user_query("найди дубликаты")
+        self.assertTrue(dups.duplicates_only)
+
+    def test_format_intent_and_savings(self):
+        from organizer.ai_assistant import SearchIntent, estimate_savings, format_intent_summary
+
+        intent = SearchIntent(categories=["Видео"], newer_than_days=7, min_size=10)
+        summary = format_intent_summary(intent)
+        self.assertIn("Видео", summary)
+        self.assertIn("7", summary)
+        self.assertGreater(estimate_savings([{"size": 1000}], ratio=0.5), 0)
+
     def test_large_and_screenshot_suggestions(self):
         from organizer.ai_assistant import RulesAssistant
         from organizer.config import Settings
@@ -259,6 +278,73 @@ class TestRulesFollowUpAndSuggestions(unittest.TestCase):
         ids = {s.id for s in suggestions}
         self.assertIn("large_files", ids)
         self.assertIn("screenshots", ids)
+
+    def test_recent_and_folder_clutter_suggestions(self):
+        import time
+
+        from organizer.ai_assistant import RulesAssistant
+        from organizer.config import Settings
+
+        index = mock.MagicMock()
+        index.count.return_value = 0
+        index.total_size.return_value = 0
+        index.stats_by_category.return_value = []
+        now = time.time()
+        entries = [
+            {
+                "path": f"/Downloads/f{i}.bin",
+                "name": f"f{i}.bin",
+                "sortable": True,
+                "excluded": False,
+                "folder": "C:/Users/me/Downloads",
+                "size": 1024,
+                "mtime": now - 3600,
+                "category": "Другое",
+            }
+            for i in range(12)
+        ]
+        suggestions = RulesAssistant().generate_suggestions(Settings(), index, entries)
+        ids = {s.id for s in suggestions}
+        self.assertIn("recent_downloads", ids)
+        self.assertIn("folder_clutter", ids)
+
+
+class TestLLMConnection(unittest.TestCase):
+    def test_connection_rules_ok(self):
+        from organizer.ai_assistant import LLMAssistant
+        from organizer.config import Settings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(
+                json.dumps({"ai_provider": "openai", "ai_api_key": "k"}),
+                encoding="utf-8",
+            )
+            with mock.patch("organizer.config.SETTINGS_PATH", settings_path):
+                settings = Settings()
+            assistant = LLMAssistant(settings)
+            with mock.patch.object(assistant, "_chat", return_value="ok"):
+                ok, msg = assistant.test_connection()
+            self.assertTrue(ok)
+            self.assertIn("Связь", msg)
+
+    def test_connection_failure(self):
+        from organizer.ai_assistant import LLMAssistant
+        from organizer.config import Settings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(
+                json.dumps({"ai_provider": "ollama"}),
+                encoding="utf-8",
+            )
+            with mock.patch("organizer.config.SETTINGS_PATH", settings_path):
+                settings = Settings()
+            assistant = LLMAssistant(settings)
+            with mock.patch.object(assistant, "_chat", side_effect=OSError("down")):
+                ok, msg = assistant.test_connection()
+            self.assertFalse(ok)
+            self.assertIn("down", msg)
 
 
 if __name__ == "__main__":

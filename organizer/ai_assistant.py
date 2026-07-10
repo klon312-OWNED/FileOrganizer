@@ -68,6 +68,10 @@ class SearchIntent:
     source: str = "all"
     raw_query: str = ""
     delete_candidates: bool = False
+    newer_than_days: int | None = None
+    older_than_days: int | None = None
+    duplicates_only: bool = False
+    installers_only: bool = False
 
 
 @dataclass
@@ -90,12 +94,74 @@ class Suggestion:
     priority: int = 0
 
 
+_INSTALLER_EXTS = {".exe", ".msi", ".msix", ".apk", ".dmg", ".appx"}
+_DUP_NAME_RE = re.compile(r"\(\d+\)|\bкопия\b|\bcopy\b|_copy", re.I)
+
+QUICK_QUERIES = (
+    "найди все pdf за май",
+    "покажи большие видео",
+    "файлы за неделю",
+    "установщики",
+    "дубликаты",
+    "что сортировать сейчас?",
+    "какие файлы можно удалить?",
+)
+
+
 def human_size(num: int) -> str:
     for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
         if num < 1024:
             return f"{num:.0f} {unit}" if unit == "Б" else f"{num:.1f} {unit}"
         num /= 1024
     return f"{num:.1f} ПБ"
+
+
+def format_intent_summary(intent: SearchIntent) -> str:
+    """Краткое описание разобранного запроса для чата."""
+    parts: list[str] = []
+    if intent.delete_candidates:
+        parts.append("кандидаты на уборку")
+    if intent.duplicates_only:
+        parts.append("похожие дубликаты")
+    if intent.installers_only:
+        parts.append("установщики")
+    if intent.categories:
+        parts.append(", ".join(intent.categories))
+    if intent.extensions:
+        parts.append(" ".join(intent.extensions))
+    if intent.month:
+        parts.append(f"месяц {intent.month}")
+    if intent.year:
+        parts.append(f"год {intent.year}")
+    if intent.newer_than_days:
+        parts.append(f"за {intent.newer_than_days} дн.")
+    if intent.older_than_days:
+        parts.append(f"старше {intent.older_than_days} дн.")
+    if intent.min_size:
+        parts.append(f"от {human_size(intent.min_size)}")
+    if intent.max_size:
+        parts.append(f"до {human_size(intent.max_size)}")
+    if intent.name_contains:
+        parts.append(f"«{intent.name_contains}»")
+    if intent.source != "all":
+        parts.append("архив" if intent.source == "archive" else "отслеживаемые")
+    return ", ".join(parts) if parts else "без фильтров"
+
+
+def estimate_savings(paths_or_entries: list[Any], *, ratio: float = 0.35) -> int:
+    """Грубая оценка экономии места (байты) при сжатии/уборке."""
+    total = 0
+    for item in paths_or_entries:
+        if isinstance(item, dict):
+            total += int(item.get("size", 0) or 0)
+        elif isinstance(item, SearchResult):
+            total += int(item.size or 0)
+        else:
+            try:
+                total += int(item)
+            except (TypeError, ValueError):
+                continue
+    return max(0, int(total * ratio))
 
 
 class RulesAssistant:
@@ -127,6 +193,16 @@ class RulesAssistant:
         if any(w in low for w in ("удал", "мусор", "лишн", "очист", "уборк")):
             intent.delete_candidates = True
 
+        if any(w in low for w in ("дубликат", "копи", "duplicate", "повтор")):
+            intent.duplicates_only = True
+            intent.action = "search"
+
+        if any(w in low for w in ("установщик", "installer", "setup", "msi")):
+            intent.installers_only = True
+            intent.action = "search"
+            if "Программы" not in intent.categories:
+                intent.categories.append("Программы")
+
         for cat, keys in _CATEGORY_KEYWORDS.items():
             if any(k in low for k in keys):
                 if cat not in intent.categories:
@@ -152,6 +228,31 @@ class RulesAssistant:
                 intent.month = num
                 break
 
+        # Относительные даты: «за неделю», «за 3 дня», «старше месяца»
+        if any(w in low for w in ("сегодня", "за сегодня", "за сутки")):
+            intent.newer_than_days = 1
+        elif any(w in low for w in ("вчера",)):
+            intent.newer_than_days = 2
+        elif any(w in low for w in ("за неделю", "за 7 дн", "за семь")):
+            intent.newer_than_days = 7
+        elif any(w in low for w in ("за месяц", "за 30 дн")):
+            intent.newer_than_days = 30
+        else:
+            m_new = re.search(r"за\s+(\d+)\s*(дн|день|дня|дней)", low)
+            if m_new:
+                intent.newer_than_days = int(m_new.group(1))
+        if any(w in low for w in ("старше года", "давн", "стары")):
+            intent.older_than_days = intent.older_than_days or 365
+        elif any(w in low for w in ("старше месяца", "старше 30")):
+            intent.older_than_days = 30
+        else:
+            m_old = re.search(r"старше\s+(\d+)\s*(дн|день|дня|дней|мес)", low)
+            if m_old:
+                days = int(m_old.group(1))
+                if "мес" in m_old.group(2):
+                    days *= 30
+                intent.older_than_days = days
+
         for pattern, mult in _SIZE_PATTERNS:
             m = pattern.search(low)
             if m:
@@ -168,7 +269,7 @@ class RulesAssistant:
         if intent.max_size is None and any(w in low for w in _SMALL_WORDS):
             intent.max_size = 1024 * 1024
 
-        if "архив" in low and "zip" not in low:
+        if "архив" in low and "zip" not in low and not intent.installers_only:
             intent.source = "archive"
         elif any(w in low for w in ("рабоч", "desktop", "загруз", "download", "отслеж")):
             intent.source = "desktop"
@@ -279,8 +380,24 @@ class RulesAssistant:
                     reason=why,
                 ))
 
+        if intent.duplicates_only:
+            results = self._filter_duplicate_results(results)
+
         results.sort(key=lambda r: r.size, reverse=True)
         return results[:200]
+
+    @staticmethod
+    def _filter_duplicate_results(results: list[SearchResult]) -> list[SearchResult]:
+        """Оставить только файлы с признаками дубликата в имени или одинаковым stem."""
+        by_stem: dict[str, list[SearchResult]] = {}
+        for r in results:
+            stem = re.sub(r"\(\d+\)", "", Path(r.name).stem.lower()).strip()
+            by_stem.setdefault(stem, []).append(r)
+        out: list[SearchResult] = []
+        for group in by_stem.values():
+            if len(group) > 1 or any(_DUP_NAME_RE.search(r.name) for r in group):
+                out.extend(group)
+        return out
 
     def generate_suggestions(
         self,
@@ -345,21 +462,34 @@ class RulesAssistant:
 
         installers = [
             e for e in sortable
-            if Path(e["name"]).suffix.lower() in {".exe", ".msi", ".msix", ".apk"}
+            if Path(e["name"]).suffix.lower() in _INSTALLER_EXTS
             and int(e.get("size", 0)) > 50 * 1024 * 1024
         ]
         if installers and not settings.compression_enabled:
             sz = sum(int(e.get("size", 0)) for e in installers)
+            save = estimate_savings(installers, ratio=0.25)
             suggestions.append(Suggestion(
                 id="enable_compression",
                 title="Включить сжатие при сортировке",
                 description=(
                     f"Найдено {len(installers)} крупных установщиков "
-                    f"({human_size(sz)}). ZIP сэкономит место в архиве."
+                    f"({human_size(sz)}). ZIP может сэкономить ~{human_size(save)}."
                 ),
                 action="enable_compression",
                 payload={},
                 priority=70,
+            ))
+        elif installers:
+            suggestions.append(Suggestion(
+                id="sort_installers",
+                title=f"Установщики: {len(installers)}",
+                description=(
+                    f"Крупные установщики ({human_size(sum(int(e.get('size', 0)) for e in installers))}). "
+                    "Отсортируйте в «Программы» или исключите нужные."
+                ),
+                action="sort_paths",
+                payload={"paths": [e["path"] for e in installers[:30]]},
+                priority=65,
             ))
 
         junk: list[dict] = []
@@ -382,7 +512,8 @@ class RulesAssistant:
                 title=f"Умная уборка: {len(junk)} кандидатов",
                 description=(
                     f"Эвристика нашла {len(junk)} вероятно лишних файлов "
-                    f"({human_size(jsize)}). Проверьте перед удалением."
+                    f"({human_size(jsize)}). Проверьте перед удалением — "
+                    f"потенциально освободится до {human_size(jsize)}."
                 ),
                 action="smart_cleanup",
                 payload={"paths": [e["path"] for e in junk[:30]]},
@@ -397,6 +528,7 @@ class RulesAssistant:
         if dups:
             sample = dups[0][0]["name"]
             stem = Path(sample).stem
+            dup_paths = [e["path"] for g in dups[:10] for e in g]
             suggestions.append(Suggestion(
                 id="review_duplicates",
                 title=f"Похожие дубликаты: {len(dups)} групп",
@@ -405,7 +537,7 @@ class RulesAssistant:
                     "Проверьте перед сортировкой или удалением."
                 ),
                 action="search",
-                payload={"query": f"найди «{stem}»"},
+                payload={"query": "дубликаты", "paths": dup_paths[:40]},
                 priority=40,
             ))
 
@@ -426,12 +558,13 @@ class RulesAssistant:
         ]
         if large:
             lsz = sum(int(e.get("size", 0)) for e in large)
+            save = estimate_savings(large, ratio=0.2)
             suggestions.append(Suggestion(
                 id="large_files",
                 title=f"Крупные файлы: {len(large)} (≥500 МБ)",
                 description=(
-                    f"Суммарно {human_size(lsz)}. Имеет смысл отсортировать "
-                    "или сжать, чтобы освободить место в отслеживаемых папках."
+                    f"Суммарно {human_size(lsz)}. Отсортируйте или сожмите — "
+                    f"ориентировочно ~{human_size(save)} при ZIP."
                 ),
                 action="sort_paths",
                 payload={"paths": [e["path"] for e in large[:30]]},
@@ -455,6 +588,46 @@ class RulesAssistant:
                 action="sort_paths",
                 payload={"paths": [e["path"] for e in old_files[:40]]},
                 priority=55,
+            ))
+
+        # Свежие загрузки за 7 дней — напомнить разложить
+        recent = [
+            e for e in sortable
+            if e.get("mtime") and (now - float(e["mtime"])) <= 7 * 86400
+        ]
+        if len(recent) >= 8:
+            suggestions.append(Suggestion(
+                id="recent_downloads",
+                title=f"Новые за 7 дней: {len(recent)}",
+                description=(
+                    f"Недавно появились {len(recent)} файлов "
+                    f"({human_size(sum(int(e.get('size', 0)) for e in recent))}). "
+                    "Удобно сразу разложить, пока помните, что это."
+                ),
+                action="sort_paths",
+                payload={"paths": [e["path"] for e in recent[:40]]},
+                priority=72,
+            ))
+
+        # Telegram / Downloads clutter
+        clutter_folders = [
+            e for e in sortable
+            if any(
+                f in (e.get("folder", "") or "").lower()
+                for f in ("telegram", "downloads", "загрузки")
+            )
+        ]
+        if len(clutter_folders) >= 12:
+            suggestions.append(Suggestion(
+                id="folder_clutter",
+                title=f"Загрузки/Telegram: {len(clutter_folders)}",
+                description=(
+                    "В типичных «мусорных» папках много файлов. "
+                    "Отсортируйте пачкой или исключите нужное."
+                ),
+                action="sort_paths",
+                payload={"paths": [e["path"] for e in clutter_folders[:40]]},
+                priority=68,
             ))
 
         # Скриншоты / снимки экрана
@@ -501,10 +674,14 @@ class RulesAssistant:
             ))
 
         suggestions.sort(key=lambda s: s.priority, reverse=True)
-        return suggestions[:8]
+        return suggestions[:10]
 
     def _matches_intent_row(self, intent: SearchIntent, row) -> bool:
-        if intent.categories and row["category"] not in intent.categories:
+        if intent.installers_only:
+            ext = (row["extension"] or "").lower()
+            if ext not in _INSTALLER_EXTS:
+                return False
+        elif intent.categories and row["category"] not in intent.categories:
             return False
         ext = (row["extension"] or "").lower()
         if intent.extensions and ext not in intent.extensions:
@@ -520,16 +697,34 @@ class RulesAssistant:
             return False
         if intent.name_contains and intent.name_contains not in row["name"].lower():
             return False
+        if intent.newer_than_days or intent.older_than_days:
+            # В архиве ориентируемся на year/month записи
+            try:
+                y = int(row["year"] or 0)
+                m = int(row["month"] or 1)
+                if y:
+                    approx = datetime(y, max(1, min(12, m or 1)), 15).timestamp()
+                    if not self._matches_age(intent, approx):
+                        return False
+            except (ValueError, TypeError, OSError):
+                pass
+        if intent.duplicates_only and not _DUP_NAME_RE.search(row["name"] or ""):
+            # Полная фильтрация дублей — после сбора; здесь мягкий пропуск
+            pass
         return True
 
     def _matches_intent_entry(self, intent: SearchIntent, entry: dict) -> bool:
-        if intent.categories and entry.get("category") not in intent.categories:
+        name = entry.get("name", "")
+        if intent.installers_only:
+            if Path(name).suffix.lower() not in _INSTALLER_EXTS:
+                return False
+        elif intent.categories and entry.get("category") not in intent.categories:
             return False
-        ext = Path(entry.get("name", "")).suffix.lower()
+        ext = Path(name).suffix.lower()
         if intent.extensions and ext not in intent.extensions:
             return False
+        mtime = entry.get("mtime", 0) or 0
         if intent.year or intent.month:
-            mtime = entry.get("mtime", 0) or 0
             if mtime:
                 dt = datetime.fromtimestamp(mtime)
                 if intent.year and dt.year != intent.year:
@@ -541,7 +736,22 @@ class RulesAssistant:
             return False
         if intent.max_size is not None and size > intent.max_size:
             return False
-        if intent.name_contains and intent.name_contains not in entry.get("name", "").lower():
+        if intent.name_contains and intent.name_contains not in name.lower():
+            return False
+        if not self._matches_age(intent, float(mtime) if mtime else None):
+            return False
+        return True
+
+    @staticmethod
+    def _matches_age(intent: SearchIntent, mtime: float | None) -> bool:
+        if intent.newer_than_days is None and intent.older_than_days is None:
+            return True
+        if not mtime:
+            return False
+        age_days = (time.time() - mtime) / 86400
+        if intent.newer_than_days is not None and age_days > intent.newer_than_days:
+            return False
+        if intent.older_than_days is not None and age_days < intent.older_than_days:
             return False
         return True
 
@@ -626,7 +836,8 @@ class LLMAssistant:
             "Ты парсер запросов файлового менеджера. Верни ТОЛЬКО JSON без markdown: "
             '{"action":"search|suggest","categories":[],"extensions":[],"month":null,'
             '"year":null,"min_size":null,"max_size":null,"name_contains":"","source":"all|archive|desktop",'
-            '"delete_candidates":false}. '
+            '"delete_candidates":false,"newer_than_days":null,"older_than_days":null,'
+            '"duplicates_only":false,"installers_only":false}. '
             "categories — из: Картинки, Видео, Музыка, Документы, Архивы, Программы, Код, Папки. "
             "sizes в байтах. Учитывай краткий контекст предыдущих сообщений, если он есть."
         )
@@ -648,6 +859,10 @@ class LLMAssistant:
             source=str(data.get("source") or "all"),
             raw_query=text,
             delete_candidates=bool(data.get("delete_candidates")),
+            newer_than_days=data.get("newer_than_days"),
+            older_than_days=data.get("older_than_days"),
+            duplicates_only=bool(data.get("duplicates_only")),
+            installers_only=bool(data.get("installers_only")),
         )
 
     def _llm_suggestions(
@@ -753,6 +968,25 @@ class LLMAssistant:
             data = json.loads(resp.read().decode("utf-8"))
         msg = data.get("message") or {}
         return msg.get("content")
+
+    def test_connection(self) -> tuple[bool, str]:
+        """Проверить доступность OpenAI/Ollama. Возвращает (ok, сообщение)."""
+        if self.provider == "rules":
+            return True, "Локальные правила — сеть не нужна."
+        try:
+            reply = self._chat(
+                "Ответь одним словом: ok",
+                "ping",
+            )
+            if reply and reply.strip():
+                return True, f"Связь есть ({self.provider}). Ответ модели получен."
+            return False, "Пустой ответ от модели. Проверьте URL и имя модели."
+        except urllib.error.HTTPError as exc:
+            return False, f"HTTP {exc.code}: {exc.reason}"
+        except urllib.error.URLError as exc:
+            return False, f"Сеть: {exc.reason}"
+        except Exception as exc:
+            return False, str(exc)
 
 
 def _count_by(entries: list[dict], key: str) -> dict[str, int]:

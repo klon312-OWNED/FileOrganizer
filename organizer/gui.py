@@ -1871,6 +1871,34 @@ class App(Tk):
         btns = Frame(win, bg=theme.BG)
         btns.pack(fill=X, padx=16, pady=12)
 
+        def test_conn():
+            from .ai_assistant import LLMAssistant, create_assistant
+
+            # Временно применить поля формы без сохранения
+            prev = {
+                "ai_provider": self.settings.data.get("ai_provider"),
+                "ai_api_key": self.settings.data.get("ai_api_key"),
+                "ai_base_url": self.settings.data.get("ai_base_url"),
+                "ai_model": self.settings.data.get("ai_model"),
+                "ai_ollama_url": self.settings.data.get("ai_ollama_url"),
+                "ai_ollama_model": self.settings.data.get("ai_ollama_model"),
+            }
+            self.settings.data["ai_provider"] = provider_var.get()
+            self.settings.data["ai_api_key"] = key_var.get().strip()
+            self.settings.data["ai_base_url"] = url_var.get().strip() or "https://api.openai.com/v1"
+            self.settings.data["ai_model"] = model_var.get().strip() or "gpt-4o-mini"
+            self.settings.data["ai_ollama_url"] = ollama_url_var.get().strip() or "http://localhost:11434"
+            self.settings.data["ai_ollama_model"] = ollama_model_var.get().strip() or "llama3.2"
+            try:
+                assistant = create_assistant(self.settings)
+                if isinstance(assistant, LLMAssistant):
+                    ok, msg = assistant.test_connection()
+                else:
+                    ok, msg = True, "Локальные правила — сеть не нужна."
+                (messagebox.showinfo if ok else messagebox.showerror)("Проверка ИИ", msg)
+            finally:
+                self.settings.data.update(prev)
+
         def save():
             self.settings.data["ai_provider"] = provider_var.get()
             self.settings.data["ai_api_key"] = key_var.get().strip()
@@ -1884,6 +1912,7 @@ class App(Tk):
             messagebox.showinfo("Сохранено", "Настройки ИИ-помощника сохранены.")
             win.destroy()
 
+        ttk.Button(btns, text="Проверить связь", command=test_conn).pack(side=LEFT)
         ttk.Button(btns, text="Сохранить", style="Accent.TButton", command=save).pack(side=RIGHT)
         ttk.Button(btns, text="Отмена", command=win.destroy).pack(side=RIGHT, padx=(0, 8))
 

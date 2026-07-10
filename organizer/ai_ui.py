@@ -10,10 +10,12 @@ from typing import Callable
 
 from . import theme
 from .ai_assistant import (
+    QUICK_QUERIES,
     SearchIntent,
     SearchResult,
     Suggestion,
     create_assistant,
+    format_intent_summary,
     generate_suggestions,
     human_size,
     search_files,
@@ -55,6 +57,7 @@ class AIAssistantPanel(Frame):
         self._on_settings = on_open_settings
         self._busy = False
         self._history: list[dict[str, str]] = []
+        self._last_results: list[SearchResult] = []
         self._build()
 
     def _build(self) -> None:
@@ -91,7 +94,7 @@ class AIAssistantPanel(Frame):
         left.pack(side=LEFT, fill=BOTH, expand=True)
 
         input_frame = Frame(left, bg=theme.CARD, highlightbackground=theme.BORDER, highlightthickness=1)
-        input_frame.pack(side="top", fill=X, pady=(0, 6))
+        input_frame.pack(side="top", fill=X, pady=(0, 4))
         self._input = Text(input_frame, height=3, font=("Segoe UI", 10), wrap="word")
         self._input.pack(side=LEFT, fill=BOTH, expand=True, padx=6, pady=6)
         self._input.bind("<Control-Return>", lambda _e: self._on_send())
@@ -100,6 +103,18 @@ class AIAssistantPanel(Frame):
         self._send_btn = ttk.Button(btn_col, text="Отправить", style="Accent.TButton", command=self._on_send)
         self._send_btn.pack(fill=X)
         ttk.Button(btn_col, text="Примеры", command=self._show_examples).pack(fill=X, pady=(4, 0))
+
+        chips = Frame(left, bg=theme.BG)
+        chips.pack(side="top", fill=X, pady=(0, 6))
+        Label(chips, text="Быстро:", bg=theme.BG, fg=theme.TEXT_MUTED, font=("Segoe UI", 8)).pack(
+            side=LEFT, padx=(0, 4),
+        )
+        for q in QUICK_QUERIES[:6]:
+            short = q if len(q) <= 22 else q[:20] + "…"
+            ttk.Button(
+                chips, text=short, width=max(10, len(short) + 1),
+                command=lambda query=q: self._run_quick(query),
+            ).pack(side=LEFT, padx=2, pady=2)
 
         Label(left, text="Диалог", font=("Segoe UI", 10, "bold"), bg=theme.BG).pack(anchor="w")
         chat_wrap = Frame(left, bg=theme.CARD, highlightbackground=theme.BORDER, highlightthickness=1)
@@ -135,7 +150,22 @@ class AIAssistantPanel(Frame):
         self._sug_canvas.bind("<Enter>", lambda _e: self._bind_sug_wheel(True))
         self._sug_canvas.bind("<Leave>", lambda _e: self._bind_sug_wheel(False))
 
-        Label(right, text="Результаты поиска", font=("Segoe UI", 10, "bold"), bg=theme.BG).pack(anchor="w")
+        res_head = Frame(right, bg=theme.BG)
+        res_head.pack(side="top", fill=X)
+        Label(res_head, text="Результаты поиска", font=("Segoe UI", 10, "bold"), bg=theme.BG).pack(
+            side=LEFT, anchor="w",
+        )
+        self._batch_frame = Frame(res_head, bg=theme.BG)
+        self._batch_frame.pack(side=RIGHT)
+        ttk.Button(
+            self._batch_frame, text="Сорт. все", width=9,
+            command=self._sort_all_results,
+        ).pack(side=LEFT, padx=2)
+        ttk.Button(
+            self._batch_frame, text="Искл. все", width=9,
+            command=self._exclude_all_results,
+        ).pack(side=LEFT)
+
         res_wrap = Frame(right, bg=theme.CARD, highlightbackground=theme.BORDER, highlightthickness=1)
         res_wrap.pack(side="top", fill=BOTH, expand=True, pady=(4, 0))
         res_vsb = ttk.Scrollbar(res_wrap)
@@ -159,7 +189,7 @@ class AIAssistantPanel(Frame):
         self._update_provider_label()
         self._append_chat(
             "Система",
-            "Привет! Спросите, например: «найди все pdf за май» или «что сортировать сейчас?» "
+            "Привет! Спросите, например: «найди все pdf за май», «файлы за неделю» или «установщики». "
             "История диалога сохраняется до закрытия окна.",
             to_history=False,
         )
@@ -239,15 +269,16 @@ class AIAssistantPanel(Frame):
         if msg:
             self._status_var.set(msg)
 
-    def _show_examples(self) -> None:
-        examples = (
-            "найди все pdf за май\n"
-            "покажи большие видео\n"
-            "что сортировать сейчас?\n"
-            "какие файлы можно удалить?"
-        )
+    def _run_quick(self, query: str) -> None:
+        if self._busy:
+            return
         self._input.delete("1.0", END)
-        self._input.insert("1.0", examples.split("\n")[0])
+        self._input.insert("1.0", query)
+        self._on_send()
+
+    def _show_examples(self) -> None:
+        self._input.delete("1.0", END)
+        self._input.insert("1.0", "\n".join(QUICK_QUERIES))
 
     def _on_send(self) -> None:
         if self._busy:
@@ -255,12 +286,14 @@ class AIAssistantPanel(Frame):
         text = self._input.get("1.0", END).strip()
         if not text:
             return
+        # Если вставили несколько строк примеров — берём первую
+        first_line = text.splitlines()[0].strip()
         self._input.delete("1.0", END)
-        self._append_chat("Вы", text)
+        self._append_chat("Вы", first_line)
         self._set_busy(True, "Думаю…")
-        history_snapshot = list(self._history[:-1])  # без только что добавленного user
+        history_snapshot = list(self._history[:-1])
         threading.Thread(
-            target=self._process_query, args=(text, history_snapshot), daemon=True,
+            target=self._process_query, args=(first_line, history_snapshot), daemon=True,
         ).start()
 
     def _process_query(self, text: str, history: list[dict[str, str]]) -> None:
@@ -272,7 +305,10 @@ class AIAssistantPanel(Frame):
                 suggestions = assistant.generate_suggestions(
                     settings, self._get_index(), self._get_watched(),
                 )
-                msg = f"Нашёл {len(suggestions)} совет(ов). Смотрите панель справа."
+                msg = (
+                    f"Фильтр: {format_intent_summary(intent)}. "
+                    f"Нашёл {len(suggestions)} совет(ов). Смотрите панель справа."
+                )
                 self.after(0, lambda: self._show_suggestions(suggestions))
             else:
                 results = search_files(
@@ -289,22 +325,17 @@ class AIAssistantPanel(Frame):
             self.after(0, lambda: self._set_busy(False, "Готов"))
 
     def _format_search_reply(self, intent: SearchIntent, results: list[SearchResult]) -> str:
-        parts = [f"Найдено: {len(results)}"]
-        if intent.categories:
-            parts.append(f"категории: {', '.join(intent.categories)}")
-        if intent.month:
-            parts.append(f"месяц: {intent.month}")
-        if intent.year:
-            parts.append(f"год: {intent.year}")
-        if intent.min_size:
-            parts.append(f"от {human_size(intent.min_size)}")
-        if intent.max_size:
-            parts.append(f"до {human_size(intent.max_size)}")
-        if intent.name_contains:
-            parts.append(f"имя содержит «{intent.name_contains}»")
+        total = sum(r.size for r in results)
+        parts = [
+            f"Найдено: {len(results)} ({human_size(total)})",
+            f"фильтр: {format_intent_summary(intent)}",
+        ]
         if results:
             top = ", ".join(r.name for r in results[:3])
             parts.append(f"например: {top}")
+            desktop_n = sum(1 for r in results if r.source == "desktop")
+            if desktop_n:
+                parts.append(f"из отслеживаемых: {desktop_n} — можно «Сорт. все»")
         return ". ".join(parts) + "."
 
     def _load_suggestions(self) -> None:
@@ -371,6 +402,7 @@ class AIAssistantPanel(Frame):
             ).pack(side=LEFT)
 
     def _show_results(self, results: list[SearchResult]) -> None:
+        self._last_results = list(results)
         self._clear_frame(self._results_frame)
         if not results:
             Label(
@@ -394,8 +426,27 @@ class AIAssistantPanel(Frame):
             ttk.Button(row, text="Сорт.", width=5, command=lambda p=res.path: self._confirm_sort([p])).pack(side=RIGHT, padx=1)
             ttk.Button(row, text="Искл.", width=5, command=lambda p=res.path: self._confirm_exclude([p])).pack(side=RIGHT)
 
+    def _desktop_result_paths(self) -> list[str]:
+        return [r.path for r in self._last_results if r.source == "desktop" and r.path]
+
+    def _sort_all_results(self) -> None:
+        paths = self._desktop_result_paths()
+        if not paths:
+            messagebox.showinfo(
+                "ИИ-помощник",
+                "Нет файлов из отслеживаемых папок в результатах (архив сортировать отсюда нельзя).",
+            )
+            return
+        self._confirm_sort(paths[:80])
+
+    def _exclude_all_results(self) -> None:
+        paths = self._desktop_result_paths()
+        if not paths:
+            messagebox.showinfo("ИИ-помощник", "Нет файлов из отслеживаемых папок для исключения.")
+            return
+        self._confirm_exclude(paths[:80])
+
     def _confirm_sort(self, paths: list[str]) -> None:
-        # Подтверждение сортировки — в gui._desktop_sort_paths
         if paths:
             self._on_sort(paths)
 
