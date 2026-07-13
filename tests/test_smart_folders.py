@@ -143,6 +143,11 @@ class TestSmartFolderSorter(unittest.TestCase):
                 (dest_folder / "report (1).txt").read_text(encoding="utf-8"),
                 "new content",
             )
+            try:
+                db.close()
+            except Exception:
+                pass
+            del sorter, db
 
 
 class TestSettingsSmartFolders(unittest.TestCase):
