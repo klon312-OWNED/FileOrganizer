@@ -58,6 +58,12 @@ _TEMP_NAME_RE = re.compile(
     r"\.(tmp|temp|crdownload|part|partial|download)$|~\$|\.!ut$|\.bc!$",
     re.I,
 )
+_CACHE_NAME_RE = re.compile(
+    r"thumbs\.db|desktop\.ini|\.ds_store|__pycache__|\.cache\b|\.bak$|\.old$",
+    re.I,
+)
+_LOG_EXTS = {".log", ".bak", ".old", ".dmp", ".chk", ".gid"}
+_SCREENSHOT_RE = re.compile(r"screenshot|снимок\s*экрана|screen\s*shot", re.I)
 
 
 @dataclass
@@ -81,6 +87,9 @@ class SearchIntent:
     installers_only: bool = False
     empty_only: bool = False
     temp_only: bool = False
+    cache_only: bool = False
+    logs_only: bool = False
+    screenshot_only: bool = False
     limit: int | None = None
     sort_by: str = "size"  # size | date | name
     folder_contains: str = ""
@@ -130,6 +139,8 @@ QUICK_QUERIES = (
     "дубликаты",
     "пустые файлы",
     "временные файлы",
+    "скриншоты",
+    "кэш и логи",
     "топ 10 самых больших",
     "сколько места?",
     "что сортировать сейчас?",
@@ -158,6 +169,12 @@ def format_intent_summary(intent: SearchIntent) -> str:
         parts.append("пустые (0 байт)")
     if intent.temp_only:
         parts.append("временные/недокачанные")
+    if intent.cache_only:
+        parts.append("кэш/служебные")
+    if intent.logs_only:
+        parts.append("логи")
+    if intent.screenshot_only:
+        parts.append("скриншоты")
     if intent.categories:
         parts.append(", ".join(intent.categories))
     if intent.extensions:
@@ -195,6 +212,23 @@ def is_temp_name(name: str) -> bool:
     if Path(n).suffix.lower() in _TEMP_EXTS:
         return True
     return bool(_TEMP_NAME_RE.search(n))
+
+
+def is_cache_name(name: str) -> bool:
+    """Служебный/кэш-файл по имени или расширению."""
+    n = (name or "").strip()
+    if not n:
+        return False
+    low = n.lower()
+    if Path(n).suffix.lower() in _LOG_EXTS:
+        return True
+    if _CACHE_NAME_RE.search(low):
+        return True
+    return low in ("desktop.ini", "thumbs.db", ".ds_store")
+
+
+def is_screenshot_name(name: str) -> bool:
+    return bool(_SCREENSHOT_RE.search(name or ""))
 
 
 def compute_storage_stats(
@@ -316,6 +350,31 @@ class RulesAssistant:
         )):
             intent.temp_only = True
             intent.action = "search"
+
+        if any(w in low for w in ("кэш", "кеш", "cache", "thumbs", "desktop.ini")):
+            intent.cache_only = True
+            intent.action = "search"
+
+        if any(w in low for w in ("лог", "log файл", "log-файл")) or re.search(
+            r"\blog\b|\.log\b", low,
+        ):
+            intent.logs_only = True
+            if ".log" not in intent.extensions:
+                intent.extensions.append(".log")
+            intent.action = "search"
+
+        if any(w in low for w in ("скриншот", "screenshot", "снимок экрана", "screen shot")):
+            intent.screenshot_only = True
+            if "Картинки" not in intent.categories:
+                intent.categories.append("Картинки")
+            intent.action = "search"
+
+        if any(w in low for w in ("только архив", "из архива", "в архиве")):
+            intent.source = "archive"
+        elif any(w in low for w in (
+            "только рабоч", "только отслеж", "без архива", "на рабоч",
+        )):
+            intent.source = "desktop"
 
         m_top = re.search(r"топ\s*(\d{1,3})", low)
         if m_top:
@@ -541,6 +600,19 @@ class RulesAssistant:
         if intent.temp_only:
             results = [r for r in results if is_temp_name(r.name)]
 
+        if intent.cache_only:
+            results = [r for r in results if is_cache_name(r.name)]
+
+        if intent.logs_only:
+            results = [
+                r for r in results
+                if Path(r.name).suffix.lower() in _LOG_EXTS
+                or ".log" in r.name.lower()
+            ]
+
+        if intent.screenshot_only:
+            results = [r for r in results if is_screenshot_name(r.name)]
+
         if intent.sort_by == "name":
             results.sort(key=lambda r: (r.name or "").lower())
         elif intent.sort_by == "date":
@@ -605,6 +677,35 @@ class RulesAssistant:
                 action="sort_paths",
                 payload={"paths": [e["path"] for e in sortable[:50]]},
                 priority=90,
+            ))
+
+        files_only = [e for e in sortable if not e.get("is_dir") and Path(e.get("path", "")).is_file()]
+        lib = (settings.smart_folders_root or "").strip()
+        if files_only and lib and Path(lib).is_dir():
+            suggestions.append(Suggestion(
+                id="smart_folders",
+                title="Раскладка по моим папкам",
+                description=(
+                    f"В библиотеке «{Path(lib).name}» можно разложить "
+                    f"{len(files_only)} файлов по вашим категориям "
+                    "(изучение имён папок, расширений и содержимого)."
+                ),
+                action="smart_folders",
+                payload={"paths": [e["path"] for e in files_only[:50]]},
+                priority=88,
+            ))
+        elif files_only and not lib:
+            suggestions.append(Suggestion(
+                id="smart_folders_setup",
+                title="Настроить «Мои папки»",
+                description=(
+                    "Укажите папку-библиотеку с вашими категориями "
+                    "(например Учёба/Курс Python) — программа будет "
+                    "раскладывать файлы по ним."
+                ),
+                action="set_sort_mode",
+                payload={"sort_mode": "smart_folders"},
+                priority=55,
             ))
 
         archive_count = index.count()
@@ -857,6 +958,24 @@ class RulesAssistant:
                 priority=62,
             ))
 
+        cache_logs = [
+            e for e in sortable
+            if is_cache_name(e.get("name", ""))
+            and not is_temp_name(e.get("name", ""))
+        ]
+        if len(cache_logs) >= 3:
+            suggestions.append(Suggestion(
+                id="cache_logs",
+                title=f"Кэш и логи: {len(cache_logs)}",
+                description=(
+                    "Thumbs.db, .log, .bak и служебные файлы. "
+                    "Часто безопасно удалить после проверки."
+                ),
+                action="search",
+                payload={"query": "кэш и логи", "paths": [e["path"] for e in cache_logs[:40]]},
+                priority=57,
+            ))
+
         # Много файлов без категории / «Другое»
         other = [e for e in sortable if e.get("category") in (OTHER_CATEGORY, "", None)]
         if len(other) >= 8:
@@ -908,6 +1027,14 @@ class RulesAssistant:
             if intent.folder_contains not in hay:
                 return False
         if intent.temp_only and not is_temp_name(row["name"] or ""):
+            return False
+        if intent.cache_only and not is_cache_name(row["name"] or ""):
+            return False
+        if intent.logs_only:
+            ext = (row["extension"] or "").lower()
+            if ext not in _LOG_EXTS and ".log" not in (row["name"] or "").lower():
+                return False
+        if intent.screenshot_only and not is_screenshot_name(row["name"] or ""):
             return False
         if intent.installers_only:
             ext = (row["extension"] or "").lower()

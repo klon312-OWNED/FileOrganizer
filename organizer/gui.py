@@ -28,6 +28,7 @@ from .layouts import DATE_SOURCES, MONTHS_RU, SORT_MODES, STORAGE_MODES, sort_mo
 from .preview_panel import PreviewPanel
 from .scanner import Scanner, fixed_drives
 from .sorter import Sorter, SortResult
+from .smart_folders_ui import SmartFolderMappingDialog
 from . import theme
 from .icon import icon_path, make_icon_image
 from .notify import SortNotifyBatcher, show_toast
@@ -238,10 +239,16 @@ class App(Tk):
 
     def _confirm_sort_operation(self, paths: list[str], *, title: str = "Сортировка") -> bool:
         count = len(paths)
+        if self.settings.sort_mode == "smart_folders" and self.settings.smart_folders_root:
+            dest = self.settings.smart_folders_root
+            mode_label = "По моим папкам"
+        else:
+            dest = self.settings.destination
+            mode_label = storage_mode_label(self.settings.storage_mode)
         msg = (
             f"Элементов: {count}\n"
-            f"Назначение: {self.settings.destination}\n"
-            f"Режим: {storage_mode_label(self.settings.storage_mode)}"
+            f"Назначение: {dest}\n"
+            f"Режим: {mode_label}"
         )
         msg += self._compression_notice(count, paths=paths)
         if self.settings.dry_run:
@@ -449,6 +456,10 @@ class App(Tk):
             toolbar, text="Сортировать выбранное", style="Accent.TButton",
             command=self._desktop_sort_selected,
         ).pack(side=LEFT, padx=(16, 0))
+        ttk.Button(
+            toolbar, text="По моим папкам",
+            command=self._desktop_smart_folders_sort,
+        ).pack(side=LEFT, padx=(8, 0))
         self._desktop_compress_var = BooleanVar(
             value=self.settings.compression_enabled and self.settings.compression_mode != "none",
         )
@@ -908,6 +919,9 @@ class App(Tk):
         self.status_var.set("Останавливаю сортировку выбранного...")
 
     def _desktop_sort_selected(self) -> None:
+        if self.settings.sort_mode == "smart_folders":
+            self._desktop_smart_folders_sort()
+            return
         by_path = {e["path"]: e for e in self._desktop_entries}
         paths = [
             p for p in self._desktop_selected
@@ -936,6 +950,97 @@ class App(Tk):
         if started:
             self._desktop_sort_active = True
             self._desktop_cancel_btn.configure(state="normal")
+
+    def _desktop_smart_folders_sort(self, paths: list[str] | None = None) -> None:
+        """Умная раскладка выбранных файлов по профилям пользовательских папок."""
+        root = self.settings.smart_folders_root.strip()
+        if not root or not Path(root).is_dir():
+            messagebox.showwarning(
+                "Мои папки",
+                "Укажите корень библиотеки в настройках:\n"
+                "«Умная раскладка по моим папкам» → папка с вашими категориями\n"
+                "(например, Документы/Учёба с подпапками «Курс Python», «Математика»).",
+            )
+            self._open_settings()
+            return
+
+        if paths is None:
+            by_path = {e["path"]: e for e in self._desktop_entries}
+            paths = [
+                p for p in self._desktop_selected
+                if by_path.get(p, {}).get("sortable") and Path(p).is_file()
+            ]
+            if not paths:
+                paths = [
+                    e["path"] for e in self._desktop_entries
+                    if e.get("sortable") and Path(e["path"]).is_file()
+                ]
+        else:
+            paths = [p for p in paths if Path(p).is_file()]
+        if not paths:
+            messagebox.showwarning(
+                "Нечего раскладывать",
+                "Нет готовых файлов для умной раскладки.",
+            )
+            return
+
+        try:
+            proposals, library_root = self.sorter.build_smart_folder_plan(paths)
+        except ValueError as e:
+            messagebox.showerror("Мои папки", str(e))
+            return
+
+        if not proposals:
+            messagebox.showinfo("Мои папки", "Нет подходящих файлов для раскладки.")
+            return
+
+        dlg = SmartFolderMappingDialog(
+            self,
+            proposals=proposals,
+            library_root=library_root,
+            catchall_name=self.settings.smart_folders_catchall,
+            auto_create=self.settings.smart_folders_auto_create,
+            dry_run=self.settings.dry_run,
+        )
+        self.wait_window(dlg)
+        if not dlg.confirmed or not dlg.result:
+            return
+
+        self._desktop_cancel_event.clear()
+        if not self._begin_task("Умная раскладка"):
+            return
+        self.status_var.set("Умная раскладка...")
+        self._desktop_sort_active = True
+        self._desktop_cancel_btn.configure(state="normal")
+        confirmed = dlg.result
+
+        def on_progress(done: int, total: int, raw_path: str) -> None:
+            name = Path(raw_path).name
+            self.after(
+                0,
+                lambda: self.status_var.set(f"Раскладка: {done}/{total} · {name}"),
+            )
+
+        def should_cancel() -> bool:
+            return self._desktop_cancel_event.is_set()
+
+        def work():
+            try:
+                result = self.sorter.apply_confirmed_smart_plan(
+                    confirmed,
+                    on_progress=on_progress,
+                    should_cancel=should_cancel,
+                )
+            except Exception as e:
+                result = SortResult()
+                result.add_error("", str(e))
+            cancelled = self._desktop_cancel_event.is_set()
+            self.after(0, lambda: self._after_sort(result, cancelled))
+            self.after(0, self._end_task)
+            self.after(0, lambda: self._desktop_cancel_btn.configure(state="disabled"))
+            self.after(0, lambda: setattr(self, "_desktop_sort_active", False))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _compression_notice(self, count: int, *, enabled: bool | None = None, paths: list[str] | None = None) -> str:
         on = self.settings.compression_enabled if enabled is None else enabled
@@ -1133,6 +1238,10 @@ class App(Tk):
             self._desktop_ctx.add_command(
                 label=label,
                 command=lambda: self._desktop_sort_paths(sortable),
+            )
+            self._desktop_ctx.add_command(
+                label="По моим папкам" if single else f"По моим папкам ({len(sortable)})",
+                command=self._desktop_smart_folders_sort,
             )
         excluded = any(by_path.get(p, {}).get("excluded") for p in paths)
         if excluded:
@@ -1803,6 +1912,7 @@ class App(Tk):
             on_enable_compression=self._ai_enable_compression,
             on_show_desktop=self._ai_show_desktop_tab,
             on_open_settings=self._open_ai_settings,
+            on_smart_folders=self._ai_smart_folders,
         )
         self._ai_panel.pack(fill=BOTH, expand=True)
 
@@ -1827,6 +1937,12 @@ class App(Tk):
 
     def _ai_show_desktop_tab(self) -> None:
         self._notebook.select(1)
+        self._desktop_refresh()
+
+    def _ai_smart_folders(self, paths: list[str]) -> None:
+        """Запуск умной раскладки из ИИ-помощника для указанных путей."""
+        self._desktop_selected = set(paths)
+        self._desktop_smart_folders_sort(paths)
 
     def _open_ai_settings(self) -> None:
         from tkinter import Radiobutton
@@ -2376,6 +2492,24 @@ class App(Tk):
             self.ctx.grab_release()
 
     def _sort_now(self):
+        if self.settings.sort_mode == "smart_folders":
+            paths = [
+                e["path"] for e in self.sorter.list_watched_entries()
+                if e.get("sortable") and Path(e["path"]).is_file()
+            ]
+            if not paths:
+                messagebox.showinfo("Сортировка", "Нет готовых файлов для сортировки.")
+                return
+            # временно выделить всё и запустить умную раскладку
+            if hasattr(self, "_desktop_selected"):
+                self._desktop_selected = set(paths)
+                self._desktop_smart_folders_sort()
+            else:
+                messagebox.showinfo(
+                    "Мои папки",
+                    "Откройте вкладку «Рабочий стол» и нажмите «По моим папкам».",
+                )
+            return
         paths = [
             e["path"] for e in self.sorter.list_watched_entries() if e.get("sortable")
         ]
@@ -2929,6 +3063,45 @@ class App(Tk):
         ).pack(fill=X, pady=(0, 4))
         update_sort_preview()
 
+        Label(canvas_frame, text="Умная раскладка по моим папкам",
+              font=("Segoe UI", 11, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(14, 4))
+        Label(
+            canvas_frame,
+            text="Корень библиотеки — папка с вашими категориями (подпапки = профили для сопоставления).",
+            fg=theme.TEXT_MUTED, bg=theme.BG, font=("Segoe UI", 9), anchor="w", padx=20,
+        ).pack(fill=X)
+        sf_root_var = StringVar(value=self.settings.smart_folders_root)
+        sf_frame = Frame(canvas_frame, bg=theme.BG)
+        sf_frame.pack(fill=X, padx=16, pady=(4, 0))
+        ttk.Entry(sf_frame, textvariable=sf_root_var).pack(side=LEFT, fill=X, expand=True)
+
+        def choose_sf_root():
+            d = filedialog.askdirectory(
+                initialdir=sf_root_var.get() or str(Path.home()),
+                title="Папка библиотеки (Мои папки)",
+            )
+            if d:
+                sf_root_var.set(d)
+
+        ttk.Button(sf_frame, text="Обзор...", command=choose_sf_root).pack(side=LEFT, padx=(6, 0))
+
+        sf_thresh_var = StringVar(value=str(self.settings.smart_folders_threshold))
+        sf_row = Frame(canvas_frame, bg=theme.BG)
+        sf_row.pack(fill=X, padx=16, pady=(6, 0))
+        Label(sf_row, text="Порог совпадения (0.05–0.95):", bg=theme.BG).pack(side=LEFT)
+        ttk.Entry(sf_row, textvariable=sf_thresh_var, width=6).pack(side=LEFT, padx=(8, 0))
+
+        sf_catchall_var = StringVar(value=self.settings.smart_folders_catchall)
+        Label(sf_row, text="  Папка «Другое»:", bg=theme.BG).pack(side=LEFT, padx=(16, 0))
+        ttk.Entry(sf_row, textvariable=sf_catchall_var, width=14).pack(side=LEFT, padx=(6, 0))
+
+        sf_auto_var = StringVar(value="on" if self.settings.smart_folders_auto_create else "off")
+        ttk.Checkbutton(
+            canvas_frame,
+            text="Автоматически предлагать создание папок для файлов без совпадения",
+            variable=sf_auto_var, onvalue="on", offvalue="off",
+        ).pack(anchor="w", padx=28, pady=(4, 0))
+
         Label(canvas_frame, text="Что делать с файлами",
               font=("Segoe UI", 11, "bold"), bg=theme.BG).pack(anchor="w", padx=16, pady=(14, 4))
         storage_var = StringVar(value=self.settings.storage_mode)
@@ -3125,6 +3298,17 @@ class App(Tk):
             self.settings.data["excluded_paths"] = excluded
             self.settings.data.pop("destination", None)
             self.settings.data["watched_folders"] = folders
+            self.settings.data["smart_folders_root"] = sf_root_var.get().strip()
+            try:
+                self.settings.data["smart_folders_threshold"] = max(
+                    0.05,
+                    min(0.95, float(sf_thresh_var.get().strip() or "0.28")),
+                )
+            except ValueError:
+                self.settings.data["smart_folders_threshold"] = 0.28
+            self.settings.data["smart_folders_auto_create"] = sf_auto_var.get() == "on"
+            catch = sf_catchall_var.get().strip() or "Другое"
+            self.settings.data["smart_folders_catchall"] = catch
             self.settings.save()
             self._update_mode_banner()
             if was_dark != self.settings.dark_mode or was_large != self.settings.large_text:

@@ -39,6 +39,8 @@ hidden = [
     "organizer.ai_assistant",
     "organizer.ai_ui",
     "organizer.video_player",
+    "organizer.folder_profiles",
+    "organizer.smart_folders_ui",
     "windnd",
     "fitz",
 ]

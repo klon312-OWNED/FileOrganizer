@@ -68,7 +68,9 @@ FOLDER_CATEGORY = "Папки"
 # Расширения файлов, которые ещё качаются — их трогать нельзя.
 SKIP_EXTENSIONS = [".crdownload", ".part", ".tmp", ".partial", ".download", ".!ut"]
 
-_VALID_SORT_MODES = frozenset({"type_date", "type_only", "date_only", "extension", "flat"})
+_VALID_SORT_MODES = frozenset({
+    "type_date", "type_only", "date_only", "extension", "flat", "smart_folders",
+})
 _VALID_STORAGE_MODES = frozenset({"move", "copy"})
 _VALID_DATE_SOURCES = frozenset({"download", "modified", "created"})
 _VALID_COMPRESSION_MODES = frozenset({"none", "zip", "zip_per_item"})
@@ -136,6 +138,11 @@ DEFAULT_SETTINGS: dict = {
     "ai_model": "gpt-4o-mini",
     "ai_ollama_url": "http://localhost:11434",
     "ai_ollama_model": "llama3.2",
+    # Умная раскладка по пользовательским папкам («Мои папки»)
+    "smart_folders_root": "",
+    "smart_folders_threshold": 0.28,
+    "smart_folders_auto_create": False,
+    "smart_folders_catchall": "Другое",
 }
 
 
@@ -213,6 +220,19 @@ class Settings:
         merged["ai_ollama_model"] = str(
             merged.get("ai_ollama_model") or DEFAULT_SETTINGS["ai_ollama_model"],
         )
+        merged["smart_folders_root"] = str(merged.get("smart_folders_root") or "")
+        try:
+            merged["smart_folders_threshold"] = max(
+                0.05,
+                min(0.95, float(merged.get("smart_folders_threshold", 0.28))),
+            )
+        except (TypeError, ValueError):
+            merged["smart_folders_threshold"] = DEFAULT_SETTINGS["smart_folders_threshold"]
+        merged["smart_folders_auto_create"] = bool(
+            merged.get("smart_folders_auto_create", False),
+        )
+        catchall = str(merged.get("smart_folders_catchall") or "Другое").strip()
+        merged["smart_folders_catchall"] = catchall or "Другое"
         self.data = merged
 
     def save(self) -> None:
@@ -379,6 +399,29 @@ class Settings:
         return str(
             self.data.get("ai_ollama_model") or DEFAULT_SETTINGS["ai_ollama_model"],
         )
+
+    @property
+    def smart_folders_root(self) -> str:
+        return str(self.data.get("smart_folders_root") or "")
+
+    @property
+    def smart_folders_threshold(self) -> float:
+        try:
+            return max(
+                0.05,
+                min(0.95, float(self.data.get("smart_folders_threshold", 0.28))),
+            )
+        except (TypeError, ValueError):
+            return 0.28
+
+    @property
+    def smart_folders_auto_create(self) -> bool:
+        return bool(self.data.get("smart_folders_auto_create", False))
+
+    @property
+    def smart_folders_catchall(self) -> str:
+        name = str(self.data.get("smart_folders_catchall") or "Другое").strip()
+        return name or "Другое"
 
     def add_excluded_path(self, path: str) -> None:
         try:

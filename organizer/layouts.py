@@ -19,6 +19,7 @@ SORT_MODES: dict[str, str] = {
     "date_only": "Только по дате — 2026/06-Июнь/файл",
     "extension": "По расширению — .pdf, .jpg",
     "flat": "Без подпапок — всё в корень архива",
+    "smart_folders": "По моим папкам — в вашу библиотеку категорий",
 }
 
 STORAGE_MODES: dict[str, str] = {
@@ -61,6 +62,10 @@ def dest_directory(
             if not ext.startswith("."):
                 ext = "." + ext
             dest = root / "По расширению" / ext.lstrip(".")
+    elif sort_mode == "smart_folders":
+        # Назначение задаётся явно через sorter.apply_smart_folder_plan;
+        # запасной путь — как type_only внутри корня библиотеки.
+        dest = root / (category or OTHER_CATEGORY)
     else:  # type_date — по умолчанию
         dest = root / category / str(year) / MONTHS_RU[month]
 
@@ -80,6 +85,7 @@ def sort_mode_preview(mode: str) -> str:
         "date_only": "2026/06-Июнь/photo.jpg",
         "extension": "По расширению/pdf/report.pdf",
         "flat": "photo.jpg",
+        "smart_folders": "Учёба/Курс Python/homework_01.pdf",
     }
     return examples.get(mode, "")
 

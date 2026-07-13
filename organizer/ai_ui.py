@@ -6,7 +6,7 @@ import csv
 import io
 import threading
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Frame, Label, StringVar, Text, filedialog, messagebox
+from tkinter import BOTH, END, LEFT, RIGHT, X, Y, Canvas, Frame, Label, StringVar, Text, filedialog, messagebox
 from tkinter import ttk
 from typing import Callable
 
@@ -47,6 +47,7 @@ class AIAssistantPanel(Frame):
         on_enable_compression: Callable[[], None],
         on_show_desktop: Callable[[], None],
         on_open_settings: Callable[[], None],
+        on_smart_folders: Callable[[list[str]], None] | None = None,
     ) -> None:
         super().__init__(master, bg=theme.BG)
         self._get_settings = get_settings
@@ -61,6 +62,7 @@ class AIAssistantPanel(Frame):
         self._on_compress = on_enable_compression
         self._on_desktop = on_show_desktop
         self._on_settings = on_open_settings
+        self._on_smart_folders = on_smart_folders
         self._busy = False
         self._history: list[dict[str, str]] = []
         self._last_results: list[SearchResult] = []
@@ -147,7 +149,7 @@ class AIAssistantPanel(Frame):
         sug_wrap.pack(side="top", fill=BOTH, expand=True, pady=(4, 6))
         sug_vsb = ttk.Scrollbar(sug_wrap)
         sug_vsb.pack(side=RIGHT, fill=Y)
-        self._sug_canvas = ttk.Canvas(sug_wrap, highlightthickness=0, bg=theme.CARD)
+        self._sug_canvas = Canvas(sug_wrap, highlightthickness=0, bg=theme.CARD)
         self._sug_canvas.pack(side=LEFT, fill=BOTH, expand=True)
         sug_vsb.configure(command=self._sug_canvas.yview)
         self._sug_canvas.configure(yscrollcommand=sug_vsb.set)
@@ -186,7 +188,7 @@ class AIAssistantPanel(Frame):
         res_wrap.pack(side="top", fill=BOTH, expand=True, pady=(4, 0))
         res_vsb = ttk.Scrollbar(res_wrap)
         res_vsb.pack(side=RIGHT, fill=Y)
-        self._res_canvas = ttk.Canvas(res_wrap, highlightthickness=0, bg=theme.CARD)
+        self._res_canvas = Canvas(res_wrap, highlightthickness=0, bg=theme.CARD)
         self._res_canvas.pack(side=LEFT, fill=BOTH, expand=True)
         res_vsb.configure(command=self._res_canvas.yview)
         self._res_canvas.configure(yscrollcommand=res_vsb.set)
@@ -562,6 +564,12 @@ class AIAssistantPanel(Frame):
                 self._on_compress()
         elif action == "smart_cleanup":
             self._on_cleanup()
+        elif action == "smart_folders":
+            paths = payload.get("paths") or []
+            if paths and self._on_smart_folders:
+                self._on_smart_folders(paths)
+            elif not self._on_smart_folders:
+                messagebox.showinfo("ИИ-помощник", sug.description)
         elif action == "show_desktop":
             self._on_desktop()
         elif action == "search":

@@ -13,6 +13,7 @@ from pathlib import Path
 from .compression import remove_source, zip_group, zip_item
 from .config import APP_DIR, FOLDER_CATEGORY, SKIP_EXTENSIONS, Settings, app_install_root
 from .database import FileIndex
+from .folder_profiles import MatchProposal, build_match_plan
 from .layouts import dest_directory, infer_index_fields
 
 APP_ROOT = app_install_root()
@@ -183,6 +184,17 @@ class Sorter:
         except OSError:
             return False
 
+    def _is_inside_smart_library(self, path: Path) -> bool:
+        root = self.settings.smart_folders_root.strip()
+        if not root:
+            return False
+        try:
+            lib = Path(root).resolve()
+            rpath = path.resolve()
+            return lib == rpath or lib in rpath.parents
+        except OSError:
+            return False
+
     def _is_protected(self, path: Path) -> bool:
         if self._is_excluded(path):
             return True
@@ -204,6 +216,13 @@ class Sorter:
                     return True
             except OSError:
                 continue
+        root = self.settings.smart_folders_root.strip()
+        if root:
+            try:
+                if rp == Path(root).resolve():
+                    return True
+            except OSError:
+                pass
         return False
 
     def _is_excluded(self, path: Path) -> bool:
@@ -302,6 +321,8 @@ class Sorter:
             return None
         if self._is_inside_destination(path) or self._is_protected(path):
             return None
+        if self.settings.sort_mode == "smart_folders":
+            return None
 
         ext = path.suffix.lower()
         category = self.settings.category_for_extension(ext)
@@ -350,6 +371,8 @@ class Sorter:
         if not self._is_ready(path):
             return None
         if self._is_inside_destination(path) or self._is_protected(path):
+            return None
+        if self.settings.sort_mode == "smart_folders":
             return None
 
         ts = self._file_time(path)
@@ -410,6 +433,117 @@ class Sorter:
             if self.sort_entry(entry, result):
                 count += 1
         return count
+
+    def build_smart_folder_plan(self, paths: list[str | Path]) -> tuple[list[MatchProposal], Path]:
+        """Построить план умной раскладки по пользовательской библиотеке."""
+        root = Path(self.settings.smart_folders_root.strip())
+        if not root.is_dir():
+            raise ValueError("Укажите существующую папку библиотеки в настройках «Мои папки».")
+        file_paths = [
+            p for p in paths
+            if Path(p).is_file() and not self._is_protected(Path(p))
+            and not self._is_inside_smart_library(Path(p))
+        ]
+        proposals, _profiles = build_match_plan(
+            file_paths,
+            root,
+            threshold=self.settings.smart_folders_threshold,
+            catchall_name=self.settings.smart_folders_catchall,
+        )
+        return proposals, root
+
+    def apply_smart_folder_plan(
+        self,
+        proposals: list[MatchProposal],
+        result: SortResult | None = None,
+        *,
+        on_progress=None,
+        should_cancel=None,
+    ) -> int:
+        """Применить подтверждённый план умной раскладки."""
+        moved = 0
+        dry_run = bool(self.settings.data.get("dry_run", False))
+        active = [
+            p for p in proposals
+            if p.action != "skip" and p.dest_folder is not None and p.source.is_file()
+        ]
+        total = len(active)
+        for i, prop in enumerate(active, start=1):
+            if should_cancel and should_cancel():
+                break
+            dest_dir = prop.dest_folder
+            if dest_dir is None:
+                continue
+            if not dry_run:
+                try:
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    if result is not None:
+                        result.add_error(str(prop.source), str(e))
+                    continue
+            target = self._unique_target(dest_dir / prop.source.name)
+            ok, err = self._transfer(prop.source, target)
+            if not ok:
+                if result is not None:
+                    result.add_error(str(prop.source), err or "не удалось переместить")
+                continue
+            moved += 1
+            if dry_run:
+                if on_progress:
+                    try:
+                        on_progress(i, total, str(prop.source))
+                    except Exception:
+                        pass
+                continue
+            ts = self._file_time(target)
+            ext = target.suffix.lower()
+            category = prop.profile_name or self.settings.category_for_extension(ext)
+            dt = datetime.fromtimestamp(ts)
+            self.index.add_file(
+                name=target.name,
+                path=str(target),
+                source_path=str(prop.source),
+                category=category,
+                extension=ext,
+                size=target.stat().st_size,
+                added_ts=ts,
+                year=dt.year,
+                month=dt.month,
+                kind="file",
+            )
+            self._record_move(
+                str(prop.source), str(target), "file", ts,
+                category=category, name=target.name,
+            )
+            if on_progress:
+                try:
+                    on_progress(i, total, str(prop.source))
+                except Exception:
+                    pass
+        return moved
+
+    def apply_confirmed_smart_plan(
+        self,
+        proposals: list[MatchProposal],
+        *,
+        on_progress=None,
+        should_cancel=None,
+    ) -> SortResult:
+        """Применить план после диалога подтверждения."""
+        result = SortResult()
+        prev_mode = self.settings.data.get("sort_mode")
+        self.settings.data["sort_mode"] = "smart_folders"
+        try:
+            with self.batch_context("smart-folders"):
+                result.moved = self.apply_smart_folder_plan(
+                    proposals,
+                    result,
+                    on_progress=on_progress,
+                    should_cancel=should_cancel,
+                )
+        finally:
+            self.settings.data["sort_mode"] = prev_mode
+        return result
 
     def list_watched_entries(self) -> list[dict]:
         """Верхнеуровневые элементы из отслеживаемых папок (для «Рабочего стола»)."""

@@ -476,6 +476,13 @@ class TestStatsTempTop(unittest.TestCase):
         self.assertIn("Видео", text)
 
 
+class TestAIUiRegression(unittest.TestCase):
+    def test_ai_ui_uses_tk_canvas_not_ttk(self):
+        """ttk.Canvas не существует — падение при старте вкладки ИИ."""
+        text = (ROOT / "organizer" / "ai_ui.py").read_text(encoding="utf-8")
+        self.assertNotIn("ttk.Canvas", text)
+        self.assertIn("Canvas(", text)
+
 
 if __name__ == "__main__":
     unittest.main()
