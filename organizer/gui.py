@@ -1915,6 +1915,7 @@ class App(Tk):
             on_open_settings=self._open_ai_settings,
             on_smart_folders=self._ai_smart_folders,
             on_apply_sort_plan=self._ai_apply_sort_plan,
+            on_undo_last=self._ai_undo_last,
         )
         self._ai_panel.pack(fill=BOTH, expand=True)
 
@@ -2015,12 +2016,16 @@ class App(Tk):
         self._desktop_selected = set(paths)
         self._desktop_smart_folders_sort(paths)
 
+    def _ai_undo_last(self) -> None:
+        """Отмена последней сортировки по запросу ИИ-помощника."""
+        self._undo_last()
+
     def _open_ai_settings(self) -> None:
-        from tkinter import Radiobutton
+        from tkinter import Radiobutton, Text as TkText
 
         win = Toplevel(self)
         win.title("Настройки ИИ-помощника")
-        win.geometry("520x420")
+        win.geometry("520x520")
         win.configure(bg=theme.BG)
         win.transient(self)
         win.grab_set()
@@ -2071,6 +2076,24 @@ class App(Tk):
         ollama_model_var = StringVar(value=self.settings.ai_ollama_model)
         ttk.Entry(ollama_frame, textvariable=ollama_model_var).pack(fill=X, pady=(2, 6))
 
+        custom_frame = Frame(win, bg=theme.BG)
+        custom_frame.pack(fill=X, padx=16, pady=4)
+        Label(
+            custom_frame,
+            text="Доп. инструкции (как system rules — по желанию):",
+            bg=theme.BG, anchor="w",
+        ).pack(fill=X)
+        custom_text = TkText(custom_frame, height=4, font=("Segoe UI", 9), wrap="word")
+        custom_text.pack(fill=X, pady=(2, 4))
+        custom_text.insert("1.0", self.settings.ai_custom_instructions)
+
+        persist_var = BooleanVar(value=self.settings.ai_persist_chat)
+        ttk.Checkbutton(
+            win,
+            text="Сохранять историю чата между запусками (~/.file_organizer/chat_history.json)",
+            variable=persist_var,
+        ).pack(anchor="w", padx=16, pady=(0, 4))
+
         btns = Frame(win, bg=theme.BG)
         btns.pack(fill=X, padx=16, pady=12)
 
@@ -2109,6 +2132,8 @@ class App(Tk):
             self.settings.data["ai_model"] = model_var.get().strip() or "gpt-4o-mini"
             self.settings.data["ai_ollama_url"] = ollama_url_var.get().strip() or "http://localhost:11434"
             self.settings.data["ai_ollama_model"] = ollama_model_var.get().strip() or "llama3.2"
+            self.settings.data["ai_custom_instructions"] = custom_text.get("1.0", END).strip()
+            self.settings.data["ai_persist_chat"] = bool(persist_var.get())
             self.settings.save()
             if hasattr(self, "_ai_panel"):
                 self._ai_panel.refresh()

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .classify import classify
-from .config import OTHER_CATEGORY, Settings
+from .config import APP_DIR, OTHER_CATEGORY, Settings
 from .database import FileIndex
 from .layouts import MONTHS_RU, SORT_MODES, sort_mode_label
 
@@ -187,13 +187,17 @@ _INSTALLER_EXTS = {".exe", ".msi", ".msix", ".apk", ".dmg", ".appx"}
 _DUP_NAME_RE = re.compile(r"\(\d+\)|\bкопия\b|\bcopy\b|_copy", re.I)
 
 QUICK_QUERIES = (
+    "разбери загрузки",
+    "найди курсовые",
+    "сожми установщики",
+    "покажи что можно удалить",
     "сортируй PDF по курсам",
     "найди большие видео",
     "разложи в мои папки учёбы",
     "положи docx в Документы/Учёба/Python",
     "разложи по моим папкам",
     "сжми установщики в zip",
-    "все pdf за 2025 год отсортируй",
+    "все pdf за этот год отсортируй",
     "сортируй по типу",
     "сортируй по дате",
     "сортируй по расширению",
@@ -209,11 +213,21 @@ QUICK_QUERIES = (
     "что сортировать сейчас?",
 )
 
+# Чипы быстрых запросов на вкладке ИИ-помощника (v1.15)
+SUGGESTED_PROMPTS = (
+    "Разбери загрузки",
+    "Найди PDF за этот год",
+    "Разложи по моим папкам",
+    "Сожми установщики",
+    "Покажи что можно удалить",
+    "Сколько места?",
+)
+
 _SORT_VERBS = (
     "сортир", "отсортир", "разлож", "разложи", "полож", "положи", "перенес",
-    "сложи", "сложить", "разложить", "упорядоч", "расклад",
+    "сложи", "сложить", "разложить", "упорядоч", "расклад", "разбер", "разбери",
 )
-_COMPRESS_WORDS = ("сжми", "сжать", "сжати", "в zip", "в зип", "zip", "упакуй", "упаков")
+_COMPRESS_WORDS = ("сжми", "сожми", "сжать", "сжати", "в zip", "в зип", "zip", "упакуй", "упаков")
 _EXCLUDE_WORDS = ("исключ", "не трогай", "не сортир", "пропуст")
 
 _SORT_MODE_PATTERNS: list[tuple[tuple[str, ...], str]] = [
@@ -941,6 +955,11 @@ class RulesAssistant:
             intent.extensions.append(".pdf")
             if "Документы" not in intent.categories:
                 intent.categories.append("Документы")
+
+        if any(w in low for w in ("курсов", "курсовая", "курсовую", "диплом", "реферат", "контрольн")):
+            if not intent.name_contains:
+                intent.name_contains = "курсов"
+            intent.action = "search"
 
         year_m = re.search(r"(20\d{2})", low)
         if year_m:
@@ -2179,3 +2198,668 @@ def storage_stats_summary(
     watched_entries: list[dict],
 ) -> str:
     return format_storage_stats(compute_storage_stats(index, watched_entries))
+
+
+# ---------------------------------------------------------------------------
+# v1.15 — ConversationalAgent: инструменты + свободный русский диалог
+# ---------------------------------------------------------------------------
+
+CHAT_HISTORY_PATH = APP_DIR / "chat_history.json"
+MAX_AGENT_HISTORY = 10  # последние N пар сообщений в контексте
+
+AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "name": "search_files",
+        "description": "Поиск файлов по фильтрам в архиве, отслеживаемых папках или на ПК.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Текстовый запрос или фильтр"},
+                "scope": {
+                    "type": "string",
+                    "enum": ["all", "archive", "desktop", "pc"],
+                    "description": "Где искать",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "plan_sort",
+        "description": "Построить превью-план сортировки (dry-run). Не выполняет перемещение.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["type_only", "type_date", "date_only", "extension", "smart_folders"],
+                },
+                "target": {"type": "string", "description": "Путь назначения, напр. Документы/Учёба"},
+                "compress": {"type": "boolean"},
+                "scope": {"type": "string", "enum": ["filtered", "all_watched", "selected"]},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "execute_sort",
+        "description": "Выполнить ранее подтверждённый план (только после согласия пользователя).",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "list_watched_folders",
+        "description": "Список отслеживаемых папок.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_stats",
+        "description": "Сводка по занятому месту в архиве и отслеживаемых папках.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "suggest_cleanup",
+        "description": "Кандидаты на уборку / что можно удалить (без авто-удаления).",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "smart_folder_match",
+        "description": "Сопоставить файлы с папками библиотеки «Мои папки».",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "name": "exclude_path",
+        "description": "Исключить путь из автосортировки.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "open_file",
+        "description": "Открыть файл в системе.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "show_in_folder",
+        "description": "Показать файл в проводнике.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "undo_last",
+        "description": "Отменить последнюю операцию сортировки из журнала.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "explain_status",
+        "description": "Кратко описать состояние папок и возможности помощника.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+]
+
+
+@dataclass
+class ToolCall:
+    """Вызов инструмента агентом."""
+
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AgentTurn:
+    """Ответ ConversationalAgent на одно сообщение пользователя."""
+
+    message: str
+    action: str = "reply"
+    search: SearchIntent | None = None
+    search_results: list[SearchResult] = field(default_factory=list)
+    sort_plan: SortPlan | None = None
+    suggestions: list[Suggestion] = field(default_factory=list)
+    next_steps: list[str] = field(default_factory=list)
+    clarify_options: list[str] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    needs_confirm: bool = False
+    pending_path: str = ""
+
+
+def load_persisted_chat() -> list[dict[str, str]]:
+    """Загрузить сохранённую историю чата."""
+    if not CHAT_HISTORY_PATH.exists():
+        return []
+    try:
+        data = json.loads(CHAT_HISTORY_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [
+                {"role": str(m.get("role")), "content": str(m.get("content") or "")}
+                for m in data[-MAX_AGENT_HISTORY * 2 :]
+                if m.get("role") in ("user", "assistant") and m.get("content")
+            ]
+    except (json.JSONDecodeError, OSError):
+        pass
+    return []
+
+
+def save_persisted_chat(messages: list[dict[str, str]], *, enabled: bool = True) -> None:
+    """Сохранить историю чата на диск."""
+    if not enabled:
+        return
+    try:
+        trimmed = messages[-MAX_AGENT_HISTORY * 2 :]
+        CHAT_HISTORY_PATH.write_text(
+            json.dumps(trimmed, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def build_agent_system_prompt(settings: Settings) -> str:
+    """System prompt на русском — возможности приложения."""
+    custom = (settings.ai_custom_instructions or "").strip()
+    custom_block = f"\n\nДоп. инструкции пользователя:\n{custom}" if custom else ""
+    return (
+        "Ты ИИ-помощник приложения FileOrganizer (организация файлов на Windows). "
+        "Отвечай по-русски, кратко и дружелюбно. "
+        "Ты НЕ удаляешь и НЕ перемещаешь файлы без явного подтверждения пользователя.\n\n"
+        "Возможности:\n"
+        "• Режимы сортировки: по типу, по типу и дате, по дате, по расширению, «Мои папки» (smart_folders).\n"
+        "• Умные папки: раскладка по пользовательской библиотеке с подкатегориями.\n"
+        "• Сжатие ZIP при сортировке (установщики и крупные файлы).\n"
+        "• Архив — отсортированные файлы; вкладка «Рабочий стол» — отслеживаемые папки.\n"
+        "• История операций и отмена последней сортировки.\n"
+        "• Исключения путей из автосортировки.\n"
+        "• Поиск: категории, расширения, даты, размер, дубликаты, установщики, мусор.\n\n"
+        "Для действий вызывай инструменты (tool_calls). На API передаются только метаданные "
+        "(имена, размеры, категории), не содержимое файлов."
+        f"{custom_block}"
+    )
+
+
+def build_agent_context_summary(
+    settings: Settings,
+    index: FileIndex,
+    watched_entries: list[dict],
+) -> str:
+    """Краткий контекст настроек для LLM (metadata only)."""
+    stats = compute_storage_stats(index, watched_entries)
+    lib = (settings.smart_folders_root or "").strip() or "не задана"
+    watched = settings.watched_folders[:6]
+    return json.dumps({
+        "sort_mode": settings.sort_mode,
+        "compression_enabled": settings.compression_enabled,
+        "archive_path": settings.destination,
+        "smart_folders_root": lib,
+        "watched_folders": watched,
+        "excluded_count": len(settings.excluded_paths),
+        "archive_files": stats.archive_files,
+        "archive_size": stats.archive_size,
+        "desktop_sortable": stats.desktop_sortable,
+        "desktop_size": stats.desktop_size,
+    }, ensure_ascii=False)
+
+
+def route_tools_rules(text: str, history: list[dict[str, str]] | None = None) -> list[ToolCall]:
+    """Локальный режим: ключевые слова и паттерны → инструменты."""
+    q = text.strip()
+    low = q.lower()
+    calls: list[ToolCall] = []
+
+    if any(w in low for w in (
+        "привет", "здравств", "как дела", "как тебе", "как ты", "что умеешь",
+        "помощь", "help", "кто ты",
+    )):
+        return [ToolCall("explain_status", {"query": q})]
+
+    if any(w in low for w in ("отмени", "undo", "верни как было", "откати")):
+        if any(w in low for w in ("последн", "сортир", "операц")):
+            return [ToolCall("undo_last", {})]
+
+    if any(w in low for w in ("исключ", "не трогай", "пропуст")) and (
+        "\\" in q or "/" in q or re.search(r"[A-Za-z]:\\", q)
+    ):
+        m = re.search(r"([A-Za-z]:\\[^\n]+|/[^\n]+)", q)
+        if m:
+            return [ToolCall("exclude_path", {"path": m.group(1).strip()})]
+
+    if any(w in low for w in (
+        "статистик", "сколько мест", "сколько файлов", "занимает", "сколько в архив",
+    )):
+        return [ToolCall("get_stats", {})]
+
+    if any(w in low for w in (
+        "что удал", "можно удал", "уборк", "мусор", "очист", "лишн", "кандидат",
+    )) or low in ("покажи что можно удалить", "что можно удалить"):
+        return [ToolCall("suggest_cleanup", {})]
+
+    if any(w in low for w in ("отслеж", "наблюд", "watched", "какие папк")):
+        return [ToolCall("list_watched_folders", {})]
+
+    if any(w in low for w in _SORT_VERBS) or any(w in low for w in _COMPRESS_WORDS):
+        scope = "all_watched"
+        if any(w in low for w in ("загруз", "download")):
+            scope = "all_watched"
+        compress = any(w in low for w in _COMPRESS_WORDS)
+        mode = _detect_sort_mode_from_text(low, "type_date") or ""
+        if any(w in low for w in ("мои папк", "по курсам", "умн")):
+            mode = "smart_folders"
+        return [ToolCall("plan_sort", {
+            "query": q,
+            "mode": mode or None,
+            "compress": compress,
+            "scope": scope,
+        })]
+
+    if any(w in low for w in ("найд", "покаж", "ищ", "search", "find", "где ", "курсов")):
+        scope = "all"
+        if "архив" in low:
+            scope = "archive"
+        elif any(w in low for w in ("рабоч", "загруз", "desktop", "download", "отслеж")):
+            scope = "desktop"
+        return [ToolCall("search_files", {"query": q, "scope": scope})]
+
+    if any(w in low for w in ("подсказ", "совет", "рекоменд", "что сортир")):
+        return [ToolCall("suggest_cleanup", {}), ToolCall("get_stats", {})]
+
+    # Короткое уточнение к прошлому запросу
+    if history and len(q.split()) <= 5:
+        prev = next((m["content"] for m in reversed(history) if m.get("role") == "user"), "")
+        if prev:
+            return route_tools_rules(f"{prev} {q}", history=None)
+
+    return [ToolCall("explain_status", {"query": q})]
+
+
+class ConversationalAgent:
+    """Агент с инструментами: свободный русский диалог + безопасные действия."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        index: FileIndex,
+        watched_entries: list[dict],
+        *,
+        sorter: Any = None,
+        assistant: RulesAssistant | LLMAssistant | None = None,
+    ) -> None:
+        self.settings = settings
+        self.index = index
+        self.watched_entries = watched_entries
+        self.sorter = sorter
+        self._rules = RulesAssistant()
+        self._assistant = assistant or create_assistant(settings)
+
+    @property
+    def provider(self) -> Provider:
+        if isinstance(self._assistant, LLMAssistant):
+            return self._assistant.provider
+        return "rules"
+
+    def chat(
+        self,
+        text: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> AgentTurn:
+        """Обработать сообщение: маршрутизация → инструменты → ответ."""
+        history = history or []
+        tool_calls = self._route_tools(text, history)
+        turn = AgentTurn(message="", tool_calls=tool_calls)
+
+        for call in tool_calls:
+            partial = self._execute_tool(call, text, history)
+            turn = self._merge_turn(turn, partial)
+
+        if not turn.message:
+            turn.message = "Готов помочь с файлами. Спросите, например: «разбери загрузки»."
+        return turn
+
+    def _route_tools(self, text: str, history: list[dict[str, str]]) -> list[ToolCall]:
+        if self.provider == "rules":
+            return route_tools_rules(text, history)
+        try:
+            llm_calls = self._route_tools_llm(text, history)
+            if llm_calls:
+                return llm_calls
+        except Exception:
+            pass
+        return route_tools_rules(text, history)
+
+    def _route_tools_llm(self, text: str, history: list[dict[str, str]]) -> list[ToolCall]:
+        if not isinstance(self._assistant, LLMAssistant):
+            return route_tools_rules(text, history)
+
+        ctx = build_agent_context_summary(self.settings, self.index, self.watched_entries)
+        tools_json = json.dumps(
+            [{"name": t["name"], "description": t["description"]} for t in AGENT_TOOL_SCHEMAS],
+            ensure_ascii=False,
+        )
+        system = (
+            build_agent_system_prompt(self.settings)
+            + f"\n\nКонтекст (metadata): {ctx}\n\n"
+            f"Доступные инструменты: {tools_json}\n\n"
+            "Верни ТОЛЬКО JSON: "
+            '{"message":"краткий ответ","tool_calls":[{"name":"...","arguments":{}}],'
+            '"clarify_question":""}. '
+            "Если запрос неоднозначен — одно короткое уточнение в clarify_question, tool_calls пустой. "
+            "Опасные действия (удаление, execute_sort) — только если пользователь явно подтвердил."
+        )
+        raw = self._assistant._chat(system, text, history=history)
+        if not raw:
+            return []
+        data = _extract_json(raw)
+        if not isinstance(data, dict):
+            return []
+        calls: list[ToolCall] = []
+        for item in data.get("tool_calls") or []:
+            if isinstance(item, dict) and item.get("name"):
+                calls.append(ToolCall(
+                    str(item["name"]),
+                    dict(item.get("arguments") or {}),
+                ))
+        if data.get("clarify_question"):
+            return [ToolCall("clarify", {"question": str(data["clarify_question"]), "message": str(data.get("message") or "")})]
+        if calls:
+            return calls
+        msg = str(data.get("message") or "").strip()
+        if msg:
+            return [ToolCall("explain_status", {"query": text, "prefill": msg})]
+        return []
+
+    def _execute_tool(
+        self,
+        call: ToolCall,
+        raw_text: str,
+        history: list[dict[str, str]],
+    ) -> AgentTurn:
+        name = call.name
+        args = call.arguments or {}
+
+        if name == "clarify":
+            return AgentTurn(
+                message=str(args.get("message") or args.get("question") or "Уточните запрос."),
+                action="clarify",
+                clarify_options=["Разбери загрузки", "Найди PDF за этот год", "Разложи по моим папкам"],
+            )
+
+        if name == "explain_status":
+            prefill = str(args.get("prefill") or "").strip()
+            stats = compute_storage_stats(self.index, self.watched_entries)
+            status = (
+                f"Отслеживаю {len(self.settings.watched_folders)} папок, "
+                f"в них {stats.desktop_sortable} элементов ({human_size(stats.desktop_size)}). "
+                f"Архив: {stats.archive_files} файлов ({human_size(stats.archive_size)}). "
+                f"Режим: {sort_mode_label(self.settings.sort_mode)}."
+            )
+            tips = (
+                "Можно: «разбери загрузки», «найди курсовые», «сожми установщики», "
+                "«покажи что можно удалить», «сколько места?»."
+            )
+            msg = prefill or status
+            if not prefill:
+                msg = f"{status} {tips}"
+            elif "?" in raw_text.lower() or any(w in raw_text.lower() for w in ("как", "что")):
+                msg = f"{prefill} {tips}"
+            return AgentTurn(message=msg, action="reply", next_steps=[tips])
+
+        if name == "get_stats":
+            stats = compute_storage_stats(self.index, self.watched_entries)
+            return AgentTurn(
+                message=format_storage_stats(stats),
+                action="stats",
+                next_steps=["Спросите «что сортировать?» или «разбери загрузки»"],
+            )
+
+        if name == "list_watched_folders":
+            folders = self.settings.watched_folders
+            if not folders:
+                return AgentTurn(message="Нет отслеживаемых папок. Добавьте их в настройках.", action="reply")
+            lines = "\n".join(f"• {f}" for f in folders[:12])
+            extra = f"\n… и ещё {len(folders) - 12}" if len(folders) > 12 else ""
+            return AgentTurn(
+                message=f"Отслеживаемые папки ({len(folders)}):\n{lines}{extra}",
+                action="reply",
+            )
+
+        if name == "suggest_cleanup":
+            suggestions = self._assistant.generate_suggestions(
+                self.settings, self.index, self.watched_entries,
+            )
+            cleanup = [s for s in suggestions if s.id in (
+                "smart_cleanup", "temp_files", "empty_files", "cache_logs", "review_duplicates",
+            )]
+            if not cleanup:
+                cleanup = suggestions[:3]
+            intent = SearchIntent(delete_candidates=True, source="desktop", raw_query=raw_text)
+            results = self._rules.search(
+                intent, index=self.index, watched_entries=self.watched_entries,
+            )
+            lines = [f"• {s.title}: {s.description}" for s in cleanup[:4]]
+            msg = (
+                "Кандидаты на уборку (удаление только вручную и с подтверждением):\n"
+                + "\n".join(lines)
+            )
+            if results:
+                msg += f"\n\nНайдено {len(results)} файлов-кандидатов ({human_size(sum(r.size for r in results))})."
+            return AgentTurn(
+                message=msg,
+                action="suggest",
+                search=intent,
+                search_results=results,
+                suggestions=suggestions,
+                needs_confirm=True,
+                next_steps=["Проверьте список справа", "«Умная уборка» на вкладке «Рабочий стол»"],
+            )
+
+        if name == "search_files":
+            query = str(args.get("query") or raw_text)
+            scope = str(args.get("scope") or "all")
+            reply = self._assistant.parse_assistant_query(query, self.settings, history=history)
+            intent = reply.search or self._rules.parse_user_query(query, history=history)
+            if scope in ("archive", "desktop", "all"):
+                intent.source = scope if scope != "pc" else "all"
+            results = self._rules.search(
+                intent, index=self.index, watched_entries=self.watched_entries,
+            )
+            extra = self._format_search_message(intent, results)
+            msg = reply.message or extra
+            if reply.message and extra:
+                msg = f"{reply.message} {extra}"
+            elif not msg:
+                msg = extra
+            return AgentTurn(
+                message=msg,
+                action="search",
+                search=intent,
+                search_results=results,
+                next_steps=reply.next_steps or [
+                    "«Сорт. все» — раскладка найденного",
+                    "Или: «отсортируй найденное»",
+                ],
+            )
+
+        if name == "plan_sort":
+            query = str(args.get("query") or raw_text)
+            reply = self._assistant.parse_assistant_query(query, self.settings, history=history)
+            plan = reply.sort_plan or parse_sort_plan(
+                query,
+                self.settings,
+                filter_intent=reply.search,
+                filter_summary=format_intent_summary(reply.search) if reply.search else "",
+            )
+            if plan is None:
+                return AgentTurn(
+                    message="Не понял, как сортировать. Уточните: по типу, по дате или «по моим папкам»?",
+                    action="clarify",
+                    clarify_options=["Сортировать по типу", "Разложи по моим папкам"],
+                )
+            if args.get("compress"):
+                plan.enable_compression = True
+                plan.compress = True
+            if args.get("mode"):
+                plan.sort_mode = str(args["mode"])
+            if args.get("scope"):
+                plan.scope = str(args["scope"])
+                plan.scope_label = str(args["scope"])
+            clarify = check_sort_clarification(plan, self.settings)
+            if clarify:
+                return AgentTurn(
+                    message=clarify.message,
+                    action="clarify",
+                    sort_plan=plan,
+                    search=clarify.search,
+                    clarify_options=clarify.clarify_options,
+                    next_steps=clarify.next_steps,
+                )
+            paths = collect_sort_paths(
+                plan, self.watched_entries,
+                filter_intent=reply.search,
+                rules=self._rules,
+                index=self.index,
+            )
+            plan.paths = paths[:120]
+            if self.sorter is not None:
+                plan = build_sort_preview(
+                    plan,
+                    settings=self.settings,
+                    sorter=self.sorter,
+                    watched_entries=self.watched_entries,
+                )
+            summary = format_sort_plan_summary(plan)
+            return AgentTurn(
+                message=format_assistant_message(reply, extra=summary) if reply.message else summary,
+                action="sort",
+                sort_plan=plan,
+                search=reply.search,
+                needs_confirm=True,
+                next_steps=format_sort_next_steps(plan),
+            )
+
+        if name == "smart_folder_match":
+            paths = list(args.get("paths") or [])
+            if not paths:
+                paths = [
+                    e["path"] for e in self.watched_entries
+                    if e.get("sortable") and Path(e["path"]).is_file()
+                ][:40]
+            if not self.sorter:
+                return AgentTurn(message="Сопоставление недоступно без sorter.", action="reply")
+            try:
+                proposals, lib_root = self.sorter.build_smart_folder_plan(paths)
+            except ValueError as exc:
+                return AgentTurn(message=str(exc), action="clarify")
+            lines = []
+            for p in proposals[:8]:
+                dest = p.dest_folder.name if p.dest_folder else "—"
+                lines.append(f"• {p.source.name} → {dest} ({p.score:.0%})")
+            more = f"\n… и ещё {len(proposals) - 8}" if len(proposals) > 8 else ""
+            plan = SortPlan(action="smart_folders", plan_type="smart_folders", paths=paths)
+            return AgentTurn(
+                message="Сопоставление с «Мои папки»:\n" + "\n".join(lines) + more,
+                action="sort",
+                sort_plan=plan,
+                needs_confirm=True,
+                next_steps=["Нажмите «Применить» для раскладки"],
+            )
+
+        if name == "exclude_path":
+            path = str(args.get("path") or "")
+            return AgentTurn(
+                message=f"Исключить из сортировки?\n{path}",
+                action="exclude",
+                pending_path=path,
+                needs_confirm=True,
+            )
+
+        if name == "open_file":
+            path = str(args.get("path") or "")
+            return AgentTurn(message=f"Открыть: {Path(path).name}", action="open", pending_path=path)
+
+        if name == "show_in_folder":
+            path = str(args.get("path") or "")
+            return AgentTurn(message=f"Показать в папке: {Path(path).name}", action="reveal", pending_path=path)
+
+        if name == "undo_last":
+            return AgentTurn(
+                message="Отменить последнюю операцию сортировки из журнала?",
+                action="undo",
+                needs_confirm=True,
+                next_steps=["Подтвердите — файлы вернутся на прежние места"],
+            )
+
+        if name == "execute_sort":
+            return AgentTurn(
+                message="Для выполнения нажмите «Применить» на карточке плана.",
+                action="sort",
+                needs_confirm=True,
+            )
+
+        return AgentTurn(message=f"Неизвестный инструмент: {name}", action="reply")
+
+    @staticmethod
+    def _format_search_message(intent: SearchIntent, results: list[SearchResult]) -> str:
+        total = sum(r.size for r in results)
+        parts = [
+            f"Найдено: {len(results)} ({human_size(total)})",
+            f"фильтр: {format_intent_summary(intent)}",
+        ]
+        if results:
+            parts.append("например: " + ", ".join(r.name for r in results[:3]))
+        return ". ".join(parts) + "."
+
+    @staticmethod
+    def _merge_turn(base: AgentTurn, extra: AgentTurn) -> AgentTurn:
+        if not base.message:
+            base.message = extra.message
+        elif extra.message and extra.message not in base.message:
+            base.message = f"{base.message}\n\n{extra.message}"
+        if extra.action != "reply":
+            base.action = extra.action
+        if extra.search:
+            base.search = extra.search
+        if extra.search_results:
+            base.search_results = extra.search_results
+        if extra.sort_plan:
+            base.sort_plan = extra.sort_plan
+        if extra.suggestions:
+            base.suggestions = extra.suggestions
+        if extra.next_steps:
+            base.next_steps = extra.next_steps
+        if extra.clarify_options:
+            base.clarify_options = extra.clarify_options
+        if extra.needs_confirm:
+            base.needs_confirm = True
+        if extra.pending_path:
+            base.pending_path = extra.pending_path
+        base.tool_calls.extend(extra.tool_calls)
+        return base
+
+
+def create_conversational_agent(
+    settings: Settings,
+    index: FileIndex,
+    watched_entries: list[dict],
+    *,
+    sorter: Any = None,
+) -> ConversationalAgent:
+    """Фабрика ConversationalAgent."""
+    return ConversationalAgent(
+        settings,
+        index,
+        watched_entries,
+        sorter=sorter,
+        assistant=create_assistant(settings),
+    )

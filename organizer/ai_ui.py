@@ -13,6 +13,7 @@ from typing import Callable
 from . import theme
 from .ai_assistant import (
     QUICK_QUERIES,
+    SUGGESTED_PROMPTS,
     SearchIntent,
     SearchResult,
     SortPlan,
@@ -20,6 +21,7 @@ from .ai_assistant import (
     build_sort_preview,
     collect_sort_paths,
     create_assistant,
+    create_conversational_agent,
     format_assistant_message,
     format_intent_summary,
     format_sort_plan_summary,
@@ -27,10 +29,12 @@ from .ai_assistant import (
     compute_storage_stats,
     generate_suggestions,
     human_size,
+    load_persisted_chat,
+    save_persisted_chat,
     search_files,
 )
 
-_MAX_HISTORY = 12  # пар user/assistant в сессии
+_MAX_HISTORY = 20  # пар user/assistant в сессии (контекст агента — 10)
 
 
 class AIAssistantPanel(Frame):
@@ -55,6 +59,7 @@ class AIAssistantPanel(Frame):
         on_open_settings: Callable[[], None],
         on_smart_folders: Callable[[list[str]], None] | None = None,
         on_apply_sort_plan: Callable[[SortPlan], None] | None = None,
+        on_undo_last: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master, bg=theme.BG)
         self._get_settings = get_settings
@@ -72,7 +77,9 @@ class AIAssistantPanel(Frame):
         self._on_settings = on_open_settings
         self._on_smart_folders = on_smart_folders
         self._on_apply_sort_plan = on_apply_sort_plan
+        self._on_undo_last = on_undo_last
         self._busy = False
+        self._typing_after: str | None = None
         self._history: list[dict[str, str]] = []
         self._last_results: list[SearchResult] = []
         self._pending_plan: SortPlan | None = None
@@ -129,27 +136,36 @@ class AIAssistantPanel(Frame):
         Label(chips, text="Быстро:", bg=theme.BG, fg=theme.TEXT_MUTED, font=("Segoe UI", 8)).pack(
             side=LEFT, padx=(0, 4),
         )
-        for q in QUICK_QUERIES[:10]:
-            short = q if len(q) <= 24 else q[:22] + "…"
+        for q in SUGGESTED_PROMPTS:
+            short = q if len(q) <= 28 else q[:26] + "…"
             ttk.Button(
                 chips, text=short, width=max(10, len(short) + 1),
                 command=lambda query=q: self._run_quick(query),
             ).pack(side=LEFT, padx=2, pady=2)
 
-        plan_bar = Frame(left, bg=theme.BG)
-        plan_bar.pack(side="top", fill=X, pady=(0, 4))
-        self._plan_var = StringVar(value="")
+        plan_card = Frame(left, bg=theme.SIDEBAR, highlightbackground=theme.BORDER, highlightthickness=1)
+        plan_card.pack(side="top", fill=X, pady=(0, 4), padx=0)
+        plan_inner = Frame(plan_card, bg=theme.SIDEBAR, padx=8, pady=6)
+        plan_inner.pack(fill=X)
+        Label(plan_inner, text="План действий", font=("Segoe UI", 9, "bold"), bg=theme.SIDEBAR).pack(anchor="w")
+        self._plan_var = StringVar(value="Нет активного плана")
         Label(
-            plan_bar, textvariable=self._plan_var, bg=theme.BG,
+            plan_inner, textvariable=self._plan_var, bg=theme.SIDEBAR,
             fg=theme.TEXT_MUTED, font=("Segoe UI", 8), wraplength=520, justify="left",
-        ).pack(side=LEFT, fill=X, expand=True)
+        ).pack(anchor="w", pady=(2, 6))
+        plan_btns = Frame(plan_inner, bg=theme.SIDEBAR)
+        plan_btns.pack(fill=X)
         self._apply_plan_btn = ttk.Button(
-            plan_bar, text="Применить план", style="Accent.TButton",
+            plan_btns, text="Применить", style="Accent.TButton",
             command=self._apply_pending_plan, state="disabled",
         )
-        self._apply_plan_btn.pack(side=RIGHT, padx=(4, 0))
-        ttk.Button(plan_bar, text="Сбросить", command=self._clear_pending_plan).pack(side=RIGHT)
+        self._apply_plan_btn.pack(side=LEFT, padx=(0, 4))
+        ttk.Button(plan_btns, text="Отмена", command=self._clear_pending_plan).pack(side=LEFT, padx=(0, 4))
+        ttk.Button(plan_btns, text="Изменить", command=self._edit_pending_plan).pack(side=LEFT)
 
+        clarify_frame = Frame(left, bg=theme.BG)
+        clarify_frame.pack(side="top", fill=X, pady=(0, 4))
+        self._clarify_frame = clarify_frame
 
         Label(left, text="Диалог", font=("Segoe UI", 10, "bold"), bg=theme.BG).pack(anchor="w")
         chat_wrap = Frame(left, bg=theme.CARD, highlightbackground=theme.BORDER, highlightthickness=1)
@@ -157,7 +173,14 @@ class AIAssistantPanel(Frame):
         self._chat = Text(
             chat_wrap, wrap="word", state="disabled",
             font=("Segoe UI", 10), bg=theme.CARD, fg=theme.TEXT,
+            padx=4, pady=4,
         )
+        self._chat.tag_configure("user_bubble", background="#dbeafe", lmargin1=40, lmargin2=40, rmargin=8, spacing3=6)
+        self._chat.tag_configure("assistant_bubble", background="#f1f5f9", lmargin1=8, lmargin2=8, rmargin=40, spacing3=6)
+        self._chat.tag_configure("system_bubble", foreground=theme.TEXT_MUTED, spacing3=4)
+        self._chat.tag_configure("typing", foreground=theme.TEXT_MUTED, font=("Segoe UI", 9, "italic"))
+        self._chat.tag_configure("user_label", foreground="#1d4ed8", font=("Segoe UI", 9, "bold"))
+        self._chat.tag_configure("assistant_label", foreground="#475569", font=("Segoe UI", 9, "bold"))
         chat_vsb = ttk.Scrollbar(chat_wrap, command=self._chat.yview)
         self._chat.configure(yscrollcommand=chat_vsb.set)
         chat_vsb.pack(side=RIGHT, fill=Y)
@@ -230,11 +253,18 @@ class AIAssistantPanel(Frame):
         )
 
         self._update_provider_label()
+        persisted = load_persisted_chat()
+        settings = self._get_settings()
+        if persisted and settings.ai_persist_chat:
+            for msg in persisted[-_MAX_HISTORY * 2 :]:
+                role = msg.get("role", "")
+                who = "Вы" if role == "user" else "Помощник"
+                if role in ("user", "assistant"):
+                    self._append_chat(who, msg.get("content", ""), to_history=True, bubble=(role == "user"))
         self._append_chat(
             "Система",
-            "Привет! Можно искать («найди большие видео») и сортировать текстом: "
-            "«разложи по моим папкам», «все pdf за 2025 отсортируй», «сжми установщики в zip». "
-            "Сначала покажу план — потом «Применить план». История диалога сохраняется в сессии.",
+            "Привет! Пишите как в чате: «разбери загрузки», «найди курсовые», «сожми установщики», "
+            "«покажи что можно удалить». Сначала покажу план — потом «Применить».",
             to_history=False,
         )
         self.after(200, self._load_suggestions)
@@ -293,9 +323,26 @@ class AIAssistantPanel(Frame):
         }
         self._provider_var.set(labels.get(s.ai_provider, labels["rules"]) + hist)
 
-    def _append_chat(self, who: str, text: str, *, to_history: bool = True) -> None:
+    def _append_chat(
+        self,
+        who: str,
+        text: str,
+        *,
+        to_history: bool = True,
+        bubble: bool | None = None,
+    ) -> None:
+        self._hide_typing()
         self._chat.configure(state="normal")
-        self._chat.insert(END, f"\n{who}: {text}\n")
+        if who == "Вы":
+            self._chat.insert(END, "\n", "user_bubble")
+            self._chat.insert(END, "Вы\n", "user_label")
+            self._chat.insert(END, f"{text}\n", "user_bubble")
+        elif who == "Помощник":
+            self._chat.insert(END, "\n", "assistant_bubble")
+            self._chat.insert(END, "Помощник\n", "assistant_label")
+            self._chat.insert(END, f"{text}\n", "assistant_bubble")
+        else:
+            self._chat.insert(END, f"\n{who}: {text}\n", "system_bubble")
         self._chat.see(END)
         self._chat.configure(state="disabled")
         if to_history and who in ("Вы", "Помощник"):
@@ -303,13 +350,60 @@ class AIAssistantPanel(Frame):
             self._history.append({"role": role, "content": text})
             if len(self._history) > _MAX_HISTORY * 2:
                 self._history = self._history[-_MAX_HISTORY * 2 :]
+            save_persisted_chat(
+                self._history,
+                enabled=self._get_settings().ai_persist_chat,
+            )
             self._update_provider_label()
+
+    def _show_typing(self) -> None:
+        self._hide_typing()
+        self._chat.configure(state="normal")
+        self._chat.insert(END, "\n", "typing")
+        self._chat.insert(END, "Помощник печатает…\n", "typing")
+        self._chat.see(END)
+        self._chat.configure(state="disabled")
+        dots = ["", ".", "..", "..."]
+        idx = [0]
+
+        def tick():
+            if not self._busy:
+                return
+            self._chat.configure(state="normal")
+            self._chat.delete("typing_line.first", "typing_line.last")
+            self._chat.insert("typing_line", f"Помощник печатает{dots[idx[0] % len(dots)]}", "typing")
+            self._chat.configure(state="disabled")
+            idx[0] += 1
+            self._typing_after = self.after(400, tick)
+
+        self._chat.mark_set("typing_line", "end-2l linestart")
+        self._chat.mark_gravity("typing_line", "left")
+        tick()
+
+    def _hide_typing(self) -> None:
+        if self._typing_after:
+            try:
+                self.after_cancel(self._typing_after)
+            except Exception:
+                pass
+            self._typing_after = None
+        content = self._chat.get("1.0", END)
+        if "Помощник печатает" in content:
+            self._chat.configure(state="normal")
+            lines = content.splitlines()
+            filtered = [ln for ln in lines if not ln.startswith("Помощник печатает")]
+            self._chat.delete("1.0", END)
+            if filtered:
+                self._chat.insert("1.0", "\n".join(filtered) + "\n")
+            self._chat.configure(state="disabled")
 
     def _clear_chat(self) -> None:
         self._history.clear()
+        save_persisted_chat([], enabled=self._get_settings().ai_persist_chat)
         self._chat.configure(state="normal")
         self._chat.delete("1.0", END)
         self._chat.configure(state="disabled")
+        self._clear_clarify_chips()
         self._append_chat(
             "Система",
             "История очищена. Задайте новый вопрос.",
@@ -383,7 +477,8 @@ class AIAssistantPanel(Frame):
         self._input.delete("1.0", END)
         self._append_chat("Вы", first_line)
         self._set_busy(True, "Думаю…")
-        history_snapshot = list(self._history[:-1])
+        self.after(0, self._show_typing)
+        history_snapshot = list(self._history[:-1])[-20:]
         threading.Thread(
             target=self._process_query, args=(first_line, history_snapshot), daemon=True,
         ).start()
@@ -391,53 +486,74 @@ class AIAssistantPanel(Frame):
     def _process_query(self, text: str, history: list[dict[str, str]]) -> None:
         try:
             settings = self._get_settings()
-            assistant = create_assistant(settings)
-            reply = assistant.parse_assistant_query(text, settings, history=history)
-            intent = reply.search
+            agent = create_conversational_agent(
+                settings,
+                self._get_index(),
+                self._get_watched(),
+                sorter=self._get_sorter(),
+            )
+            turn = agent.chat(text, history=history[-20:])
 
-            if reply.action == "clarify":
-                msg = format_assistant_message(reply)
+            if turn.action == "clarify":
+                msg = turn.message
+                if turn.next_steps:
+                    msg += " Дальше: " + "; ".join(turn.next_steps[:2]) + "."
                 self.after(0, lambda: self._clear_pending_plan())
                 self.after(0, lambda: self._show_results([]))
-                if reply.clarify_options:
-                    self.after(0, lambda opts=list(reply.clarify_options): self._show_clarify_chips(opts))
-            elif reply.action == "stats":
-                stats = compute_storage_stats(self._get_index(), self._get_watched())
-                msg = format_assistant_message(
-                    reply, extra=format_storage_stats(stats),
-                )
+                if turn.clarify_options:
+                    self.after(0, lambda opts=list(turn.clarify_options): self._show_clarify_chips(opts))
+            elif turn.action == "undo":
+                msg = turn.message
+                self.after(0, lambda m=turn.message: self._confirm_undo(m))
+            elif turn.action == "exclude" and turn.pending_path:
+                msg = turn.message
+                self.after(0, lambda p=turn.pending_path: self._confirm_exclude([p]))
+            elif turn.action == "open" and turn.pending_path:
+                self._on_open(turn.pending_path)
+                msg = turn.message
+            elif turn.action == "reveal" and turn.pending_path:
+                self._on_reveal(turn.pending_path)
+                msg = turn.message
+            elif turn.action == "stats":
+                msg = turn.message
+                if turn.next_steps:
+                    msg += " Дальше: " + "; ".join(turn.next_steps[:2]) + "."
                 self.after(0, lambda: self._show_results([]))
-            elif reply.action == "suggest":
-                suggestions = assistant.generate_suggestions(
-                    settings, self._get_index(), self._get_watched(),
-                )
-                msg = format_assistant_message(
-                    reply,
-                    extra=f"Нашёл {len(suggestions)} совет(ов). Смотрите панель справа.",
-                )
-                self.after(0, lambda: self._show_suggestions(suggestions))
-            elif reply.action == "sort" and reply.sort_plan is not None:
-                plan = self._prepare_sort_plan(reply.sort_plan, intent)
+            elif turn.action == "suggest":
+                msg = turn.message
+                if turn.suggestions:
+                    self.after(0, lambda s=list(turn.suggestions): self._show_suggestions(s))
+                if turn.search_results:
+                    self.after(0, lambda r=list(turn.search_results): self._show_results(r))
+            elif turn.action == "sort" and turn.sort_plan is not None:
+                plan = turn.sort_plan
+                if not plan.items and plan.paths:
+                    plan = self._prepare_sort_plan(plan, turn.search)
                 summary = format_sort_plan_summary(plan)
-                msg = format_assistant_message(reply, extra=summary)
+                msg = turn.message if turn.message else summary
+                if summary not in msg:
+                    msg = f"{msg}\n\n{summary}"
                 self.after(0, lambda p=plan: self._set_pending_plan(p))
                 self.after(0, lambda p=plan: self._show_plan_items(p))
             else:
-                if intent is None:
-                    intent = assistant.parse_user_query(text, history=history)
-                results = search_files(
-                    intent,
-                    index=self._get_index(),
-                    watched_entries=self._get_watched(),
-                )
-                msg = self._format_search_reply(intent, results, reply.next_steps)
+                msg = turn.message
+                if turn.next_steps:
+                    msg += " Дальше: " + "; ".join(turn.next_steps[:2]) + "."
+                results = turn.search_results
+                if not results and turn.search:
+                    results = search_files(
+                        turn.search,
+                        index=self._get_index(),
+                        watched_entries=self._get_watched(),
+                    )
                 self.after(0, lambda: self._clear_pending_plan())
-                self.after(0, lambda: self._show_results(results))
+                self.after(0, lambda r=list(results): self._show_results(r))
             self.after(0, lambda m=msg: self._append_chat("Помощник", m))
         except Exception as exc:
             self.after(0, lambda: self._append_chat("Ошибка", str(exc), to_history=False))
         finally:
             self.after(0, lambda: self._set_busy(False, "Готов"))
+            self.after(0, self._hide_typing)
 
     def _prepare_sort_plan(
         self,
@@ -464,15 +580,36 @@ class AIAssistantPanel(Frame):
         self._pending_plan = plan
         ok = sum(1 for i in plan.items if i.dest_hint and not i.skip_reason)
         self._plan_var.set(
-            f"План: {ok}/{len(plan.paths)} к раскладке · {plan.plan_type}"
+            f"{ok} из {len(plan.paths)} к раскладке · {plan.plan_type}"
             + (" · ZIP" if plan.enable_compression else "")
+            + (f" · {plan.filter_summary}" if plan.filter_summary else "")
         )
         state = "normal" if plan.paths and ok > 0 else "disabled"
         self._apply_plan_btn.configure(state=state)
 
+    def _edit_pending_plan(self) -> None:
+        plan = self._pending_plan
+        hint = plan.raw_query if plan and plan.raw_query else "сортируй по типу"
+        self._input.delete("1.0", END)
+        self._input.insert("1.0", hint)
+        self._input.focus_set()
+        self._status_var.set("Измените запрос и отправьте снова")
+
+    def _confirm_undo(self, message: str) -> None:
+        if not self._on_undo_last:
+            self._append_chat("Система", "Отмена недоступна.", to_history=False)
+            return
+        if messagebox.askyesno("Отменить последнюю операцию", message):
+            self._on_undo_last()
+            self._append_chat("Помощник", "Запросил отмену последней сортировки.")
+
+    def _clear_clarify_chips(self) -> None:
+        for w in self._clarify_frame.winfo_children():
+            w.destroy()
+
     def _clear_pending_plan(self) -> None:
         self._pending_plan = None
-        self._plan_var.set("")
+        self._plan_var.set("Нет активного плана")
         self._apply_plan_btn.configure(state="disabled")
 
     def _apply_pending_plan(self) -> None:
@@ -521,32 +658,31 @@ class AIAssistantPanel(Frame):
         ]
 
     def _show_clarify_chips(self, options: list[str]) -> None:
+        self._clear_clarify_chips()
+        Label(
+            self._clarify_frame, text="Уточните:", bg=theme.BG, fg=theme.TEXT_MUTED,
+            font=("Segoe UI", 8),
+        ).pack(side=LEFT, padx=(0, 4))
         mapping = {
             "Сортировать по типу": "сортируй по типу",
             "Сортировать по дате": "сортируй по дате",
             "Разложить по моим папкам": "разложи по моим папкам",
-            "Открыть настройки «Мои папки»": "",
-            "Сортировать в обычный архив вместо этого": "сортируй по типу",
-            "Использовать «разложи по моим папкам»": "разложи по моим папкам",
+            "Разбери загрузки": "разбери загрузки",
+            "Найди PDF за этот год": "найди pdf за этот год",
         }
         for opt in options[:4]:
             q = mapping.get(opt, opt)
             if opt.startswith("Открыть настройки"):
-                self._append_chat(
-                    "Система",
-                    "Откройте «Настройки ИИ» → или настройки сортировки «Мои папки».",
-                    to_history=False,
-                )
+                ttk.Button(
+                    self._clarify_frame, text=opt[:20],
+                    command=self._on_settings,
+                ).pack(side=LEFT, padx=2)
                 continue
             if q:
-                # Не спамим кнопками в чат — подсказка текстом
-                pass
-        if options:
-            self._append_chat(
-                "Система",
-                "Варианты: " + " · ".join(options[:4]),
-                to_history=False,
-            )
+                ttk.Button(
+                    self._clarify_frame, text=opt[:24],
+                    command=lambda query=q: self._run_quick(query),
+                ).pack(side=LEFT, padx=2)
 
     def _format_search_reply(
         self,

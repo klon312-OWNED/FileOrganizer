@@ -605,5 +605,104 @@ class TestSortPlansV114(unittest.TestCase):
         self.assertIn("SortPlan", text)
 
 
+class TestConversationalAgentV115(unittest.TestCase):
+    def _agent(self):
+        from organizer.ai_assistant import ConversationalAgent, create_assistant
+        from organizer.config import Settings
+
+        index = mock.MagicMock()
+        index.query.return_value = []
+        index.count.return_value = 0
+        index.total_size.return_value = 0
+        index.stats_by_category.return_value = []
+        entries = [
+            {
+                "path": "/dl/setup.exe",
+                "name": "setup.exe",
+                "sortable": True,
+                "excluded": False,
+                "folder": "C:/Users/me/Downloads",
+                "size": 60 * 1024 * 1024,
+                "mtime": 1,
+                "category": "Программы",
+            },
+            {
+                "path": "/dl/kursovaya.docx",
+                "name": "kursovaya.docx",
+                "sortable": True,
+                "excluded": False,
+                "folder": "C:/Users/me/Downloads",
+                "size": 1024,
+                "mtime": 2,
+                "category": "Документы",
+            },
+        ]
+        return ConversationalAgent(
+            Settings(), index, entries, assistant=create_assistant(Settings()),
+        )
+
+    def test_route_tools_rules_downloads(self):
+        from organizer.ai_assistant import route_tools_rules
+
+        calls = route_tools_rules("разбери загрузки")
+        self.assertEqual(calls[0].name, "plan_sort")
+        self.assertIn("query", calls[0].arguments)
+
+    def test_route_tools_rules_coursework(self):
+        from organizer.ai_assistant import route_tools_rules
+
+        calls = route_tools_rules("найди курсовые")
+        self.assertEqual(calls[0].name, "search_files")
+
+    def test_route_tools_rules_compress_installers(self):
+        from organizer.ai_assistant import route_tools_rules
+
+        calls = route_tools_rules("сожми установщики")
+        self.assertEqual(calls[0].name, "plan_sort")
+        self.assertTrue(calls[0].arguments.get("compress"))
+
+    def test_route_tools_rules_cleanup(self):
+        from organizer.ai_assistant import route_tools_rules
+
+        calls = route_tools_rules("покажи что можно удалить")
+        self.assertEqual(calls[0].name, "suggest_cleanup")
+
+    def test_route_tools_casual_status(self):
+        from organizer.ai_assistant import route_tools_rules
+
+        calls = route_tools_rules("как тебе")
+        self.assertEqual(calls[0].name, "explain_status")
+
+    def test_chat_search_coursework(self):
+        agent = self._agent()
+        turn = agent.chat("найди курсовые")
+        self.assertEqual(turn.action, "search")
+        self.assertTrue(turn.search_results or turn.search)
+
+    def test_chat_plan_sort_downloads(self):
+        agent = self._agent()
+        turn = agent.chat("разбери загрузки")
+        self.assertIn(turn.action, ("sort", "clarify"))
+
+    def test_suggested_prompts_defined(self):
+        from organizer.ai_assistant import SUGGESTED_PROMPTS
+
+        self.assertIn("Разбери загрузки", SUGGESTED_PROMPTS)
+        self.assertIn("Найди PDF за этот год", SUGGESTED_PROMPTS)
+
+    def test_persist_chat_roundtrip(self):
+        import tempfile
+        from organizer.ai_assistant import load_persisted_chat, save_persisted_chat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hist_path = Path(tmp) / "chat_history.json"
+            with mock.patch("organizer.ai_assistant.CHAT_HISTORY_PATH", hist_path):
+                msgs = [{"role": "user", "content": "привет"}, {"role": "assistant", "content": "ок"}]
+                save_persisted_chat(msgs, enabled=True)
+                loaded = load_persisted_chat()
+            self.assertEqual(len(loaded), 2)
+            self.assertEqual(loaded[0]["content"], "привет")
+
+
 if __name__ == "__main__":
     unittest.main()

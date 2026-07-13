@@ -138,6 +138,10 @@ DEFAULT_SETTINGS: dict = {
     "ai_model": "gpt-4o-mini",
     "ai_ollama_url": "http://localhost:11434",
     "ai_ollama_model": "llama3.2",
+    # Доп. инструкции для ИИ-помощника (как system rules в Cursor)
+    "ai_custom_instructions": "",
+    # Сохранять историю чата между запусками (~/.file_organizer/chat_history.json)
+    "ai_persist_chat": True,
     # Умная раскладка по пользовательским папкам («Мои папки»)
     "smart_folders_root": "",
     "smart_folders_threshold": 0.28,
@@ -220,6 +224,8 @@ class Settings:
         merged["ai_ollama_model"] = str(
             merged.get("ai_ollama_model") or DEFAULT_SETTINGS["ai_ollama_model"],
         )
+        merged["ai_custom_instructions"] = str(merged.get("ai_custom_instructions") or "")
+        merged["ai_persist_chat"] = bool(merged.get("ai_persist_chat", True))
         merged["smart_folders_root"] = str(merged.get("smart_folders_root") or "")
         try:
             merged["smart_folders_threshold"] = max(
@@ -399,6 +405,14 @@ class Settings:
         return str(
             self.data.get("ai_ollama_model") or DEFAULT_SETTINGS["ai_ollama_model"],
         )
+
+    @property
+    def ai_custom_instructions(self) -> str:
+        return str(self.data.get("ai_custom_instructions") or "")
+
+    @property
+    def ai_persist_chat(self) -> bool:
+        return bool(self.data.get("ai_persist_chat", True))
 
     @property
     def smart_folders_root(self) -> str:
