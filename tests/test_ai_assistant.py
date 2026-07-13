@@ -484,5 +484,126 @@ class TestAIUiRegression(unittest.TestCase):
         self.assertIn("Canvas(", text)
 
 
+class TestSortPlansV114(unittest.TestCase):
+    def test_sort_by_type_and_date(self):
+        from organizer.ai_assistant import RulesAssistant
+        from organizer.config import Settings
+
+        r = RulesAssistant()
+        s = Settings()
+        by_type = r.parse_assistant_query("сортируй по типу", s)
+        self.assertEqual(by_type.action, "sort")
+        self.assertEqual(by_type.sort_plan.sort_mode, "type_only")
+        by_date = r.parse_assistant_query("сортируй по дате", s)
+        self.assertEqual(by_date.sort_plan.sort_mode, "date_only")
+        by_ext = r.parse_assistant_query("сортируй по расширению", s)
+        self.assertEqual(by_ext.sort_plan.sort_mode, "extension")
+
+    def test_smart_folders_clarifies_without_library(self):
+        from organizer.ai_assistant import RulesAssistant
+        from organizer.config import Settings
+
+        r = RulesAssistant()
+        reply = r.parse_assistant_query("разложи по моим папкам", Settings())
+        self.assertEqual(reply.action, "clarify")
+        self.assertIn("библиотек", reply.message.lower())
+
+    def test_ambiguous_layout_clarifies(self):
+        from organizer.ai_assistant import RulesAssistant
+        from organizer.config import Settings
+
+        reply = RulesAssistant().parse_assistant_query("разложи файлы", Settings())
+        self.assertEqual(reply.action, "clarify")
+
+    def test_custom_dest_and_compress(self):
+        from organizer.ai_assistant import RulesAssistant, parse_sort_plan
+        from organizer.config import Settings
+
+        s = Settings()
+        plan = parse_sort_plan("положи docx в Документы/Учёба/Python", s)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.plan_type, "custom_folder")
+        self.assertIn("Учёба", plan.custom_dest)
+
+        reply = RulesAssistant().parse_assistant_query("сжми установщики в zip", s)
+        self.assertEqual(reply.action, "sort")
+        self.assertTrue(reply.sort_plan.enable_compression)
+        self.assertTrue(reply.search.installers_only)
+
+    def test_filter_then_sort_pdf_2025(self):
+        from organizer.ai_assistant import RulesAssistant
+        from organizer.config import Settings
+
+        reply = RulesAssistant().parse_assistant_query(
+            "все pdf за 2025 год отсортируй", Settings(),
+        )
+        self.assertEqual(reply.action, "sort")
+        self.assertIn(".pdf", reply.search.extensions)
+        self.assertEqual(reply.search.year, 2025)
+        self.assertEqual(reply.search.source, "desktop")
+
+    def test_sort_by_courses_means_smart_folders(self):
+        from organizer.ai_assistant import parse_sort_plan
+        from organizer.config import Settings
+
+        plan = parse_sort_plan("сортируй PDF по курсам", Settings())
+        self.assertEqual(plan.plan_type, "smart_folders")
+
+    def test_build_sort_preview_archive(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from organizer.ai_assistant import SortPlan, build_sort_preview, collect_sort_paths
+        from organizer.config import Settings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "Архив"
+            archive.mkdir()
+            src = tmp_path / "Downloads"
+            src.mkdir()
+            f = src / "report.pdf"
+            f.write_bytes(b"%PDF-1.4")
+            settings_path = tmp_path / "settings.json"
+            settings_path.write_text("{}", encoding="utf-8")
+            with mock.patch("organizer.config.SETTINGS_PATH", settings_path):
+                settings = Settings()
+            settings.data["archive_location"] = str(tmp_path)
+            settings.data["archive_name"] = "Архив"
+            settings.data["sort_mode"] = "type_only"
+
+            sorter = mock.MagicMock()
+            sorter._is_ready.return_value = True
+            sorter._is_inside_destination.return_value = False
+            sorter._is_protected.return_value = False
+            sorter._file_time.return_value = 1_700_000_000
+            sorter._unique_target.side_effect = lambda p: p
+
+            entries = [{
+                "path": str(f),
+                "name": "report.pdf",
+                "sortable": True,
+                "category": "Документы",
+                "size": 8,
+                "mtime": 1_700_000_000,
+                "folder": str(src),
+            }]
+            plan = SortPlan(plan_type="archive", sort_mode="type_only", scope_label="all_watched")
+            plan.paths = collect_sort_paths(plan, entries)
+            self.assertEqual(plan.paths, [str(f)])
+            preview = build_sort_preview(
+                plan, settings=settings, sorter=sorter, watched_entries=entries,
+            )
+            self.assertEqual(len(preview.items), 1)
+            self.assertIn("Документы", preview.items[0].dest_hint)
+
+    def test_llm_sort_fields_in_prompt(self):
+        text = (ROOT / "organizer" / "ai_assistant.py").read_text(encoding="utf-8")
+        self.assertIn("sort_mode", text)
+        self.assertIn("target_relpath", text)
+        self.assertIn("SortPlan", text)
+
+
 if __name__ == "__main__":
     unittest.main()

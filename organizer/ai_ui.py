@@ -15,9 +15,14 @@ from .ai_assistant import (
     QUICK_QUERIES,
     SearchIntent,
     SearchResult,
+    SortPlan,
     Suggestion,
+    build_sort_preview,
+    collect_sort_paths,
     create_assistant,
+    format_assistant_message,
     format_intent_summary,
+    format_sort_plan_summary,
     format_storage_stats,
     compute_storage_stats,
     generate_suggestions,
@@ -38,6 +43,7 @@ class AIAssistantPanel(Frame):
         get_settings,
         get_index,
         get_watched_entries,
+        get_sorter,
         on_open_path: Callable[[str], None],
         on_reveal_path: Callable[[str], None],
         on_sort_paths: Callable[[list[str]], None],
@@ -48,11 +54,13 @@ class AIAssistantPanel(Frame):
         on_show_desktop: Callable[[], None],
         on_open_settings: Callable[[], None],
         on_smart_folders: Callable[[list[str]], None] | None = None,
+        on_apply_sort_plan: Callable[[SortPlan], None] | None = None,
     ) -> None:
         super().__init__(master, bg=theme.BG)
         self._get_settings = get_settings
         self._get_index = get_index
         self._get_watched = get_watched_entries
+        self._get_sorter = get_sorter
         self._on_open = on_open_path
         self._on_reveal = on_reveal_path
         self._on_sort = on_sort_paths
@@ -63,9 +71,11 @@ class AIAssistantPanel(Frame):
         self._on_desktop = on_show_desktop
         self._on_settings = on_open_settings
         self._on_smart_folders = on_smart_folders
+        self._on_apply_sort_plan = on_apply_sort_plan
         self._busy = False
         self._history: list[dict[str, str]] = []
         self._last_results: list[SearchResult] = []
+        self._pending_plan: SortPlan | None = None
         self._active_wheel: str | None = None
         self._build()
 
@@ -119,12 +129,27 @@ class AIAssistantPanel(Frame):
         Label(chips, text="Быстро:", bg=theme.BG, fg=theme.TEXT_MUTED, font=("Segoe UI", 8)).pack(
             side=LEFT, padx=(0, 4),
         )
-        for q in QUICK_QUERIES[:8]:
-            short = q if len(q) <= 22 else q[:20] + "…"
+        for q in QUICK_QUERIES[:10]:
+            short = q if len(q) <= 24 else q[:22] + "…"
             ttk.Button(
                 chips, text=short, width=max(10, len(short) + 1),
                 command=lambda query=q: self._run_quick(query),
             ).pack(side=LEFT, padx=2, pady=2)
+
+        plan_bar = Frame(left, bg=theme.BG)
+        plan_bar.pack(side="top", fill=X, pady=(0, 4))
+        self._plan_var = StringVar(value="")
+        Label(
+            plan_bar, textvariable=self._plan_var, bg=theme.BG,
+            fg=theme.TEXT_MUTED, font=("Segoe UI", 8), wraplength=520, justify="left",
+        ).pack(side=LEFT, fill=X, expand=True)
+        self._apply_plan_btn = ttk.Button(
+            plan_bar, text="Применить план", style="Accent.TButton",
+            command=self._apply_pending_plan, state="disabled",
+        )
+        self._apply_plan_btn.pack(side=RIGHT, padx=(4, 0))
+        ttk.Button(plan_bar, text="Сбросить", command=self._clear_pending_plan).pack(side=RIGHT)
+
 
         Label(left, text="Диалог", font=("Segoe UI", 10, "bold"), bg=theme.BG).pack(anchor="w")
         chat_wrap = Frame(left, bg=theme.CARD, highlightbackground=theme.BORDER, highlightthickness=1)
@@ -207,8 +232,9 @@ class AIAssistantPanel(Frame):
         self._update_provider_label()
         self._append_chat(
             "Система",
-            "Привет! Спросите, например: «найди все pdf за май», «файлы за неделю» или «установщики». "
-            "История диалога сохраняется до закрытия окна.",
+            "Привет! Можно искать («найди большие видео») и сортировать текстом: "
+            "«разложи по моим папкам», «все pdf за 2025 отсортируй», «сжми установщики в zip». "
+            "Сначала покажу план — потом «Применить план». История диалога сохраняется в сессии.",
             to_history=False,
         )
         self.after(200, self._load_suggestions)
@@ -366,35 +392,168 @@ class AIAssistantPanel(Frame):
         try:
             settings = self._get_settings()
             assistant = create_assistant(settings)
-            intent = assistant.parse_user_query(text, history=history)
-            if intent.action == "stats":
-                stats = compute_storage_stats(self._get_index(), self._get_watched())
-                msg = format_storage_stats(stats)
+            reply = assistant.parse_assistant_query(text, settings, history=history)
+            intent = reply.search
+
+            if reply.action == "clarify":
+                msg = format_assistant_message(reply)
+                self.after(0, lambda: self._clear_pending_plan())
                 self.after(0, lambda: self._show_results([]))
-            elif intent.action == "suggest":
+                if reply.clarify_options:
+                    self.after(0, lambda opts=list(reply.clarify_options): self._show_clarify_chips(opts))
+            elif reply.action == "stats":
+                stats = compute_storage_stats(self._get_index(), self._get_watched())
+                msg = format_assistant_message(
+                    reply, extra=format_storage_stats(stats),
+                )
+                self.after(0, lambda: self._show_results([]))
+            elif reply.action == "suggest":
                 suggestions = assistant.generate_suggestions(
                     settings, self._get_index(), self._get_watched(),
                 )
-                msg = (
-                    f"Фильтр: {format_intent_summary(intent)}. "
-                    f"Нашёл {len(suggestions)} совет(ов). Смотрите панель справа."
+                msg = format_assistant_message(
+                    reply,
+                    extra=f"Нашёл {len(suggestions)} совет(ов). Смотрите панель справа.",
                 )
                 self.after(0, lambda: self._show_suggestions(suggestions))
+            elif reply.action == "sort" and reply.sort_plan is not None:
+                plan = self._prepare_sort_plan(reply.sort_plan, intent)
+                summary = format_sort_plan_summary(plan)
+                msg = format_assistant_message(reply, extra=summary)
+                self.after(0, lambda p=plan: self._set_pending_plan(p))
+                self.after(0, lambda p=plan: self._show_plan_items(p))
             else:
+                if intent is None:
+                    intent = assistant.parse_user_query(text, history=history)
                 results = search_files(
                     intent,
                     index=self._get_index(),
                     watched_entries=self._get_watched(),
                 )
-                msg = self._format_search_reply(intent, results)
+                msg = self._format_search_reply(intent, results, reply.next_steps)
+                self.after(0, lambda: self._clear_pending_plan())
                 self.after(0, lambda: self._show_results(results))
-            self.after(0, lambda: self._append_chat("Помощник", msg))
+            self.after(0, lambda m=msg: self._append_chat("Помощник", m))
         except Exception as exc:
             self.after(0, lambda: self._append_chat("Ошибка", str(exc), to_history=False))
         finally:
             self.after(0, lambda: self._set_busy(False, "Готов"))
 
-    def _format_search_reply(self, intent: SearchIntent, results: list[SearchResult]) -> str:
+    def _prepare_sort_plan(
+        self,
+        plan: SortPlan,
+        filter_intent: SearchIntent | None,
+    ) -> SortPlan:
+        settings = self._get_settings()
+        watched = self._get_watched()
+        paths = collect_sort_paths(
+            plan,
+            watched,
+            filter_intent=filter_intent,
+            index=self._get_index(),
+        )
+        plan.paths = paths[:120]
+        return build_sort_preview(
+            plan,
+            settings=settings,
+            sorter=self._get_sorter(),
+            watched_entries=watched,
+        )
+
+    def _set_pending_plan(self, plan: SortPlan) -> None:
+        self._pending_plan = plan
+        ok = sum(1 for i in plan.items if i.dest_hint and not i.skip_reason)
+        self._plan_var.set(
+            f"План: {ok}/{len(plan.paths)} к раскладке · {plan.plan_type}"
+            + (" · ZIP" if plan.enable_compression else "")
+        )
+        state = "normal" if plan.paths and ok > 0 else "disabled"
+        self._apply_plan_btn.configure(state=state)
+
+    def _clear_pending_plan(self) -> None:
+        self._pending_plan = None
+        self._plan_var.set("")
+        self._apply_plan_btn.configure(state="disabled")
+
+    def _apply_pending_plan(self) -> None:
+        plan = self._pending_plan
+        if not plan or not plan.paths:
+            messagebox.showinfo("ИИ-помощник", "Нет активного плана сортировки.")
+            return
+        ok = [i for i in plan.items if i.dest_hint and not i.skip_reason]
+        preview = "\n".join(f"• {i.name} → {i.dest_hint}" for i in ok[:8])
+        more = f"\n… и ещё {len(ok) - 8}" if len(ok) > 8 else ""
+        if not messagebox.askyesno(
+            "Применить план",
+            f"Переместить {len(ok)} файл(ов)?\n\n{preview}{more}\n\n"
+            "Это изменит расположение файлов на диске.",
+        ):
+            return
+        if self._on_apply_sort_plan:
+            self._on_apply_sort_plan(plan)
+        elif plan.plan_type == "smart_folders" and self._on_smart_folders:
+            self._on_smart_folders(plan.paths)
+        else:
+            self._on_sort(plan.paths)
+        self._append_chat(
+            "Помощник",
+            f"Запустил раскладку ({len(plan.paths)} файл(ов)). Смотрите статус внизу окна.",
+        )
+        self._clear_pending_plan()
+
+    def _show_plan_items(self, plan: SortPlan) -> None:
+        """Показать элементы плана в панели результатов."""
+        fake: list[SearchResult] = []
+        for item in plan.items[:40]:
+            fake.append(SearchResult(
+                path=item.path,
+                name=f"{item.name} → {item.dest_hint or item.skip_reason or '—'}",
+                category=item.category,
+                size=item.size,
+                source="desktop",
+                reason="ZIP" if item.will_compress else (item.skip_reason or "план"),
+            ))
+        self._show_results(fake)
+        # Сохраняем реальные пути для «Сорт. все»
+        self._last_results = [
+            SearchResult(path=p, name=Path(p).name, source="desktop")
+            for p in plan.paths
+        ]
+
+    def _show_clarify_chips(self, options: list[str]) -> None:
+        mapping = {
+            "Сортировать по типу": "сортируй по типу",
+            "Сортировать по дате": "сортируй по дате",
+            "Разложить по моим папкам": "разложи по моим папкам",
+            "Открыть настройки «Мои папки»": "",
+            "Сортировать в обычный архив вместо этого": "сортируй по типу",
+            "Использовать «разложи по моим папкам»": "разложи по моим папкам",
+        }
+        for opt in options[:4]:
+            q = mapping.get(opt, opt)
+            if opt.startswith("Открыть настройки"):
+                self._append_chat(
+                    "Система",
+                    "Откройте «Настройки ИИ» → или настройки сортировки «Мои папки».",
+                    to_history=False,
+                )
+                continue
+            if q:
+                # Не спамим кнопками в чат — подсказка текстом
+                pass
+        if options:
+            self._append_chat(
+                "Система",
+                "Варианты: " + " · ".join(options[:4]),
+                to_history=False,
+            )
+
+    def _format_search_reply(
+        self,
+        intent: SearchIntent,
+        results: list[SearchResult],
+        next_steps: list[str] | None = None,
+    ) -> str:
         total = sum(r.size for r in results)
         parts = [
             f"Найдено: {len(results)} ({human_size(total)})",
@@ -414,8 +573,15 @@ class AIAssistantPanel(Frame):
             parts.append(f"например: {top}")
             desktop_n = sum(1 for r in results if r.source == "desktop")
             if desktop_n:
-                parts.append(f"из отслеживаемых: {desktop_n} — можно «Сорт. все»")
-        return ". ".join(parts) + "."
+                parts.append(f"из отслеживаемых: {desktop_n} — «Сорт. все» или «отсортируй найденное»")
+        msg = ". ".join(parts) + "."
+        steps = next_steps or [
+            "Уточните: «только pdf» / «за май»",
+            "Или: «отсортируй найденное»",
+        ]
+        if not results:
+            steps = ["Попробуйте «файлы за неделю» или «большие видео»"]
+        return msg + " Дальше: " + "; ".join(steps[:2]) + "."
 
     def _load_suggestions(self) -> None:
         if self._busy:

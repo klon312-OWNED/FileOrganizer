@@ -15,7 +15,7 @@ from typing import Any, Literal
 from .classify import classify
 from .config import OTHER_CATEGORY, Settings
 from .database import FileIndex
-from .layouts import MONTHS_RU
+from .layouts import MONTHS_RU, SORT_MODES, sort_mode_label
 
 Provider = Literal["rules", "openai", "ollama"]
 
@@ -93,6 +93,61 @@ class SearchIntent:
     limit: int | None = None
     sort_by: str = "size"  # size | date | name
     folder_contains: str = ""
+    # Сортировка / раскладка по текстовому запросу
+    sort_mode: str | None = None  # type_only|type_date|date_only|extension|smart_folders
+    sort_scope: str = "filtered"  # selected | all_watched | filtered
+    target_relpath: str = ""  # например Документы/Учёба/Python
+    compress: bool = False
+    clarify_question: str = ""
+
+
+@dataclass
+class SortPlanItem:
+    """Один шаг плана раскладки (dry-run)."""
+
+    path: str
+    name: str
+    dest_hint: str
+    size: int = 0
+    category: str = ""
+    skip_reason: str = ""
+    will_compress: bool = False
+
+
+@dataclass
+class SortPlan:
+    """План сортировки: сначала превью, потом подтверждение Apply."""
+
+    action: str = "sort"  # sort | smart_folders | move_to | compress | exclude | clarify | none
+    plan_type: str = "archive"  # archive | smart_folders | custom_folder
+    sort_mode: str | None = None
+    scope: str = "filtered"
+    scope_label: str = "filtered"
+    target_relpath: str = ""
+    custom_dest: str = ""
+    target_resolved: str = ""
+    compress: bool = False
+    enable_compression: bool = False
+    clarify_question: str = ""
+    summary: str = ""
+    next_steps: list[str] = field(default_factory=list)
+    items: list[SortPlanItem] = field(default_factory=list)
+    paths: list[str] = field(default_factory=list)
+    needs_confirm: bool = True
+    filter_summary: str = ""
+    raw_query: str = ""
+
+
+@dataclass
+class AssistantReply:
+    """Полный ответ парсера: поиск, сортировка или уточнение."""
+
+    action: str = "search"  # search | suggest | stats | sort | clarify
+    search: SearchIntent | None = None
+    sort_plan: SortPlan | None = None
+    message: str = ""
+    next_steps: list[str] = field(default_factory=list)
+    clarify_options: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -132,20 +187,53 @@ _INSTALLER_EXTS = {".exe", ".msi", ".msix", ".apk", ".dmg", ".appx"}
 _DUP_NAME_RE = re.compile(r"\(\d+\)|\bкопия\b|\bcopy\b|_copy", re.I)
 
 QUICK_QUERIES = (
+    "сортируй PDF по курсам",
+    "найди большие видео",
+    "разложи в мои папки учёбы",
+    "положи docx в Документы/Учёба/Python",
+    "разложи по моим папкам",
+    "сжми установщики в zip",
+    "все pdf за 2025 год отсортируй",
+    "сортируй по типу",
+    "сортируй по дате",
+    "сортируй по расширению",
     "найди все pdf за май",
-    "покажи большие видео",
     "файлы за неделю",
     "установщики",
     "дубликаты",
     "пустые файлы",
     "временные файлы",
     "скриншоты",
-    "кэш и логи",
     "топ 10 самых больших",
     "сколько места?",
     "что сортировать сейчас?",
-    "какие файлы можно удалить?",
 )
+
+_SORT_VERBS = (
+    "сортир", "отсортир", "разлож", "разложи", "полож", "положи", "перенес",
+    "сложи", "сложить", "разложить", "упорядоч", "расклад",
+)
+_COMPRESS_WORDS = ("сжми", "сжать", "сжати", "в zip", "в зип", "zip", "упакуй", "упаков")
+_EXCLUDE_WORDS = ("исключ", "не трогай", "не сортир", "пропуст")
+
+_SORT_MODE_PATTERNS: list[tuple[tuple[str, ...], str]] = [
+    (("по моим папк", "в мои папк", "умн", "по профил", "по курсам", "папкам учёб", "папки учёб"), "smart_folders"),
+    (("по расширен", "по экстенш", "extension"), "extension"),
+    (("по типу и дат", "type_date", "по категориям и дат"), "type_date"),
+    (("по типу", "по категорий", "по категор", "type_only"), "type_only"),
+    (("по дате", "по год", "по месяц", "date_only"), "date_only"),
+]
+
+_PATH_ALIASES = {
+    "документы": "Documents",
+    "загрузки": "Downloads",
+    "загрузках": "Downloads",
+    "рабочий стол": "Desktop",
+    "рабочем столе": "Desktop",
+    "desktop": "Desktop",
+    "downloads": "Downloads",
+    "documents": "Documents",
+}
 
 
 def human_size(num: int) -> str:
@@ -201,6 +289,18 @@ def format_intent_summary(intent: SearchIntent) -> str:
         parts.append("архив" if intent.source == "archive" else "отслеживаемые")
     if intent.folder_contains:
         parts.append(f"папка: {intent.folder_contains}")
+    if intent.sort_mode:
+        parts.append(f"режим: {intent.sort_mode}")
+    if intent.target_relpath:
+        parts.append(f"куда: {intent.target_relpath}")
+    if intent.compress:
+        parts.append("со сжатием")
+    if intent.sort_scope and intent.sort_scope != "filtered" and intent.action in (
+        "sort", "sort_plan", "compress", "exclude", "clarify",
+    ):
+        parts.append(
+            "все отслеживаемые" if intent.sort_scope == "all_watched" else "выбранные",
+        )
     return ", ".join(parts) if parts else "без фильтров"
 
 
@@ -292,6 +392,440 @@ def estimate_savings(paths_or_entries: list[Any], *, ratio: float = 0.35) -> int
             except (TypeError, ValueError):
                 continue
     return max(0, int(total * ratio))
+
+
+_CUSTOM_DEST_RE = re.compile(
+    r"(?:полож|перемест|отправ|склад|разлож)\w*\s+(?:в|into|to)\s+([^\n,.!?]+)",
+    re.I,
+)
+_INTO_PATH_RE = re.compile(
+    r"\b(?:в|into|to)\s+([A-Za-zА-Яа-яё0-9_\-./\\ ]{3,120})",
+    re.I,
+)
+_ZIP_DEST_SKIP = frozenset({"zip", "зип", "архив", "archive"})
+
+
+def _has_sort_intent(low: str) -> bool:
+    return any(v in low for v in _SORT_VERBS) or any(w in low for w in _COMPRESS_WORDS)
+
+
+def _detect_sort_scope(low: str) -> str:
+    if any(w in low for w in ("выбран", "отмечен", "selected")):
+        return "selected"
+    if any(w in low for w in ("все", "всё", "всех", "отслеж", "наблюд", "рабоч", "загруз")):
+        return "all_watched"
+    return "filtered"
+
+
+def _detect_sort_mode_from_text(low: str, default: str) -> str | None:
+    for hints, mode in _SORT_MODE_PATTERNS:
+        if any(h in low for h in hints):
+            return mode
+    return None
+
+
+def _extract_target_path(text: str, low: str) -> str:
+    for pattern in (_CUSTOM_DEST_RE, _INTO_PATH_RE):
+        m = pattern.search(text)
+        if not m:
+            continue
+        dest = m.group(1).strip().strip("«»\"'")
+        dest_low = dest.lower()
+        if dest and dest_low not in _ZIP_DEST_SKIP and not any(
+            w in dest_low for w in ("мои папк", "умн", "zip", "зип")
+        ):
+            return dest
+    return ""
+
+
+def resolve_dest_path(hint: str, settings: Settings) -> Path | None:
+    """Разрешить путь назначения из фразы пользователя."""
+    hint = (hint or "").strip().strip("/\\")
+    if not hint:
+        return None
+    for alias, repl in _PATH_ALIASES.items():
+        if hint.lower().startswith(alias):
+            hint = repl + hint[len(alias):]
+            break
+    candidates: list[Path] = []
+    p = Path(hint)
+    if p.is_absolute():
+        candidates.append(p)
+    home = Path.home()
+    candidates.append(home / hint)
+    lib = (settings.smart_folders_root or "").strip()
+    if lib:
+        candidates.append(Path(lib) / hint)
+        candidates.append(Path(lib).parent / hint)
+    dest = (settings.destination or "").strip()
+    if dest:
+        candidates.append(Path(dest) / hint)
+    for c in candidates:
+        try:
+            if c.exists() and c.is_dir():
+                return c.resolve()
+        except OSError:
+            continue
+    if lib:
+        try:
+            target = (Path(lib) / hint).resolve()
+            lib_p = Path(lib).resolve()
+            if lib_p in target.parents or target.parent == lib_p:
+                return target
+        except OSError:
+            pass
+    return None
+
+
+def parse_sort_plan(
+    text: str,
+    settings: Settings,
+    *,
+    filter_intent: SearchIntent | None = None,
+    filter_summary: str = "",
+) -> SortPlan | None:
+    """Разобрать текстовый запрос на SortPlan."""
+    q = text.strip()
+    low = q.lower()
+    if not _has_sort_intent(low):
+        return None
+
+    plan = SortPlan(raw_query=q, filter_summary=filter_summary)
+    plan.scope_label = _detect_sort_scope(low)
+    plan.scope = plan.scope_label
+    plan.enable_compression = any(w in low for w in _COMPRESS_WORDS)
+    plan.compress = plan.enable_compression
+
+    mode = _detect_sort_mode_from_text(low, settings.sort_mode)
+    target = _extract_target_path(q, low)
+
+    if mode == "smart_folders" or any(
+        p in low for p in ("по моим папк", "мои папки", "моим папк", "папкам учёб", "папки учёб", "по курсам")
+    ):
+        plan.plan_type = "smart_folders"
+        plan.action = "smart_folders"
+        plan.sort_mode = "smart_folders"
+    elif target:
+        plan.plan_type = "custom_folder"
+        plan.action = "move_to"
+        plan.custom_dest = target
+        plan.target_relpath = target
+    else:
+        plan.plan_type = "archive"
+        plan.action = "compress" if plan.enable_compression and "установ" in low else "sort"
+        plan.sort_mode = mode or settings.sort_mode
+        # «разложи» без режима — попросим уточнить
+        if (
+            mode is None
+            and not plan.enable_compression
+            and any(w in low for w in ("разлож", "расклад", "полож"))
+            and not any(w in low for w in ("сортир", "отсортир"))
+        ):
+            plan.clarify_question = (
+                "Как разложить файлы?\n"
+                "• по типу · по дате · по расширению\n"
+                "• по моим папкам (нужна папка-библиотека)\n"
+                "• или путь: «положи pdf в Документы/Учёба»"
+            )
+
+    if filter_intent and filter_intent.installers_only:
+        plan.filter_summary = (plan.filter_summary + ", установщики").strip(", ")
+    if filter_intent and (filter_intent.extensions or filter_intent.categories or filter_intent.year):
+        # Фильтр+сортировка: ищем среди отслеживаемых
+        if filter_intent.source == "all":
+            filter_intent.source = "desktop"
+
+    return plan
+
+
+def check_sort_clarification(plan: SortPlan, settings: Settings) -> AssistantReply | None:
+    """Вернуть уточняющий вопрос, если план неоднозначен."""
+    if plan.clarify_question:
+        return AssistantReply(
+            action="clarify",
+            sort_plan=plan,
+            message=plan.clarify_question,
+            next_steps=[
+                "Напишите: «сортируй по типу» / «по дате» / «по расширению»",
+                "Или: «разложи по моим папкам»",
+            ],
+            clarify_options=[
+                "Сортировать по типу",
+                "Сортировать по дате",
+                "Разложить по моим папкам",
+            ],
+        )
+
+    if plan.plan_type == "smart_folders":
+        root = (settings.smart_folders_root or "").strip()
+        if not root or not Path(root).is_dir():
+            opts = [
+                "Открыть настройки «Мои папки»",
+                "Сортировать в обычный архив вместо этого",
+            ]
+            if root:
+                opts.insert(0, f"Указать другую папку (сейчас: {root})")
+            return AssistantReply(
+                action="clarify",
+                sort_plan=plan,
+                message=(
+                    "Для раскладки по вашим папкам нужна папка-библиотека с подкатегориями "
+                    "(например «Документы/Учёба» с «Курс Python», «Математика»).\n\n"
+                    "Какую папку-библиотеку использовать?"
+                ),
+                next_steps=[
+                    "Настройки → «Умная раскладка по моим папкам» → укажите корень библиотеки",
+                    "Или напишите: «сортируй по типу» для обычного архива",
+                ],
+                clarify_options=opts,
+            )
+
+    if plan.plan_type == "custom_folder" and plan.custom_dest:
+        if resolve_dest_path(plan.custom_dest, settings) is None:
+            return AssistantReply(
+                action="clarify",
+                sort_plan=plan,
+                message=(
+                    f"Не нашёл папку «{plan.custom_dest}». "
+                    "Уточните полный путь или настройте корень библиотеки «Мои папки»."
+                ),
+                next_steps=[
+                    "Пример: «положи docx в Документы/Учёба/Python»",
+                    "Или: «разложи по моим папкам»",
+                ],
+                clarify_options=[
+                    "Указать полный путь к папке",
+                    "Использовать «разложи по моим папкам»",
+                ],
+            )
+    return None
+
+
+def collect_sort_paths(
+    plan: SortPlan,
+    watched_entries: list[dict],
+    *,
+    filter_intent: SearchIntent | None = None,
+    rules: RulesAssistant | None = None,
+    index: FileIndex | None = None,
+) -> list[str]:
+    """Собрать пути для сортировки по scope и фильтру."""
+    assistant = rules or RulesAssistant()
+
+    if plan.scope_label == "all_watched":
+        base = [
+            e["path"] for e in watched_entries
+            if e.get("sortable") and Path(e["path"]).exists()
+        ]
+    else:
+        base = [
+            e["path"] for e in watched_entries
+            if e.get("sortable") and Path(e["path"]).is_file()
+        ]
+
+    if filter_intent and index is not None:
+        results = assistant.search(
+            filter_intent, index=index, watched_entries=watched_entries,
+        )
+        allowed = {r.path for r in results if r.source == "desktop"}
+        if allowed:
+            base = [p for p in base if p in allowed]
+        elif filter_intent.categories or filter_intent.extensions or filter_intent.year:
+            base = []
+
+    if plan.enable_compression and (
+        "установ" in (plan.filter_summary or "").lower()
+        or (filter_intent and filter_intent.installers_only)
+    ):
+        base = [p for p in base if Path(p).suffix.lower() in _INSTALLER_EXTS]
+
+    return base
+
+
+def build_sort_preview(
+    plan: SortPlan,
+    *,
+    settings: Settings,
+    sorter: Any,
+    watched_entries: list[dict],
+) -> SortPlan:
+    """Заполнить plan.items — dry-run без изменений на диске."""
+    from .layouts import dest_directory
+
+    paths = list(plan.paths)
+    if not paths:
+        return plan
+
+    sort_mode = plan.sort_mode or settings.sort_mode
+
+    if plan.plan_type == "smart_folders":
+        try:
+            proposals, lib_root = sorter.build_smart_folder_plan(paths)
+        except ValueError as exc:
+            plan.items = [
+                SortPlanItem(path=p, name=Path(p).name, dest_hint="", skip_reason=str(exc))
+                for p in paths[:40]
+            ]
+            return plan
+        for prop in proposals[:80]:
+            if prop.action == "skip" or prop.dest_folder is None:
+                plan.items.append(SortPlanItem(
+                    path=str(prop.source),
+                    name=prop.source.name,
+                    dest_hint="— пропуск",
+                    category=prop.profile_name,
+                    skip_reason=prop.reason or "пропуск",
+                ))
+                continue
+            target = sorter._unique_target(prop.dest_folder / prop.source.name)
+            try:
+                hint = str(target.relative_to(lib_root))
+            except ValueError:
+                hint = str(target)
+            plan.items.append(SortPlanItem(
+                path=str(prop.source),
+                name=prop.source.name,
+                dest_hint=hint,
+                category=prop.profile_name or prop.dest_folder.name,
+            ))
+        return plan
+
+    if plan.plan_type == "custom_folder" and plan.custom_dest:
+        dest_dir = resolve_dest_path(plan.custom_dest, settings)
+        if dest_dir is None:
+            return plan
+        plan.target_resolved = str(dest_dir)
+        for raw in paths[:80]:
+            p = Path(raw)
+            if not p.is_file():
+                continue
+            target = sorter._unique_target(dest_dir / p.name)
+            plan.items.append(SortPlanItem(
+                path=str(p),
+                name=p.name,
+                dest_hint=str(target),
+                category=settings.category_for_extension(p.suffix.lower()),
+                will_compress=plan.enable_compression,
+            ))
+        return plan
+
+    prev_mode = settings.data.get("sort_mode")
+    if sort_mode in SORT_MODES:
+        settings.data["sort_mode"] = sort_mode
+    try:
+        for raw in paths[:80]:
+            p = Path(raw)
+            if p.is_dir():
+                if not settings.sort_folders:
+                    plan.items.append(SortPlanItem(
+                        path=str(p), name=p.name, dest_hint="",
+                        skip_reason="сортировка папок отключена",
+                    ))
+                    continue
+                category = "Папки"
+                ext = ""
+                is_dir = True
+            elif p.is_file():
+                ext = p.suffix.lower()
+                category = settings.category_for_extension(ext)
+                is_dir = False
+            else:
+                continue
+            if p.is_file() and not sorter._is_ready(p):
+                plan.items.append(SortPlanItem(
+                    path=str(p), name=p.name, dest_hint="",
+                    skip_reason="файл ещё загружается",
+                ))
+                continue
+            if sorter._is_inside_destination(p) or sorter._is_protected(p):
+                plan.items.append(SortPlanItem(
+                    path=str(p), name=p.name, dest_hint="",
+                    skip_reason="защищён или уже в архиве",
+                ))
+                continue
+            try:
+                ts = sorter._file_time(p)
+            except OSError:
+                ts = datetime.now().timestamp()
+            dest_dir, _, _ = dest_directory(
+                archive_root=Path(settings.destination),
+                sort_mode=sort_mode or settings.sort_mode,
+                category=category,
+                extension=ext,
+                ts=ts,
+                is_dir=is_dir,
+            )
+            target = sorter._unique_target(dest_dir / p.name)
+            will_zip = (
+                plan.enable_compression
+                and p.is_file()
+                and settings.compression_mode != "none"
+            )
+            plan.items.append(SortPlanItem(
+                path=str(p),
+                name=p.name,
+                dest_hint=str(target),
+                category=category,
+                will_compress=will_zip,
+            ))
+    finally:
+        if sort_mode in SORT_MODES:
+            settings.data["sort_mode"] = prev_mode
+    return plan
+
+
+def format_sort_plan_summary(plan: SortPlan) -> str:
+    """Краткое описание плана для чата."""
+    if not plan.items:
+        n = len(plan.paths)
+        mode = sort_mode_label(plan.sort_mode or "type_date") if plan.sort_mode else plan.plan_type
+        return f"План: {n} элемент(ов), режим «{mode}». Нечего раскладывать — проверьте фильтр."
+
+    ok = [i for i in plan.items if i.dest_hint and not i.skip_reason]
+    skipped = [i for i in plan.items if i.skip_reason or not i.dest_hint]
+    parts = [f"Готово к раскладке: {len(ok)} из {len(plan.paths)}"]
+    if plan.filter_summary:
+        parts.append(f"фильтр: {plan.filter_summary}")
+    scope_ru = {
+        "all_watched": "все отслеживаемые",
+        "selected": "выбранные",
+        "filtered": "по фильтру",
+    }.get(plan.scope_label, plan.scope_label)
+    parts.append(f"область: {scope_ru}")
+    if plan.enable_compression:
+        parts.append("со сжатием ZIP")
+    if ok:
+        sample = "; ".join(
+            f"«{i.name}» → {i.dest_hint[:48]}{'…' if len(i.dest_hint) > 48 else ''}"
+            for i in ok[:3]
+        )
+        parts.append(f"например: {sample}")
+    if skipped:
+        parts.append(f"пропуск: {len(skipped)}")
+    return ". ".join(parts) + "."
+
+
+def format_sort_next_steps(plan: SortPlan) -> list[str]:
+    """Подсказки следующих шагов после предпросмотра."""
+    steps = ["Нажмите «Применить» — выполнить раскладку после подтверждения"]
+    if plan.plan_type == "smart_folders":
+        steps.append("Откроется диалог «Мои папки» для правки сопоставлений")
+    if plan.enable_compression:
+        steps.append("Установщики упакуются в ZIP, если сжатие включено в настройках")
+    steps.append("«Искл. все» — исключить файлы из автосортировки")
+    return steps
+
+
+def format_assistant_message(reply: AssistantReply, *, extra: str = "") -> str:
+    """Собрать дружелюбный ответ с подсказками."""
+    parts: list[str] = []
+    if reply.message:
+        parts.append(reply.message)
+    if extra:
+        parts.append(extra)
+    if reply.next_steps:
+        parts.append("Дальше: " + "; ".join(reply.next_steps[:3]))
+    return " ".join(parts)
 
 
 class RulesAssistant:
@@ -509,6 +1043,64 @@ class RulesAssistant:
                 intent.name_contains = " ".join(tokens[:4])
 
         return intent
+
+    def parse_assistant_query(
+        self,
+        text: str,
+        settings: Settings,
+        history: list[dict[str, str]] | None = None,
+    ) -> AssistantReply:
+        """Разбор запроса: поиск, статистика, сортировка или уточнение."""
+        search = self.parse_user_query(text, history=history)
+        low = text.lower()
+
+        if search.action == "stats":
+            return AssistantReply(
+                action="stats",
+                search=search,
+                message="Сводка по занятому месту:",
+                next_steps=["Спросите «что сортировать?» для советов"],
+            )
+
+        if search.action == "suggest":
+            return AssistantReply(
+                action="suggest",
+                search=search,
+                message="Подберу советы по вашим папкам.",
+                next_steps=["Смотрите панель «Советы» справа"],
+            )
+
+        sort_plan = parse_sort_plan(
+            text,
+            settings,
+            filter_intent=search if search.action == "search" else None,
+            filter_summary=format_intent_summary(search) if search.action == "search" else "",
+        )
+
+        if sort_plan is not None:
+            clarify = check_sort_clarification(sort_plan, settings)
+            if clarify:
+                clarify.search = search
+                return clarify
+            return AssistantReply(
+                action="sort",
+                search=search,
+                sort_plan=sort_plan,
+                message="Понял запрос на сортировку. Сейчас построю план…",
+                next_steps=format_sort_next_steps(sort_plan),
+            )
+
+        if search.action == "search":
+            steps = ["«Сорт. все» — раскладка найденных файлов из отслеживаемых папок"]
+            if search.categories or search.extensions:
+                steps.append("Или: «отсортируй найденное» / «разложи по моим папкам»")
+            return AssistantReply(
+                action="search",
+                search=search,
+                next_steps=steps,
+            )
+
+        return AssistantReply(action=search.action, search=search)
 
     def search(
         self,
@@ -1156,6 +1748,37 @@ class LLMAssistant:
             pass
         return self.rules.parse_user_query(text, history=history)
 
+    def parse_assistant_query(
+        self,
+        text: str,
+        settings: Settings,
+        history: list[dict[str, str]] | None = None,
+    ) -> AssistantReply:
+        if self.provider == "rules":
+            return self.rules.parse_assistant_query(text, settings, history=history)
+        try:
+            llm_reply = self._llm_assistant_parse(text, history=history)
+            if llm_reply:
+                sort_plan = parse_sort_plan(
+                    text,
+                    settings,
+                    filter_intent=llm_reply.search,
+                    filter_summary=format_intent_summary(llm_reply.search)
+                    if llm_reply.search else "",
+                )
+                if sort_plan:
+                    clarify = check_sort_clarification(sort_plan, settings)
+                    if clarify:
+                        clarify.search = llm_reply.search
+                        return clarify
+                    llm_reply.action = "sort"
+                    llm_reply.sort_plan = sort_plan
+                    llm_reply.next_steps = format_sort_next_steps(sort_plan)
+                return llm_reply
+        except Exception:
+            pass
+        return self.rules.parse_assistant_query(text, settings, history=history)
+
     def generate_suggestions(
         self,
         settings: Settings,
@@ -1200,20 +1823,137 @@ class LLMAssistant:
             "desktop_by_category": _count_by(watched_entries, "category"),
         }
 
+    def parse_assistant_query(
+        self,
+        text: str,
+        settings: Settings,
+        history: list[dict[str, str]] | None = None,
+    ) -> AssistantReply:
+        """LLM + fallback на правила для полного ответа (поиск/сортировка)."""
+        if self.provider == "rules":
+            return self.rules.parse_assistant_query(text, settings, history=history)
+        try:
+            parsed = self._llm_parse(text, history=history)
+            if parsed and parsed.action in ("sort", "compress", "clarify"):
+                # Достраиваем SortPlan правилами поверх LLM-фильтра
+                reply = self.rules.parse_assistant_query(text, settings, history=history)
+                if reply.action in ("sort", "clarify") and reply.sort_plan:
+                    return reply
+            if parsed and parsed.action in ("search", "suggest", "stats"):
+                # Обогащаем правила LLM-полями, затем стандартный ответ
+                base = self.rules.parse_assistant_query(text, settings, history=history)
+                if base.search and parsed:
+                    for field_name in (
+                        "categories", "extensions", "month", "year", "min_size", "max_size",
+                        "name_contains", "source", "delete_candidates", "newer_than_days",
+                        "older_than_days", "duplicates_only", "installers_only", "empty_only",
+                        "folder_contains", "sort_mode", "target_relpath", "compress",
+                    ):
+                        val = getattr(parsed, field_name, None)
+                        if val not in (None, "", [], False):
+                            setattr(base.search, field_name, val)
+                return base
+        except Exception:
+            pass
+        return self.rules.parse_assistant_query(text, settings, history=history)
+
+    def _llm_assistant_parse(
+        self,
+        text: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> AssistantReply | None:
+        meta = {
+            "smart_folders_root": self.settings.smart_folders_root,
+            "sort_mode": self.settings.sort_mode,
+            "destination": self.settings.destination,
+        }
+        system = (
+            "Ты парсер запросов файлового менеджера. По метаданным и запросу верни ТОЛЬКО JSON: "
+            '{"action":"search|suggest|stats|sort|clarify","message":"краткий ответ по-русски",'
+            '"next_steps":["..."],"clarify_question":"","categories":[],"extensions":[],"month":null,'
+            '"year":null,"min_size":null,"max_size":null,"name_contains":"","source":"all|archive|desktop",'
+            '"delete_candidates":false,"newer_than_days":null,"older_than_days":null,'
+            '"duplicates_only":false,"installers_only":false,"empty_only":false,'
+            '"folder_contains":"","sort_mode":null,"sort_scope":"filtered|all_watched|selected",'
+            '"target_relpath":"","compress":false}. '
+            "categories: Картинки, Видео, Музыка, Документы, Архивы, Программы, Код, Папки. "
+            "sort_mode: type_date, type_only, date_only, extension, smart_folders. "
+            "sizes в байтах. Только metadata, без содержимого файлов. "
+            f"Контекст настроек: {json.dumps(meta, ensure_ascii=False)}"
+        )
+        raw = self._chat(system, text, history=history)
+        if not raw:
+            return None
+        data = _extract_json(raw)
+        if not isinstance(data, dict):
+            return None
+        search = SearchIntent(
+            action=str(data.get("action") or "search"),
+            categories=[str(c) for c in (data.get("categories") or [])],
+            extensions=[
+                str(e) if str(e).startswith(".") else f".{e}"
+                for e in (data.get("extensions") or [])
+            ],
+            month=data.get("month"),
+            year=data.get("year"),
+            min_size=data.get("min_size"),
+            max_size=data.get("max_size"),
+            name_contains=str(data.get("name_contains") or ""),
+            source=str(data.get("source") or "all"),
+            raw_query=text,
+            delete_candidates=bool(data.get("delete_candidates")),
+            newer_than_days=data.get("newer_than_days"),
+            older_than_days=data.get("older_than_days"),
+            duplicates_only=bool(data.get("duplicates_only")),
+            installers_only=bool(data.get("installers_only")),
+            empty_only=bool(data.get("empty_only")),
+            folder_contains=str(data.get("folder_contains") or ""),
+            sort_mode=data.get("sort_mode"),
+            sort_scope=str(data.get("sort_scope") or "filtered"),
+            target_relpath=str(data.get("target_relpath") or ""),
+            compress=bool(data.get("compress")),
+            clarify_question=str(data.get("clarify_question") or ""),
+        )
+        action = str(data.get("action") or search.action)
+        if action == "clarify" or search.clarify_question:
+            return AssistantReply(
+                action="clarify",
+                search=search,
+                message=search.clarify_question or str(data.get("message") or "Уточните запрос."),
+                next_steps=[str(s) for s in (data.get("next_steps") or [])][:4],
+            )
+        if action in ("stats", "suggest"):
+            return AssistantReply(
+                action=action,
+                search=search,
+                message=str(data.get("message") or ""),
+                next_steps=[str(s) for s in (data.get("next_steps") or [])][:4],
+            )
+        return AssistantReply(
+            action="search" if action == "search" else action,
+            search=search,
+            message=str(data.get("message") or ""),
+            next_steps=[str(s) for s in (data.get("next_steps") or [])][:4],
+        )
+
     def _llm_parse(
         self,
         text: str,
         history: list[dict[str, str]] | None = None,
     ) -> SearchIntent | None:
         system = (
-            "Ты парсер запросов файлового менеджера. Верни ТОЛЬКО JSON без markdown: "
-            '{"action":"search|suggest|stats","categories":[],"extensions":[],"month":null,'
+            "Ты парсер запросов файлового менеджера FileOrganizer. Верни ТОЛЬКО JSON без markdown: "
+            '{"action":"search|suggest|stats|sort|clarify","categories":[],"extensions":[],"month":null,'
             '"year":null,"min_size":null,"max_size":null,"name_contains":"","source":"all|archive|desktop",'
             '"delete_candidates":false,"newer_than_days":null,"older_than_days":null,'
             '"duplicates_only":false,"installers_only":false,"empty_only":false,'
-            '"folder_contains":""}. '
+            '"folder_contains":"","sort_mode":null,"sort_scope":"filtered|all_watched|selected",'
+            '"target_relpath":"","compress":false,"clarify_question":""}. '
+            "action=sort — сортировка/раскладка; sort_mode из: type_only, type_date, date_only, "
+            "extension, smart_folders; target_relpath — путь вроде Документы/Учёба/Python. "
             "categories — из: Картинки, Видео, Музыка, Документы, Архивы, Программы, Код, Папки. "
-            "sizes в байтах. Учитывай краткий контекст предыдущих сообщений, если он есть."
+            "Только метаданные, без содержимого файлов. sizes в байтах. "
+            "Учитывай краткий контекст предыдущих сообщений."
         )
         raw = self._chat(system, text, history=history)
         if not raw:
@@ -1239,6 +1979,11 @@ class LLMAssistant:
             installers_only=bool(data.get("installers_only")),
             empty_only=bool(data.get("empty_only")),
             folder_contains=str(data.get("folder_contains") or ""),
+            sort_mode=data.get("sort_mode"),
+            sort_scope=str(data.get("sort_scope") or "filtered"),
+            target_relpath=str(data.get("target_relpath") or ""),
+            compress=bool(data.get("compress")),
+            clarify_question=str(data.get("clarify_question") or ""),
         )
 
     def _llm_suggestions(
@@ -1395,6 +2140,17 @@ def create_assistant(settings: Settings) -> RulesAssistant | LLMAssistant:
     if settings.ai_provider in ("openai", "ollama"):
         return LLMAssistant(settings)
     return RulesAssistant()
+
+
+def parse_assistant_query(
+    text: str,
+    settings: Settings,
+    history: list[dict[str, str]] | None = None,
+) -> AssistantReply:
+    assistant = create_assistant(settings)
+    if hasattr(assistant, "parse_assistant_query"):
+        return assistant.parse_assistant_query(text, settings, history=history)
+    return RulesAssistant().parse_assistant_query(text, settings, history=history)
 
 
 def parse_user_query(

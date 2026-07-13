@@ -1903,6 +1903,7 @@ class App(Tk):
             get_settings=lambda: self.settings,
             get_index=lambda: self.index,
             get_watched_entries=lambda: self.sorter.list_watched_entries(),
+            get_sorter=lambda: self.sorter,
             on_open_path=open_path,
             on_reveal_path=reveal_in_explorer,
             on_sort_paths=self._desktop_sort_paths,
@@ -1913,8 +1914,78 @@ class App(Tk):
             on_show_desktop=self._ai_show_desktop_tab,
             on_open_settings=self._open_ai_settings,
             on_smart_folders=self._ai_smart_folders,
+            on_apply_sort_plan=self._ai_apply_sort_plan,
         )
         self._ai_panel.pack(fill=BOTH, expand=True)
+
+    def _ai_apply_sort_plan(self, plan) -> None:
+        """Применить подтверждённый план сортировки из ИИ-помощника."""
+        from .ai_assistant import SortPlan, resolve_dest_path
+        from .folder_profiles import MatchProposal
+
+        if not isinstance(plan, SortPlan) or not plan.paths:
+            return
+
+        if plan.plan_type == "smart_folders":
+            self._ai_smart_folders(plan.paths)
+            return
+
+        if plan.plan_type == "custom_folder" and plan.custom_dest:
+            dest = resolve_dest_path(plan.custom_dest, self.settings)
+            if dest is None:
+                messagebox.showwarning(
+                    "ИИ-помощник",
+                    f"Не удалось найти папку «{plan.custom_dest}».",
+                )
+                return
+            proposals = []
+            for raw in plan.paths:
+                src = Path(raw)
+                if not src.is_file():
+                    continue
+                proposals.append(MatchProposal(
+                    source=src,
+                    action="move",
+                    dest_folder=dest,
+                    profile_name=dest.name,
+                    reason="ИИ: пользовательский путь",
+                ))
+            if not proposals:
+                messagebox.showinfo("ИИ-помощник", "Нет файлов для перемещения.")
+                return
+
+            def work():
+                result = self.sorter.apply_confirmed_smart_plan(proposals)
+                self.after(0, lambda: self._after_sort(result, False))
+
+            if not self._begin_task("Раскладка ИИ"):
+                return
+            threading.Thread(target=work, daemon=True).start()
+            return
+
+        prev_mode = self.settings.data.get("sort_mode")
+        prev_compress = self.settings.data.get("compression_enabled", False)
+        if plan.sort_mode and plan.sort_mode in SORT_MODES:
+            self.settings.data["sort_mode"] = plan.sort_mode
+        compress_override = True if plan.enable_compression else None
+        if plan.enable_compression:
+            self.settings.data["compression_enabled"] = True
+            if self.settings.compression_mode == "none":
+                self.settings.data["compression_mode"] = "zip"
+
+        def restore():
+            self.settings.data["sort_mode"] = prev_mode
+            self.settings.data["compression_enabled"] = prev_compress
+
+        if not self._confirm_duplicates(plan.paths):
+            restore()
+            return
+        started = self._run_sort(plan.paths, compress_override=compress_override)
+        if not started:
+            restore()
+            return
+        # Режим вернём после сортировки через отложенный вызов
+        self.after(500, restore)
 
     def _ai_apply_sort_mode(self, mode: str) -> None:
         if mode not in SORT_MODES:
