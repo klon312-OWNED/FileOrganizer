@@ -99,6 +99,11 @@ class SearchIntent:
     target_relpath: str = ""  # например Документы/Учёба/Python
     compress: bool = False
     clarify_question: str = ""
+    months: list[int] = field(default_factory=list)
+    exclude_extensions: list[str] = field(default_factory=list)
+    exclude_categories: list[str] = field(default_factory=list)
+    exclude_folder: str = ""
+    confidence: float = 1.0
 
 
 @dataclass
@@ -225,8 +230,15 @@ SUGGESTED_PROMPTS = (
 
 _SORT_VERBS = (
     "сортир", "отсортир", "разлож", "разложи", "полож", "положи", "перенес",
-    "сложи", "сложить", "разложить", "упорядоч", "расклад", "разбер", "разбери",
+    "перенеси", "скинь", "скин", "закинь", "закин", "сложи", "сложить",
+    "разложить", "упорядоч", "расклад", "разбер", "разбери", "убери", "убрать",
+    "почист", "почисти", "распред", "распредели",
 )
+_SEARCH_VERBS = (
+    "найд", "найти", "покаж", "показать", "ищ", "искать", "search", "find", "где ",
+    "вытащ", "вытащи", "откопай", "откоп",
+)
+_CLEAN_VERBS = ("почист", "убер", "убрать", "разбер", "разбери", "наведи порядок")
 _COMPRESS_WORDS = ("сжми", "сожми", "сжать", "сжати", "в zip", "в зип", "zip", "упакуй", "упаков")
 _EXCLUDE_WORDS = ("исключ", "не трогай", "не сортир", "пропуст")
 
@@ -249,6 +261,413 @@ _PATH_ALIASES = {
     "documents": "Documents",
 }
 
+# v1.16 — расширенный NLU: опечатки, синонимы, сезоны, контекст
+_TYPO_CORRECTIONS: dict[str, str] = {
+    "найти": "найди", "найдти": "найди", "найдт": "найди", "найдите": "найди",
+    "разложить": "разложи", "разложит": "разложи", "разложите": "разложи",
+    "сортироват": "сортируй", "сортировка": "сортируй", "отсортировать": "отсортируй",
+    "перенести": "перенеси", "перенос": "перенеси", "скинуть": "скинь", "закинуть": "закинь",
+    "почистить": "почисти", "убрать": "убери", "показать": "покажи", "показ": "покажи",
+    "загрузок": "загрузки", "загрузк": "загрузки", "загрузке": "загрузки",
+    "ворд": "word", "вордов": "word", "ворды": "word", "word": "word",
+    "пдф": "pdf", "эксель": "excel", "эксел": "excel", "установочник": "установщик",
+    "курсовую": "курсовая", "курсовые": "курсовая", "курсовой": "курсовая",
+    "недавно": "недавно", "вчерашн": "вчера",
+}
+
+_FILE_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
+    "word": (".doc", ".docx"), "doc": (".doc", ".docx"), "ворд": (".doc", ".docx"),
+    "pdf": (".pdf",), "пдф": (".pdf",),
+    "excel": (".xls", ".xlsx"), "эксель": (".xls", ".xlsx"),
+    "ppt": (".ppt", ".pptx"), "powerpoint": (".ppt", ".pptx"),
+    "jpg": (".jpg", ".jpeg"), "jpeg": (".jpg", ".jpeg"), "png": (".png",),
+    "mp4": (".mp4",), "mkv": (".mkv",), "zip": (".zip",), "rar": (".rar",),
+}
+
+_SEASON_MONTHS: dict[str, tuple[int, ...]] = {
+    "весн": (3, 4, 5), "лет": (6, 7, 8), "осен": (9, 10, 11), "зим": (12, 1, 2),
+}
+
+_PRONOUN_PATTERNS = (
+    (re.compile(r"\b(их|эти|это|то же|то же самое|найденн\w*)\b", re.I), "last_search"),
+    (re.compile(r"\b(туда же|туда\s+же|как раньше|как в прошлый раз|как в прошлый\s+раз|"
+                 r"повтори|ещё раз|снова так же)\b", re.I), "last_plan"),
+)
+
+SESSION_CONTEXT_PATH = APP_DIR / "agent_session.json"
+
+
+@dataclass
+class SessionContext:
+    """Память сессии: последний успешный план и фильтры."""
+
+    last_sort_mode: str | None = None
+    last_target_relpath: str = ""
+    last_filter_summary: str = ""
+    last_scope: str = "filtered"
+    last_compress: bool = False
+    last_query: str = ""
+    last_search_query: str = ""
+    last_extensions: list[str] = field(default_factory=list)
+    last_categories: list[str] = field(default_factory=list)
+
+
+def load_session_context() -> SessionContext:
+    if not SESSION_CONTEXT_PATH.exists():
+        return SessionContext()
+    try:
+        data = json.loads(SESSION_CONTEXT_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return SessionContext(
+                last_sort_mode=data.get("last_sort_mode"),
+                last_target_relpath=str(data.get("last_target_relpath") or ""),
+                last_filter_summary=str(data.get("last_filter_summary") or ""),
+                last_scope=str(data.get("last_scope") or "filtered"),
+                last_compress=bool(data.get("last_compress")),
+                last_query=str(data.get("last_query") or ""),
+                last_search_query=str(data.get("last_search_query") or ""),
+                last_extensions=list(data.get("last_extensions") or []),
+                last_categories=list(data.get("last_categories") or []),
+            )
+    except (json.JSONDecodeError, OSError):
+        pass
+    return SessionContext()
+
+
+def save_session_context(ctx: SessionContext) -> None:
+    try:
+        SESSION_CONTEXT_PATH.write_text(
+            json.dumps({
+                "last_sort_mode": ctx.last_sort_mode,
+                "last_target_relpath": ctx.last_target_relpath,
+                "last_filter_summary": ctx.last_filter_summary,
+                "last_scope": ctx.last_scope,
+                "last_compress": ctx.last_compress,
+                "last_query": ctx.last_query,
+                "last_search_query": ctx.last_search_query,
+                "last_extensions": ctx.last_extensions,
+                "last_categories": ctx.last_categories,
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if len(a) < len(b):
+        return _levenshtein(b, a)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            ins = cur[j - 1] + 1
+            delete = prev[j] + 1
+            sub = prev[j - 1] + (ca != cb)
+            cur.append(min(ins, delete, sub))
+        prev = cur
+    return prev[-1]
+
+
+_FUZZY_STOP_WORDS = frozenset({
+    "за", "в", "во", "на", "и", "не", "по", "из", "от", "до", "но", "как", "что",
+    "то", "же", "ли", "бы", "ни", "мне", "все", "ещё", "еще", "или", "при", "без",
+    "под", "над", "для", "про", "ну", "плз", "pls", "мне", "там", "тут", "это",
+    "их", "он", "она", "мы", "вы", "оно", "они", "мой", "мои", "моя",
+})
+
+
+def _fix_typos(text: str) -> str:
+    """Простая коррекция опечаток по словарю и edit distance для ключевых слов."""
+    words = text.split()
+    keywords = set(_TYPO_CORRECTIONS) | set(_TYPO_CORRECTIONS.values())
+    keywords.update(
+        "найди", "разложи", "сортируй", "перенеси", "скинь", "закинь", "почисти",
+        "убери", "покажи", "загрузки", "установщик", "курсовая",
+    )
+    out: list[str] = []
+    for w in words:
+        low = w.lower()
+        if low in _TYPO_CORRECTIONS:
+            out.append(_TYPO_CORRECTIONS[low])
+            continue
+        if len(low) < 4 or low in _FUZZY_STOP_WORDS:
+            out.append(w)
+            continue
+        best = low
+        best_dist = 2
+        for kw in keywords:
+            if len(kw) < 4 or abs(len(kw) - len(low)) > 2:
+                continue
+            d = _levenshtein(low, kw)
+            if d < best_dist:
+                best_dist = d
+                best = kw
+        out.append(best if best_dist == 1 else w)
+    return " ".join(out)
+
+
+def normalize_query_text(text: str) -> str:
+    """Нормализация запроса: пробелы, ё→е, опечатки."""
+    q = re.sub(r"\s+", " ", (text or "").strip())
+    q = q.replace("ё", "е")
+    return _fix_typos(q)
+
+
+def resolve_context_references(
+    text: str,
+    history: list[dict[str, str]] | None,
+    session: SessionContext | None,
+) -> str:
+    """Подставить контекст для местоимений и «как в прошлый раз»."""
+    q = text.strip()
+    low = q.lower()
+    session = session or load_session_context()
+    history = history or []
+
+    if re.search(r"как в прошлый раз|как раньше|повтори|снова так же|ещё раз", low):
+        parts: list[str] = []
+        if session.last_query:
+            parts.append(session.last_query)
+        elif session.last_search_query:
+            parts.append(session.last_search_query)
+        if parts and len(q.split()) <= 6:
+            return parts[0]
+
+    if re.search(r"\b(их|эти|это|найденн\w*)\b", low) and len(q.split()) <= 8:
+        prev = next((m["content"] for m in reversed(history) if m.get("role") == "user"), "")
+        if prev:
+            return f"{prev} {q}"
+        if session.last_search_query:
+            return f"{session.last_search_query} {q}"
+
+    if re.search(r"туда же", low):
+        target = session.last_target_relpath
+        if target:
+            return re.sub(r"туда\s+же", f"в {target}", q, flags=re.I)
+
+    return q
+
+
+def split_compound_request(text: str) -> tuple[str, str] | None:
+    """Разделить составной запрос «найди X и положи Y» на (filter, action)."""
+    low = text.lower()
+    m = re.search(
+        r"^(.*?)\s+и\s+(?:потом\s+)?"
+        r"(?:полож|перенес|скин|закин|разлож|сортир|отсортир|убери|убрать|слож)",
+        low,
+    )
+    if not m:
+        return None
+    split_at = m.start(0) + len(m.group(1))
+    part_a = text[:split_at].strip()
+    part_b = text[split_at + 3:].strip()  # skip " и "
+    if not part_a or not part_b:
+        return None
+    has_search = any(v in part_a.lower() for v in _SEARCH_VERBS)
+    has_sort = any(v in part_b.lower() for v in _SORT_VERBS + _COMPRESS_WORDS)
+    if has_search and has_sort:
+        return part_a, part_b
+    return None
+
+
+def _parse_negations(low: str, intent: SearchIntent) -> None:
+    """«не трогай exe», «кроме папки Project», «без pdf», «exe не трогай»."""
+    for m in re.finditer(
+        r"(?:не\s+трогай|не\s+сортир|не\s+трога|кроме|без|except|ignore)\s+"
+        r"(?:файл\w*|папк\w*|тип\w*)?\s*([a-z0-9_.\-/\\]+)",
+        low,
+    ):
+        chunk = m.group(1).strip()
+        if not chunk:
+            continue
+        if "папк" in m.group(0) or "\\" in chunk or "/" in chunk:
+            intent.exclude_folder = chunk.strip("«»\"' ")
+            continue
+        token = chunk.split()[0] if " " in chunk else chunk
+        if token.startswith("."):
+            if token not in intent.exclude_extensions:
+                intent.exclude_extensions.append(token)
+            continue
+        for alias, exts in _FILE_TYPE_ALIASES.items():
+            if alias == token or alias in token:
+                for e in exts:
+                    if e not in intent.exclude_extensions:
+                        intent.exclude_extensions.append(e)
+                break
+        else:
+            ext = f".{token}" if re.fullmatch(r"[a-z0-9]{1,8}", token) else ""
+            if ext and ext not in intent.exclude_extensions:
+                intent.exclude_extensions.append(ext)
+            for cat, keys in _CATEGORY_KEYWORDS.items():
+                if any(k in token for k in keys) or cat.lower() in token:
+                    if cat not in intent.exclude_categories:
+                        intent.exclude_categories.append(cat)
+
+    for m in re.finditer(r"\b([a-z0-9]{1,8})\s+не\s+трогай\b", low):
+        token = m.group(1)
+        ext = token if token.startswith(".") else f".{token}"
+        if ext not in intent.exclude_extensions:
+            intent.exclude_extensions.append(ext)
+
+    if re.search(r"кроме\s+папк", low):
+        m = re.search(r"кроме\s+папк\w*\s+([^\n,.!?]+)", low)
+        if m:
+            intent.exclude_folder = m.group(1).strip()
+
+
+def _parse_file_type_aliases(low: str, intent: SearchIntent) -> None:
+    for alias, exts in _FILE_TYPE_ALIASES.items():
+        if re.search(rf"\b{re.escape(alias)}\b", low):
+            for e in exts:
+                if e not in intent.extensions:
+                    intent.extensions.append(e)
+            if alias in ("word", "doc", "ворд") and "Документы" not in intent.categories:
+                intent.categories.append("Документы")
+
+
+def _parse_seasons_and_relative_time(low: str, intent: SearchIntent) -> None:
+    for key, months in _SEASON_MONTHS.items():
+        if key in low:
+            intent.months = list(months)
+            break
+    if "на прошлой неделе" in low or "за прошлую неделю" in low or "прошлой недел" in low:
+        intent.newer_than_days = 14
+        intent.older_than_days = 7
+    elif "на этой неделе" in low or "за эту неделю" in low or "эту недел" in low:
+        intent.newer_than_days = 7
+    elif "недавно" in low or "свеж" in low:
+        intent.newer_than_days = intent.newer_than_days or 14
+    elif "давно" in low and "не " not in low[:low.find("давно") if "давно" in low else 0]:
+        intent.older_than_days = intent.older_than_days or 90
+
+
+def estimate_parse_confidence(intent: SearchIntent, text: str) -> float:
+    """Оценка уверенности разбора (0..1)."""
+    low = text.lower()
+    score = 0.35
+    if any(v in low for v in _SEARCH_VERBS + _SORT_VERBS + _CLEAN_VERBS):
+        score += 0.2
+    if intent.categories or intent.extensions or intent.name_contains:
+        score += 0.15
+    if intent.month or intent.year or intent.months or intent.newer_than_days:
+        score += 0.1
+    if intent.target_relpath or intent.sort_mode:
+        score += 0.1
+    if intent.folder_contains:
+        score += 0.05
+    if intent.action in ("stats", "suggest") and any(
+        w in low for w in ("сколько", "статистик", "совет", "подсказ", "уборк")
+    ):
+        score += 0.25
+    return min(1.0, score)
+
+
+def format_understood_summary(intent: SearchIntent | None, plan: SortPlan | None = None) -> str:
+    """Человекочитаемое «Понял: …» для UI."""
+    parts: list[str] = []
+    if plan and plan.action in ("sort", "move_to", "smart_folders", "compress"):
+        verb = "сортировать"
+        if plan.plan_type == "custom_folder":
+            verb = f"перенести в «{plan.custom_dest or plan.target_relpath}»"
+        elif plan.plan_type == "smart_folders":
+            verb = "разложить по моим папкам"
+        elif plan.enable_compression:
+            verb = "сжать и отсортировать"
+        parts.append(verb)
+    elif intent:
+        action_map = {"search": "найти", "sort": "сортировать", "stats": "показать статистику",
+                      "suggest": "подсказать уборку", "clarify": "уточнить"}
+        parts.append(action_map.get(intent.action, intent.action))
+
+    if intent:
+        if intent.extensions:
+            parts.append(" ".join(intent.extensions))
+        if intent.categories:
+            parts.append(", ".join(intent.categories))
+        if intent.months:
+            names = [str(m) for m in intent.months]
+            parts.append(f"за месяцы {', '.join(names)}")
+        elif intent.month:
+            parts.append(f"за {intent.month}-й месяц")
+        if intent.year:
+            parts.append(f"за {intent.year}")
+        if intent.folder_contains:
+            loc = {"download": "Загрузки", "desktop": "Рабочий стол"}.get(
+                intent.folder_contains, intent.folder_contains,
+            )
+            parts.append(f"из {loc}")
+        if intent.target_relpath:
+            parts.append(f"→ {intent.target_relpath}")
+        if intent.exclude_extensions:
+            parts.append(f"кроме {', '.join(intent.exclude_extensions)}")
+        if intent.exclude_folder:
+            parts.append(f"кроме папки {intent.exclude_folder}")
+    if plan and plan.sort_mode:
+        parts.append(f"режим {sort_mode_label(plan.sort_mode)}")
+    summary = ", ".join(p for p in parts if p)
+    return summary if summary else "ваш запрос"
+
+
+def update_session_from_turn(
+    turn: AgentTurn,
+    raw_query: str,
+    session: SessionContext | None = None,
+) -> SessionContext:
+    """Обновить память сессии после успешного разбора."""
+    ctx = session or load_session_context()
+    ctx.last_query = raw_query
+    if turn.search:
+        ctx.last_search_query = raw_query
+        ctx.last_extensions = list(turn.search.extensions)
+        ctx.last_categories = list(turn.search.categories)
+    if turn.sort_plan and turn.action in ("sort",):
+        plan = turn.sort_plan
+        ctx.last_sort_mode = plan.sort_mode
+        ctx.last_target_relpath = plan.custom_dest or plan.target_relpath
+        ctx.last_filter_summary = plan.filter_summary
+        ctx.last_scope = plan.scope
+        ctx.last_compress = plan.enable_compression
+    save_session_context(ctx)
+    return ctx
+
+
+# Few-shot примеры для LLM (v1.16)
+AGENT_FEW_SHOT_EXAMPLES = """
+Примеры разговорного русского (запрос → инструменты):
+
+Пользователь: ну короче разбери мне загрузки плз
+→ plan_sort(query=..., scope=all_watched)
+
+Пользователь: где мои курсовые лежат?
+→ search_files(query=курсовые)
+
+Пользователь: найди все ворд за весну и положи в учёбу
+→ search_files + plan_sort с target=Учёба, фильтр docx, months=3,4,5
+
+Пользователь: exe не трогай, остальное из downloads разложи
+→ plan_sort(scope=all_watched), exclude .exe
+
+Пользователь: как в прошлый раз только pdf
+→ plan_sort с параметрами из прошлого успешного плана + extensions=.pdf
+
+Пользователь: сколько там места вообще
+→ get_stats
+
+Пользователь: че можно удалить?
+→ suggest_cleanup
+
+Пользователь: найди большие видео за май
+→ search_files(categories=Видео, month=5, min_size)
+
+Пользователь: кроме папки Project всё остальное сортируй
+→ plan_sort, exclude_folder=Project
+
+Пользователь: привет
+→ explain_status
+"""
 
 def human_size(num: int) -> str:
     for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
@@ -309,6 +728,12 @@ def format_intent_summary(intent: SearchIntent) -> str:
         parts.append(f"куда: {intent.target_relpath}")
     if intent.compress:
         parts.append("со сжатием")
+    if intent.months:
+        parts.append(f"месяцы {','.join(str(m) for m in intent.months)}")
+    if intent.exclude_extensions:
+        parts.append(f"кроме {', '.join(intent.exclude_extensions)}")
+    if intent.exclude_folder:
+        parts.append(f"кроме папки {intent.exclude_folder}")
     if intent.sort_scope and intent.sort_scope != "filtered" and intent.action in (
         "sort", "sort_plan", "compress", "exclude", "clarify",
     ):
@@ -653,6 +1078,14 @@ def collect_sort_paths(
     ):
         base = [p for p in base if Path(p).suffix.lower() in _INSTALLER_EXTS]
 
+    if filter_intent:
+        if filter_intent.exclude_extensions:
+            ex = set(filter_intent.exclude_extensions)
+            base = [p for p in base if Path(p).suffix.lower() not in ex]
+        if filter_intent.exclude_folder:
+            needle = filter_intent.exclude_folder.lower()
+            base = [p for p in base if needle not in p.lower()]
+
     return base
 
 
@@ -849,8 +1282,10 @@ class RulesAssistant:
         self,
         text: str,
         history: list[dict[str, str]] | None = None,
+        session: SessionContext | None = None,
     ) -> SearchIntent:
-        q = text.strip()
+        session = session or load_session_context()
+        q = normalize_query_text(resolve_context_references(text, history, session))
         # Короткие уточнения («только pdf», «за 2024») — подмешиваем прошлый запрос
         if history and len(q.split()) <= 5:
             prev_user = next(
@@ -859,11 +1294,15 @@ class RulesAssistant:
             )
             low_q = q.lower()
             if prev_user and not any(
-                w in low_q for w in ("найд", "покаж", "что ", "как ", "удал", "совет", "подсказ")
+                w in low_q for w in _SEARCH_VERBS + ("что ", "как ", "удал", "совет", "подсказ")
             ):
                 q = f"{prev_user} {q}"
         low = q.lower()
         intent = SearchIntent(raw_query=q)
+
+        _parse_negations(low, intent)
+        _parse_file_type_aliases(low, intent)
+        _parse_seasons_and_relative_time(low, intent)
 
         if any(w in low for w in ("подсказ", "совет", "рекоменд", "что сортир", "что удал")):
             intent.action = "suggest"
@@ -1025,9 +1464,7 @@ class RulesAssistant:
         elif "desktop" in low or ("рабоч" in low and "стол" in low):
             intent.folder_contains = "desktop"
 
-        if intent.action != "stats" and any(
-            w in low for w in ("найд", "покаж", "ищ", "search", "find", "где ")
-        ):
+        if intent.action != "stats" and any(w in low for w in _SEARCH_VERBS):
             intent.action = "search"
 
         quoted = re.findall(r"[«\"']([^»\"']+)[»\"']", q)
@@ -1039,14 +1476,15 @@ class RulesAssistant:
                 "большие", "большой", "маленькие", "файлы", "файл", "в", "на",
                 "май", "июнь", "июль", "архиве", "рабочем", "столе", "можно",
                 "какие", "который", "которые", "пожалуйста", "мне", "есть",
-                "больше", "меньше", "года", "году", "месяц", "месяца",
+                "больше", "меньше", "года", "году", "месяц", "месяца", "положи",
+                "перенеси", "скинь", "закинь", "учебу", "учёбу", "плз", "ну",
             }
-            # Не брать в name токены, уже распознанные как категории/размеры/годы
             skip_parts = set()
             for keys in _CATEGORY_KEYWORDS.values():
                 skip_parts.update(keys)
             skip_parts.update(_LARGE_WORDS)
             skip_parts.update(_SMALL_WORDS)
+            skip_parts.update(_FILE_TYPE_ALIASES)
             tokens = []
             for t in re.split(r"\s+", low):
                 if not t or t in stop or len(t) <= 2:
@@ -1061,6 +1499,7 @@ class RulesAssistant:
             if tokens and not intent.categories and not intent.extensions:
                 intent.name_contains = " ".join(tokens[:4])
 
+        intent.confidence = estimate_parse_confidence(intent, q)
         return intent
 
     def parse_assistant_query(
@@ -1660,6 +2099,8 @@ class RulesAssistant:
             return False
         if intent.month and int(row["month"]) != intent.month:
             return False
+        if intent.months and int(row["month"]) not in intent.months:
+            return False
         size = int(row["size"] or 0)
         if intent.min_size is not None and size < intent.min_size:
             return False
@@ -1667,6 +2108,14 @@ class RulesAssistant:
             return False
         if intent.name_contains and intent.name_contains not in row["name"].lower():
             return False
+        ext = (row["extension"] or "").lower()
+        if intent.exclude_extensions and ext in intent.exclude_extensions:
+            return False
+        if intent.exclude_categories and row["category"] in intent.exclude_categories:
+            return False
+        if intent.exclude_folder:
+            if intent.exclude_folder.lower() in f"{row['path']}".lower():
+                return False
         if intent.newer_than_days or intent.older_than_days:
             # В архиве ориентируемся на year/month записи
             try:
@@ -1707,6 +2156,8 @@ class RulesAssistant:
                     return False
                 if intent.month and dt.month != intent.month:
                     return False
+                if intent.months and dt.month not in intent.months:
+                    return False
         size = int(entry.get("size", 0))
         if intent.min_size is not None and size < intent.min_size:
             return False
@@ -1714,6 +2165,14 @@ class RulesAssistant:
             return False
         if intent.name_contains and intent.name_contains not in name.lower():
             return False
+        if intent.exclude_extensions and ext in intent.exclude_extensions:
+            return False
+        if intent.exclude_categories and entry.get("category") in intent.exclude_categories:
+            return False
+        if intent.exclude_folder:
+            hay_exc = f"{entry.get('folder', '')} {entry.get('path', '')}".lower()
+            if intent.exclude_folder.lower() in hay_exc:
+                return False
         if intent.folder_contains:
             folder = (entry.get("folder") or "").lower()
             needle = intent.folder_contains.lower()
@@ -2146,8 +2605,35 @@ def _extract_json(text: str) -> Any:
             try:
                 return json.loads(m.group(0))
             except json.JSONDecodeError:
-                return None
+                pass
     return None
+
+
+def _extract_intent_from_plain_text(raw: str, user_query: str) -> dict[str, Any] | None:
+    """Вторичный разбор: LLM вернул текст вместо JSON — извлечь intent эвристиками."""
+    low = raw.lower()
+    calls: list[dict[str, Any]] = []
+    if any(w in low for w in _SEARCH_VERBS) or "найд" in user_query.lower():
+        calls.append({"name": "search_files", "arguments": {"query": user_query}})
+    elif any(w in low for w in _SORT_VERBS):
+        calls.append({"name": "plan_sort", "arguments": {"query": user_query}})
+    elif any(w in low for w in ("статистик", "место", "сколько")):
+        calls.append({"name": "get_stats", "arguments": {}})
+    elif any(w in low for w in ("уборк", "удал", "мусор")):
+        calls.append({"name": "suggest_cleanup", "arguments": {}})
+    else:
+        intent = RulesAssistant().parse_user_query(user_query)
+        if intent.action == "search":
+            calls.append({"name": "search_files", "arguments": {"query": user_query}})
+        elif intent.confidence >= 0.5:
+            calls.append({"name": "plan_sort", "arguments": {"query": user_query}})
+    if not calls:
+        return {"message": raw.strip()[:500], "tool_calls": [], "clarify_question": ""}
+    return {
+        "message": raw.strip()[:300] if len(raw) < 400 else "",
+        "tool_calls": calls,
+        "clarify_question": "",
+    }
 
 
 def create_assistant(settings: Settings) -> RulesAssistant | LLMAssistant:
@@ -2335,6 +2821,8 @@ class AgentTurn:
     tool_calls: list[ToolCall] = field(default_factory=list)
     needs_confirm: bool = False
     pending_path: str = ""
+    understood: str = ""
+    confidence: float = 1.0
 
 
 def load_persisted_chat() -> list[dict[str, str]]:
@@ -2372,8 +2860,19 @@ def build_agent_system_prompt(settings: Settings) -> str:
     """System prompt на русском — возможности приложения."""
     custom = (settings.ai_custom_instructions or "").strip()
     custom_block = f"\n\nДоп. инструкции пользователя:\n{custom}" if custom else ""
+    session = load_session_context()
+    session_hint = ""
+    if session.last_query:
+        session_hint = (
+            f"\n\nПамять сессии (последний успешный план): "
+            f"режим={session.last_sort_mode}, куда={session.last_target_relpath}, "
+            f"фильтр={session.last_filter_summary}. "
+            "«как в прошлый раз» — повтори эти параметры."
+        )
     return (
         "Ты ИИ-помощник приложения FileOrganizer (организация файлов на Windows). "
+        "Пользователь пишет разговорным русским: неполные фразы, сленг, опечатки, "
+        "«ну разбери загрузки плз», «где курсовые», «че удалить» — ты всё понимаешь. "
         "Отвечай по-русски, кратко и дружелюбно. "
         "Ты НЕ удаляешь и НЕ перемещаешь файлы без явного подтверждения пользователя.\n\n"
         "Возможности:\n"
@@ -2382,10 +2881,13 @@ def build_agent_system_prompt(settings: Settings) -> str:
         "• Сжатие ZIP при сортировке (установщики и крупные файлы).\n"
         "• Архив — отсортированные файлы; вкладка «Рабочий стол» — отслеживаемые папки.\n"
         "• История операций и отмена последней сортировки.\n"
-        "• Исключения путей из автосортировки.\n"
-        "• Поиск: категории, расширения, даты, размер, дубликаты, установщики, мусор.\n\n"
+        "• Исключения путей из автосортировки; «не трогай exe», «кроме папки X».\n"
+        "• Поиск: категории, расширения, даты, сезоны, размер, дубликаты, установщики, мусор.\n"
+        "• Составные запросы: «найди pdf за май и положи в учёбу».\n\n"
         "Для действий вызывай инструменты (tool_calls). На API передаются только метаданные "
         "(имена, размеры, категории), не содержимое файлов."
+        f"{session_hint}"
+        f"\n{AGENT_FEW_SHOT_EXAMPLES}"
         f"{custom_block}"
     )
 
@@ -2415,13 +2917,32 @@ def build_agent_context_summary(
 
 def route_tools_rules(text: str, history: list[dict[str, str]] | None = None) -> list[ToolCall]:
     """Локальный режим: ключевые слова и паттерны → инструменты."""
-    q = text.strip()
+    session = load_session_context()
+    q = normalize_query_text(resolve_context_references(text, history, session))
     low = q.lower()
     calls: list[ToolCall] = []
 
+    compound = split_compound_request(q)
+    if compound:
+        filter_part, action_part = compound
+        filter_intent = RulesAssistant().parse_user_query(filter_part, history=history, session=session)
+        target = _extract_target_path(action_part, action_part.lower()) or session.last_target_relpath
+        mode = _detect_sort_mode_from_text(action_part.lower(), session.last_sort_mode or "type_date")
+        return [
+            ToolCall("search_files", {"query": filter_part, "scope": "desktop"}),
+            ToolCall("plan_sort", {
+                "query": q,
+                "mode": mode or session.last_sort_mode,
+                "target": target or None,
+                "compress": any(w in action_part.lower() for w in _COMPRESS_WORDS),
+                "scope": "filtered",
+                "filter_query": filter_part,
+            }),
+        ]
+
     if any(w in low for w in (
         "привет", "здравств", "как дела", "как тебе", "как ты", "что умеешь",
-        "помощь", "help", "кто ты",
+        "помощь", "help", "кто ты", "че умеешь",
     )):
         return [ToolCall("explain_status", {"query": q})]
 
@@ -2429,8 +2950,9 @@ def route_tools_rules(text: str, history: list[dict[str, str]] | None = None) ->
         if any(w in low for w in ("последн", "сортир", "операц")):
             return [ToolCall("undo_last", {})]
 
-    if any(w in low for w in ("исключ", "не трогай", "пропуст")) and (
+    if any(w in low for w in ("исключ", "не трогай", "пропуст", "кроме")) and (
         "\\" in q or "/" in q or re.search(r"[A-Za-z]:\\", q)
+        or re.search(r"кроме\s+папк", low)
     ):
         m = re.search(r"([A-Za-z]:\\[^\n]+|/[^\n]+)", q)
         if m:
@@ -2438,33 +2960,38 @@ def route_tools_rules(text: str, history: list[dict[str, str]] | None = None) ->
 
     if any(w in low for w in (
         "статистик", "сколько мест", "сколько файлов", "занимает", "сколько в архив",
+        "сколько там", "сколько вообще",
     )):
         return [ToolCall("get_stats", {})]
 
     if any(w in low for w in (
-        "что удал", "можно удал", "уборк", "мусор", "очист", "лишн", "кандидат",
+        "что удал", "можно удал", "уборк", "мусор", "очист", "лишн", "кандидат", "че удал",
     )) or low in ("покажи что можно удалить", "что можно удалить"):
         return [ToolCall("suggest_cleanup", {})]
 
     if any(w in low for w in ("отслеж", "наблюд", "watched", "какие папк")):
         return [ToolCall("list_watched_folders", {})]
 
-    if any(w in low for w in _SORT_VERBS) or any(w in low for w in _COMPRESS_WORDS):
-        scope = "all_watched"
+    if any(w in low for w in _SORT_VERBS + _CLEAN_VERBS) or any(w in low for w in _COMPRESS_WORDS):
+        scope = _detect_sort_scope(low)
         if any(w in low for w in ("загруз", "download")):
             scope = "all_watched"
         compress = any(w in low for w in _COMPRESS_WORDS)
-        mode = _detect_sort_mode_from_text(low, "type_date") or ""
+        mode = _detect_sort_mode_from_text(low, session.last_sort_mode or "type_date") or ""
         if any(w in low for w in ("мои папк", "по курсам", "умн")):
             mode = "smart_folders"
+        target = _extract_target_path(q, low) or (
+            session.last_target_relpath if re.search(r"как в прошлый|туда же|повтори", low) else ""
+        )
         return [ToolCall("plan_sort", {
             "query": q,
-            "mode": mode or None,
-            "compress": compress,
-            "scope": scope,
+            "mode": mode or session.last_sort_mode or None,
+            "target": target or None,
+            "compress": compress or session.last_compress,
+            "scope": scope if scope != "filtered" else session.last_scope,
         })]
 
-    if any(w in low for w in ("найд", "покаж", "ищ", "search", "find", "где ", "курсов")):
+    if any(w in low for w in _SEARCH_VERBS) or "курсов" in low:
         scope = "all"
         if "архив" in low:
             scope = "archive"
@@ -2481,7 +3008,15 @@ def route_tools_rules(text: str, history: list[dict[str, str]] | None = None) ->
         if prev:
             return route_tools_rules(f"{prev} {q}", history=None)
 
-    return [ToolCall("explain_status", {"query": q})]
+    intent = RulesAssistant().parse_user_query(q, history=history, session=session)
+    if intent.confidence >= 0.55 and intent.action == "search":
+        return [ToolCall("search_files", {"query": q, "scope": intent.source})]
+
+    return [ToolCall("clarify", {
+        "question": "Не совсем понял — что сделать с файлами?",
+        "message": "Не совсем понял — что сделать с файлами?",
+        "options": ["Разбери загрузки", "Найди PDF", "Разложи по моим папкам"],
+    })]
 
 
 class ConversationalAgent:
@@ -2516,15 +3051,39 @@ class ConversationalAgent:
     ) -> AgentTurn:
         """Обработать сообщение: маршрутизация → инструменты → ответ."""
         history = history or []
-        tool_calls = self._route_tools(text, history)
+        normalized = normalize_query_text(
+            resolve_context_references(text, history, load_session_context()),
+        )
+        tool_calls = self._route_tools(normalized, history)
         turn = AgentTurn(message="", tool_calls=tool_calls)
 
         for call in tool_calls:
-            partial = self._execute_tool(call, text, history)
+            partial = self._execute_tool(call, normalized, history)
             turn = self._merge_turn(turn, partial)
 
+        if turn.search or turn.sort_plan:
+            turn.understood = format_understood_summary(turn.search, turn.sort_plan)
+            turn.confidence = (
+                turn.search.confidence if turn.search else 0.85
+            )
+        if turn.confidence < 0.5 and turn.action not in ("clarify",) and not turn.clarify_options:
+            turn.action = "clarify"
+            turn.message = turn.message or "Не совсем понял — уточните, пожалуйста."
+            turn.clarify_options = turn.clarify_options or [
+                "Разбери загрузки",
+                "Найди PDF за этот год",
+                "Разложи по моим папкам",
+            ]
+
         if not turn.message:
-            turn.message = "Готов помочь с файлами. Спросите, например: «разбери загрузки»."
+            turn.message = "Готов помочь с файлами. Напишите как удобно — я разберусь."
+        if turn.understood and turn.action != "clarify":
+            prefix = f"Понял: {turn.understood}."
+            if prefix not in turn.message:
+                turn.message = f"{prefix}\n\n{turn.message}"
+
+        if turn.action in ("search", "sort", "stats", "suggest") and turn.confidence >= 0.5:
+            update_session_from_turn(turn, normalized)
         return turn
 
     def _route_tools(self, text: str, history: list[dict[str, str]]) -> list[ToolCall]:
@@ -2562,6 +3121,8 @@ class ConversationalAgent:
             return []
         data = _extract_json(raw)
         if not isinstance(data, dict):
+            data = _extract_intent_from_plain_text(raw, text)
+        if not isinstance(data, dict):
             return []
         calls: list[ToolCall] = []
         for item in data.get("tool_calls") or []:
@@ -2589,10 +3150,14 @@ class ConversationalAgent:
         args = call.arguments or {}
 
         if name == "clarify":
+            opts = list(args.get("options") or args.get("clarify_options") or [
+                "Разбери загрузки", "Найди PDF за этот год", "Разложи по моим папкам",
+            ])[:3]
             return AgentTurn(
                 message=str(args.get("message") or args.get("question") or "Уточните запрос."),
                 action="clarify",
-                clarify_options=["Разбери загрузки", "Найди PDF за этот год", "Разложи по моим папкам"],
+                clarify_options=opts,
+                confidence=0.3,
             )
 
         if name == "explain_status":
@@ -2693,7 +3258,11 @@ class ConversationalAgent:
 
         if name == "plan_sort":
             query = str(args.get("query") or raw_text)
+            filter_q = str(args.get("filter_query") or "")
             reply = self._assistant.parse_assistant_query(query, self.settings, history=history)
+            if filter_q:
+                filter_intent = self._rules.parse_user_query(filter_q, history=history)
+                reply.search = filter_intent
             plan = reply.sort_plan or parse_sort_plan(
                 query,
                 self.settings,
@@ -2705,6 +3274,7 @@ class ConversationalAgent:
                     message="Не понял, как сортировать. Уточните: по типу, по дате или «по моим папкам»?",
                     action="clarify",
                     clarify_options=["Сортировать по типу", "Разложи по моим папкам"],
+                    confidence=0.35,
                 )
             if args.get("compress"):
                 plan.enable_compression = True
@@ -2714,6 +3284,11 @@ class ConversationalAgent:
             if args.get("scope"):
                 plan.scope = str(args["scope"])
                 plan.scope_label = str(args["scope"])
+            if args.get("target"):
+                plan.custom_dest = str(args["target"])
+                plan.target_relpath = str(args["target"])
+                plan.plan_type = "custom_folder"
+                plan.action = "move_to"
             clarify = check_sort_clarification(plan, self.settings)
             if clarify:
                 return AgentTurn(

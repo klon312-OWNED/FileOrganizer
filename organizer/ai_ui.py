@@ -23,6 +23,7 @@ from .ai_assistant import (
     create_conversational_agent,
     format_intent_summary,
     format_sort_plan_summary,
+    format_understood_summary,
     generate_suggestions,
     human_size,
     load_persisted_chat,
@@ -120,28 +121,39 @@ class AIAssistantPanel(Frame):
         input_frame.pack(side="top", fill=X, pady=(0, 4))
         self._input = Text(input_frame, height=3, font=("Segoe UI", 10), wrap="word")
         self._input.pack(side=LEFT, fill=BOTH, expand=True, padx=6, pady=6)
+        self._input.insert("1.0", "")
+        self._input.bind("<FocusIn>", self._clear_input_placeholder)
+        self._input.bind("<FocusOut>", self._restore_input_placeholder)
         self._input.bind("<Control-Return>", lambda _e: self._on_send())
+        self._show_input_placeholder()
         btn_col = Frame(input_frame, bg=theme.CARD)
         btn_col.pack(side=RIGHT, padx=6, pady=6)
         self._send_btn = ttk.Button(btn_col, text="Отправить", style="Accent.TButton", command=self._on_send)
         self._send_btn.pack(fill=X)
-        ttk.Button(btn_col, text="Примеры", command=self._show_examples).pack(fill=X, pady=(4, 0))
+        self._examples_visible = False
+        self._examples_btn = ttk.Button(btn_col, text="Примеры ▾", command=self._toggle_examples)
+        self._examples_btn.pack(fill=X, pady=(4, 0))
 
-        chips = Frame(left, bg=theme.BG)
-        chips.pack(side="top", fill=X, pady=(0, 6))
-        Label(chips, text="Быстро:", bg=theme.BG, fg=theme.TEXT_MUTED, font=("Segoe UI", 8)).pack(
-            side=LEFT, padx=(0, 4),
-        )
+        self._examples_frame = Frame(left, bg=theme.BG)
+        # Скрыты по умолчанию — v1.16
+        self._chips_inner = Frame(self._examples_frame, bg=theme.BG)
+        Label(
+            self._chips_inner, text="Подсказки (необязательно):", bg=theme.BG,
+            fg=theme.TEXT_MUTED, font=("Segoe UI", 8),
+        ).pack(anchor="w", pady=(0, 2))
+        chips_row = Frame(self._chips_inner, bg=theme.BG)
+        chips_row.pack(fill=X)
         for q in SUGGESTED_PROMPTS:
-            short = q if len(q) <= 28 else q[:26] + "…"
+            short = q if len(q) <= 24 else q[:22] + "…"
             ttk.Button(
-                chips, text=short, width=max(10, len(short) + 1),
+                chips_row, text=short,
                 command=lambda query=q: self._run_quick(query),
-            ).pack(side=LEFT, padx=2, pady=2)
+            ).pack(side=LEFT, padx=2, pady=1)
 
         plan_card = Frame(left, bg=theme.SIDEBAR, highlightbackground=theme.BORDER, highlightthickness=1)
-        plan_card.pack(side="top", fill=X, pady=(0, 4), padx=0)
-        plan_inner = Frame(plan_card, bg=theme.SIDEBAR, padx=8, pady=6)
+        self._plan_card = plan_card
+        self._plan_card.pack(side="top", fill=X, pady=(0, 4), padx=0)
+        plan_inner = Frame(self._plan_card, bg=theme.SIDEBAR, padx=8, pady=6)
         plan_inner.pack(fill=X)
         Label(plan_inner, text="План действий", font=("Segoe UI", 9, "bold"), bg=theme.SIDEBAR).pack(anchor="w")
         self._plan_var = StringVar(value="Нет активного плана")
@@ -259,8 +271,8 @@ class AIAssistantPanel(Frame):
                     self._append_chat(who, msg.get("content", ""), to_history=True, bubble=(role == "user"))
         self._append_chat(
             "Система",
-            "Привет! Пишите как в чате: «разбери загрузки», «найди курсовые», «сожми установщики», "
-            "«покажи что можно удалить». Сначала покажу план — потом «Применить».",
+            "Привет! Пишите как удобно — обычными словами, без шаблонов. "
+            "Я покажу, что понял, и предложу план. Применение — только после «Применить».",
             to_history=False,
         )
         self.after(200, self._load_suggestions)
@@ -458,19 +470,48 @@ class AIAssistantPanel(Frame):
         self._input.insert("1.0", query)
         self._on_send()
 
+    _INPUT_PLACEHOLDER = "Напишите как удобно — я разберусь"
+
+    def _show_input_placeholder(self) -> None:
+        if not self._input.get("1.0", END).strip():
+            self._input.configure(fg=theme.TEXT_MUTED)
+            self._input.insert("1.0", self._INPUT_PLACEHOLDER)
+
+    def _clear_input_placeholder(self, _event=None) -> None:
+        if self._input.get("1.0", END).strip() == self._INPUT_PLACEHOLDER:
+            self._input.delete("1.0", END)
+            self._input.configure(fg=theme.TEXT)
+
+    def _restore_input_placeholder(self, _event=None) -> None:
+        if not self._input.get("1.0", END).strip():
+            self._show_input_placeholder()
+
+    def _toggle_examples(self) -> None:
+        self._examples_visible = not self._examples_visible
+        if self._examples_visible:
+            self._examples_frame.pack(side="top", fill=X, pady=(0, 6), before=self._plan_card)
+            self._chips_inner.pack(fill=X)
+            self._examples_btn.configure(text="Примеры ▴")
+        else:
+            self._examples_frame.pack_forget()
+            self._examples_btn.configure(text="Примеры ▾")
+
     def _show_examples(self) -> None:
+        if not self._examples_visible:
+            self._toggle_examples()
         self._input.delete("1.0", END)
-        self._input.insert("1.0", "\n".join(QUICK_QUERIES))
+        self._input.configure(fg=theme.TEXT)
+        self._input.insert("1.0", "\n".join(QUICK_QUERIES[:8]))
 
     def _on_send(self) -> None:
         if self._busy:
             return
         text = self._input.get("1.0", END).strip()
-        if not text:
+        if not text or text == self._INPUT_PLACEHOLDER:
             return
-        # Если вставили несколько строк примеров — берём первую
         first_line = text.splitlines()[0].strip()
         self._input.delete("1.0", END)
+        self._restore_input_placeholder()
         self._append_chat("Вы", first_line)
         self._set_busy(True, "Думаю…")
         self.after(0, self._show_typing)
@@ -478,6 +519,17 @@ class AIAssistantPanel(Frame):
         threading.Thread(
             target=self._process_query, args=(first_line, history_snapshot), daemon=True,
         ).start()
+
+    def _append_partial_understanding(self, understood: str) -> None:
+        if not understood:
+            return
+        self._hide_typing()
+        self._chat.configure(state="normal")
+        self._chat.insert(END, "\n", "assistant_bubble")
+        self._chat.insert(END, "Помощник\n", "assistant_label")
+        self._chat.insert(END, f"Понял: {understood}…\n", "typing")
+        self._chat.see(END)
+        self._chat.configure(state="disabled")
 
     def _process_query(self, text: str, history: list[dict[str, str]]) -> None:
         try:
@@ -488,6 +540,12 @@ class AIAssistantPanel(Frame):
                 self._get_watched(),
                 sorter=self._get_sorter(),
             )
+            # Быстрый превью «Понял: …» для ощущения потокового ответа
+            preview_intent = agent._rules.parse_user_query(text, history=history)
+            preview = format_understood_summary(preview_intent)
+            if preview and preview != "ваш запрос":
+                self.after(0, lambda u=preview: self._append_partial_understanding(u))
+
             turn = agent.chat(text, history=history[-20:])
 
             if turn.action == "clarify":
@@ -665,8 +723,9 @@ class AIAssistantPanel(Frame):
             "Разложить по моим папкам": "разложи по моим папкам",
             "Разбери загрузки": "разбери загрузки",
             "Найди PDF за этот год": "найди pdf за этот год",
+            "Найди PDF": "найди pdf",
         }
-        for opt in options[:4]:
+        for opt in options[:3]:
             q = mapping.get(opt, opt)
             if opt.startswith("Открыть настройки"):
                 ttk.Button(

@@ -704,5 +704,187 @@ class TestConversationalAgentV115(unittest.TestCase):
             self.assertEqual(loaded[0]["content"], "привет")
 
 
+class TestFreeFormNluV116(unittest.TestCase):
+    """20+ casual Russian prompts for rules parser (v1.16)."""
+
+    def _parse(self, text: str, history: list | None = None):
+        from organizer.ai_assistant import RulesAssistant
+
+        return RulesAssistant().parse_user_query(text, history=history)
+
+    def test_casual_downloads_sort(self):
+        from organizer.ai_assistant import route_tools_rules
+
+        calls = route_tools_rules("ну разбери загрузки плз")
+        self.assertEqual(calls[0].name, "plan_sort")
+
+    def test_typo_naydi(self):
+        intent = self._parse("найдти все pdf")
+        self.assertIn(".pdf", intent.extensions)
+
+    def test_word_alias_spring(self):
+        intent = self._parse("найди все ворд за весну")
+        self.assertTrue(intent.extensions)
+        self.assertIn(".doc", intent.extensions[0])
+        self.assertEqual(intent.months, [3, 4, 5])
+
+    def test_compound_find_and_move(self):
+        from organizer.ai_assistant import split_compound_request
+
+        parts = split_compound_request("найди все ворд за весну и положи в учёбу")
+        self.assertIsNotNone(parts)
+        self.assertIn("найди", parts[0].lower())
+        self.assertIn("положи", parts[1].lower())
+
+    def test_compound_routing(self):
+        from organizer.ai_assistant import route_tools_rules
+
+        calls = route_tools_rules("найди pdf за май и положи в учёбу")
+        names = [c.name for c in calls]
+        self.assertIn("plan_sort", names)
+
+    def test_negation_exe(self):
+        intent = self._parse("не трогай exe остальное сортируй")
+        self.assertIn(".exe", intent.exclude_extensions)
+
+    def test_negation_except_folder(self):
+        intent = self._parse("кроме папки Project всё сортируй")
+        self.assertIn("project", intent.exclude_folder.lower())
+
+    def test_relative_yesterday(self):
+        intent = self._parse("файлы за вчера")
+        self.assertEqual(intent.newer_than_days, 2)
+
+    def test_relative_last_week(self):
+        intent = self._parse("на прошлой неделе")
+        self.assertEqual(intent.newer_than_days, 14)
+        self.assertEqual(intent.older_than_days, 7)
+
+    def test_relative_recently(self):
+        intent = self._parse("недавно скачанные pdf")
+        self.assertEqual(intent.newer_than_days, 14)
+
+    def test_slang_cleanup(self):
+        from organizer.ai_assistant import route_tools_rules
+
+        calls = route_tools_rules("че можно удалить")
+        self.assertEqual(calls[0].name, "suggest_cleanup")
+
+    def test_slang_stats(self):
+        from organizer.ai_assistant import route_tools_rules
+
+        calls = route_tools_rules("сколько там места вообще")
+        self.assertEqual(calls[0].name, "get_stats")
+
+    def test_skiny_verb(self):
+        from organizer.ai_assistant import route_tools_rules
+
+        calls = route_tools_rules("скинь pdf в документы")
+        self.assertEqual(calls[0].name, "plan_sort")
+
+    def test_zakin_verb(self):
+        from organizer.ai_assistant import route_tools_rules
+
+        calls = route_tools_rules("закинь установщики в архив")
+        self.assertEqual(calls[0].name, "plan_sort")
+
+    def test_pronoun_context_history(self):
+        from organizer.ai_assistant import resolve_context_references
+
+        hist = [{"role": "user", "content": "найди pdf за май"}]
+        resolved = resolve_context_references("их в учёбу", hist, None)
+        self.assertIn("pdf", resolved.lower())
+
+    def test_like_last_time_session(self):
+        import tempfile
+        from organizer.ai_assistant import (
+            SESSION_CONTEXT_PATH,
+            SessionContext,
+            resolve_context_references,
+            save_session_context,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx_path = Path(tmp) / "agent_session.json"
+            with mock.patch("organizer.ai_assistant.SESSION_CONTEXT_PATH", ctx_path):
+                save_session_context(SessionContext(
+                    last_query="разложи pdf по типу",
+                    last_sort_mode="type_only",
+                    last_target_relpath="Документы/Учёба",
+                ))
+                resolved = resolve_context_references("как в прошлый раз", [], None)
+                self.assertIn("pdf", resolved.lower())
+
+    def test_understood_summary(self):
+        from organizer.ai_assistant import SearchIntent, format_understood_summary
+
+        intent = SearchIntent(
+            action="search", extensions=[".pdf"], folder_contains="download",
+        )
+        summary = format_understood_summary(intent)
+        self.assertIn(".pdf", summary)
+        self.assertIn("Загрузки", summary)
+
+    def test_confidence_low_gibberish(self):
+        intent = self._parse("абракадабра xyz")
+        self.assertLess(intent.confidence, 0.55)
+
+    def test_confidence_high_search(self):
+        intent = self._parse("найди большие видео за май")
+        self.assertGreaterEqual(intent.confidence, 0.55)
+
+    def test_normalize_typos(self):
+        from organizer.ai_assistant import normalize_query_text
+
+        self.assertIn("найди", normalize_query_text("найдти pdf"))
+
+    def test_session_persist(self):
+        import tempfile
+        from organizer.ai_assistant import (
+            AgentTurn,
+            SearchIntent,
+            SortPlan,
+            load_session_context,
+            save_session_context,
+            update_session_from_turn,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx_path = Path(tmp) / "agent_session.json"
+            with mock.patch("organizer.ai_assistant.SESSION_CONTEXT_PATH", ctx_path):
+                turn = AgentTurn(
+                    message="",
+                    action="sort",
+                    search=SearchIntent(extensions=[".pdf"]),
+                    sort_plan=SortPlan(sort_mode="type_only", target_relpath="Учёба"),
+                )
+                update_session_from_turn(turn, "pdf в учёбу")
+                loaded = load_session_context()
+            self.assertEqual(loaded.last_sort_mode, "type_only")
+            self.assertEqual(loaded.last_target_relpath, "Учёба")
+
+    def test_agent_casual_chat(self):
+        agent = TestConversationalAgentV115()._agent()
+        turn = agent.chat("ну разбери загрузки плз")
+        self.assertIn(turn.action, ("sort", "clarify"))
+        self.assertTrue(turn.understood or turn.message)
+
+    def test_plain_text_llm_fallback(self):
+        from organizer.ai_assistant import _extract_intent_from_plain_text
+
+        data = _extract_intent_from_plain_text(
+            "Хорошо, поищу pdf файлы для вас.",
+            "найди pdf",
+        )
+        self.assertIsInstance(data, dict)
+        self.assertTrue(data.get("tool_calls"))
+
+    def test_route_clarify_on_unknown(self):
+        from organizer.ai_assistant import route_tools_rules
+
+        calls = route_tools_rules("абракадабра xyz qwerty")
+        self.assertEqual(calls[0].name, "clarify")
+
+
 if __name__ == "__main__":
     unittest.main()
