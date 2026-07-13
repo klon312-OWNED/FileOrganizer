@@ -1748,37 +1748,6 @@ class LLMAssistant:
             pass
         return self.rules.parse_user_query(text, history=history)
 
-    def parse_assistant_query(
-        self,
-        text: str,
-        settings: Settings,
-        history: list[dict[str, str]] | None = None,
-    ) -> AssistantReply:
-        if self.provider == "rules":
-            return self.rules.parse_assistant_query(text, settings, history=history)
-        try:
-            llm_reply = self._llm_assistant_parse(text, history=history)
-            if llm_reply:
-                sort_plan = parse_sort_plan(
-                    text,
-                    settings,
-                    filter_intent=llm_reply.search,
-                    filter_summary=format_intent_summary(llm_reply.search)
-                    if llm_reply.search else "",
-                )
-                if sort_plan:
-                    clarify = check_sort_clarification(sort_plan, settings)
-                    if clarify:
-                        clarify.search = llm_reply.search
-                        return clarify
-                    llm_reply.action = "sort"
-                    llm_reply.sort_plan = sort_plan
-                    llm_reply.next_steps = format_sort_next_steps(sort_plan)
-                return llm_reply
-        except Exception:
-            pass
-        return self.rules.parse_assistant_query(text, settings, history=history)
-
     def generate_suggestions(
         self,
         settings: Settings,
@@ -1833,14 +1802,41 @@ class LLMAssistant:
         if self.provider == "rules":
             return self.rules.parse_assistant_query(text, settings, history=history)
         try:
-            parsed = self._llm_parse(text, history=history)
-            if parsed and parsed.action in ("sort", "compress", "clarify"):
-                # Достраиваем SortPlan правилами поверх LLM-фильтра
-                reply = self.rules.parse_assistant_query(text, settings, history=history)
-                if reply.action in ("sort", "clarify") and reply.sort_plan:
-                    return reply
+            llm_reply = self._llm_assistant_parse(text, history=history)
+            if llm_reply and llm_reply.action == "clarify":
+                return llm_reply
+
+            parsed = (
+                llm_reply.search
+                if llm_reply and llm_reply.search
+                else self._llm_parse(text, history=history)
+            )
+
+            sort_plan = parse_sort_plan(
+                text,
+                settings,
+                filter_intent=parsed if parsed and parsed.action == "search" else None,
+                filter_summary=format_intent_summary(parsed) if parsed else "",
+            )
+            if sort_plan:
+                clarify = check_sort_clarification(sort_plan, settings)
+                if clarify:
+                    clarify.search = parsed
+                    return clarify
+                reply = llm_reply or AssistantReply(
+                    action="sort",
+                    search=parsed,
+                    message="Понял запрос на сортировку. Сейчас построю план…",
+                )
+                reply.action = "sort"
+                reply.sort_plan = sort_plan
+                reply.next_steps = format_sort_next_steps(sort_plan)
+                return reply
+
+            if llm_reply:
+                return llm_reply
+
             if parsed and parsed.action in ("search", "suggest", "stats"):
-                # Обогащаем правила LLM-полями, затем стандартный ответ
                 base = self.rules.parse_assistant_query(text, settings, history=history)
                 if base.search and parsed:
                     for field_name in (
